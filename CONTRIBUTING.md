@@ -1,7 +1,8 @@
 # Contributing
 
 Community data providers are the reason this repository exists. Keep the core
-contracts small and put vendor behavior behind provider modules.
+contracts small and put vendor behavior behind Python provider modules. This
+repository does not accept a separate C++ provider implementation surface.
 
 Docker and initialized codegen/engine submodules are required for raw-Pine
 integration work:
@@ -13,7 +14,14 @@ docker version
 
 ## Provider checklist
 
-- Implement one or more protocols from `pineforge_data.providers`.
+- Implement `MarketDataProvider` for backtest-compatible adapters; live-trade
+  and macro support remain separate optional protocols.
+- Resolve exact normalized symbols from the upstream market catalog. Do not
+  infer base, quote, settlement currency, or contract terms by parsing symbols.
+- Preserve both the normalized symbol and the provider-native `provider_id`.
+- Represent spot/cash/CFD/swap/future/option separately and populate derivative
+  contract size, linear/inverse flags, expiry, strike, and option type when the
+  upstream supplies them.
 - Normalize all timestamps to Unix milliseconds.
 - Preserve the source name and normalized instrument on every record.
 - Keep credentials out of logs and exception messages; prefer authorization
@@ -24,6 +32,18 @@ docker version
 - Keep provider-specific request parameters inside the adapter rather than
   extending the normalized records.
 - Never make `pineforge-engine` depend on this package.
+
+Adapters may be contributed in-tree or shipped by another Python package. An
+external package registers a factory without changing this repository's CLI:
+
+```toml
+[project.entry-points."pineforge_data.providers"]
+example = "example_pineforge:provider_factory"
+```
+
+The callable receives `(venue, config)` and returns a structural
+`MarketDataProvider`. See [docs/provider-contract.md](docs/provider-contract.md)
+for the normalized model and a complete skeleton.
 
 ## Determinism and macro vintages
 

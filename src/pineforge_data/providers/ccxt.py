@@ -9,8 +9,18 @@ from importlib import import_module
 from math import isfinite
 from typing import Protocol, cast
 
-from ..models import Bar, TradeTick
-from ..requests import BarRequest, TradeSubscription
+from ..models import (
+    AssetClass,
+    Bar,
+    ContractSpec,
+    Instrument,
+    MarketListing,
+    MarketType,
+    OptionType,
+    TradeTick,
+)
+from ..requests import BarRequest, MarketQuery, TradeSubscription
+from .base import MarketNotFoundError
 
 
 class CcxtError(RuntimeError):
@@ -36,6 +46,12 @@ class _AsyncCcxtExchange(Protocol):
     def milliseconds(self) -> int: ...
 
     def parse_timeframe(self, timeframe: str) -> float: ...
+
+    async def load_markets(
+        self,
+        reload: bool = False,
+        params: Mapping[str, object] | None = None,
+    ) -> Mapping[str, Mapping[str, object]]: ...
 
     async def fetch_ohlcv(
         self,
@@ -89,6 +105,44 @@ def _timestamp(value: object, field: str = "timestamp") -> int:
     return int(normalized)
 
 
+def _optional_number(value: object, field: str) -> float | None:
+    return None if value is None else _number(value, field)
+
+
+def _optional_timestamp(value: object, field: str) -> int | None:
+    return None if value is None else _timestamp(value, field)
+
+
+def _optional_bool(value: object, field: str) -> bool | None:
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise CcxtDataError(f"{field} must be boolean")
+    return value
+
+
+def _text(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise CcxtDataError(f"{field} must be a non-empty string")
+    return value
+
+
+def _optional_text(value: object, field: str) -> str:
+    if value is None:
+        return ""
+    return _text(value, field)
+
+
+_CCXT_MARKET_TYPES = {
+    "spot": MarketType.SPOT,
+    "margin": MarketType.SPOT,
+    "swap": MarketType.SWAP,
+    "future": MarketType.FUTURE,
+    "option": MarketType.OPTION,
+}
+_CONTRACT_MARKET_TYPES = {MarketType.SWAP, MarketType.FUTURE, MarketType.OPTION}
+
+
 class CcxtProvider:
     """Normalize one CCXT exchange into PineForge bars and trade ticks.
 
@@ -106,6 +160,8 @@ class CcxtProvider:
         page_limit: int = 1_000,
         poll_interval_ms: int = 1_000,
         dedup_window: int = 10_000,
+        reload_markets: bool = False,
+        market_params: Mapping[str, object] | None = None,
         ohlcv_params: Mapping[str, object] | None = None,
         trade_params: Mapping[str, object] | None = None,
     ) -> None:
@@ -125,16 +181,93 @@ class CcxtProvider:
                 f"injected CCXT exchange id {self._exchange.id!r} does not match {exchange_id!r}"
             )
         self.exchange_id = exchange_id
+        self.venue = exchange_id
         self.name = f"ccxt:{exchange_id}"
         self.page_limit = page_limit
         self.poll_interval_ms = poll_interval_ms
         self.dedup_window = dedup_window
+        self.reload_markets = reload_markets
+        self.market_params = dict(market_params or {})
         self.ohlcv_params = dict(ohlcv_params or {})
         self.trade_params = dict(trade_params or {})
 
     def _require_capability(self, name: str) -> None:
         if not self._exchange.has.get(name):
             raise CcxtCapabilityError(f"{self.exchange_id} does not support {name}")
+
+    def _validate_instrument_venue(self, instrument: Instrument) -> None:
+        if instrument.venue and instrument.venue != self.venue:
+            raise ValueError(
+                f"instrument venue {instrument.venue!r} does not match provider "
+                f"venue {self.venue!r}"
+            )
+
+    def _normalize_market(self, raw: Mapping[str, object]) -> MarketListing:
+        symbol = _text(raw.get("symbol"), "market.symbol")
+        provider_id = _text(raw.get("id"), "market.id")
+        raw_type = _optional_text(raw.get("type"), "market.type").casefold()
+        market_type = _CCXT_MARKET_TYPES.get(raw_type, MarketType.UNKNOWN)
+        declared_contract = _optional_bool(raw.get("contract"), "market.contract")
+        is_contract = declared_contract is True or market_type in _CONTRACT_MARKET_TYPES
+
+        option_type: OptionType | None = None
+        raw_option_type = _optional_text(raw.get("optionType"), "market.optionType")
+        if raw_option_type:
+            try:
+                option_type = OptionType(raw_option_type.casefold())
+            except ValueError as exc:
+                raise CcxtDataError(f"unsupported market.optionType: {raw_option_type!r}") from exc
+
+        contract = None
+        if is_contract:
+            try:
+                contract = ContractSpec(
+                    contract_size=_optional_number(raw.get("contractSize"), "market.contractSize"),
+                    linear=_optional_bool(raw.get("linear"), "market.linear"),
+                    inverse=_optional_bool(raw.get("inverse"), "market.inverse"),
+                    expiry_ms=_optional_timestamp(raw.get("expiry"), "market.expiry"),
+                    strike=_optional_number(raw.get("strike"), "market.strike"),
+                    option_type=option_type,
+                )
+            except ValueError as exc:
+                raise CcxtDataError(f"invalid contract metadata for {symbol}: {exc}") from exc
+
+        return MarketListing(
+            instrument=Instrument(
+                symbol=symbol,
+                venue=self.venue,
+                volume_unit="contracts" if is_contract else "base",
+                asset_class=AssetClass.CRYPTO,
+                market_type=market_type,
+                base=_optional_text(raw.get("base"), "market.base"),
+                quote=_optional_text(raw.get("quote"), "market.quote"),
+                settle=_optional_text(raw.get("settle"), "market.settle"),
+                provider_id=provider_id,
+                contract=contract,
+            ),
+            active=_optional_bool(raw.get("active"), "market.active"),
+            margin_supported=_optional_bool(raw.get("margin"), "market.margin"),
+        )
+
+    async def list_markets(self, query: MarketQuery | None = None) -> Sequence[MarketListing]:
+        """Load and normalize every market advertised by this CCXT exchange."""
+
+        raw_markets = await self._exchange.load_markets(self.reload_markets, self.market_params)
+        listings = [self._normalize_market(raw) for raw in raw_markets.values()]
+        if query is not None:
+            listings = [listing for listing in listings if query.matches(listing)]
+        return sorted(listings, key=lambda listing: listing.instrument.symbol)
+
+    async def resolve_market(self, symbol: str) -> MarketListing:
+        """Resolve one exact CCXT unified symbol into normalized market metadata."""
+
+        if not symbol.strip():
+            raise ValueError("symbol must not be empty")
+        raw_markets = await self._exchange.load_markets(self.reload_markets, self.market_params)
+        raw = raw_markets.get(symbol)
+        if raw is None:
+            raise MarketNotFoundError(f"{self.name} has no exact unified market symbol {symbol!r}")
+        return self._normalize_market(raw)
 
     def _normalize_bar(self, raw: Sequence[object], request: BarRequest) -> Bar:
         if len(raw) < 6:
@@ -153,6 +286,7 @@ class CcxtProvider:
     async def fetch_bars(self, request: BarRequest) -> Sequence[Bar]:
         """Fetch paginated, deduplicated, confirmed OHLCV bars."""
 
+        self._validate_instrument_venue(request.instrument)
         self._require_capability("fetchOHLCV")
         timeframe_seconds = self._exchange.parse_timeframe(request.timeframe)
         timeframe_ms = int(_number(timeframe_seconds, "timeframe seconds") * 1_000)
@@ -216,11 +350,10 @@ class CcxtProvider:
             source=self.name,
         )
 
-    async def stream_trades(
-        self, subscription: TradeSubscription
-    ) -> AsyncIterator[TradeTick]:
+    async def stream_trades(self, subscription: TradeSubscription) -> AsyncIterator[TradeTick]:
         """Poll CCXT public trades and emit a strictly ordered local sequence."""
 
+        self._validate_instrument_venue(subscription.instrument)
         self._require_capability("fetchTrades")
         since = (
             subscription.start_ms

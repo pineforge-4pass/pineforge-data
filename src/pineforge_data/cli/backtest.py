@@ -7,14 +7,15 @@ import asyncio
 import json
 import re
 import sys
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import cast
 
 from ..backtest import BacktestOptions, JsonValue
 from ..docker_runtime import DockerBacktestRuntime, discover_repository_root
-from ..models import Instrument
-from ..providers import CcxtProvider
+from ..models import MarketListing
+from ..providers import create_provider
 from ..requests import BarRequest
 
 
@@ -36,12 +37,12 @@ def parse_timestamp(value: str) -> int:
     return timestamp
 
 
-def ccxt_timeframe_to_pine(timeframe: str) -> str:
-    """Translate common CCXT timeframe spelling into Pine timeframe spelling."""
+def source_timeframe_to_pine(timeframe: str) -> str:
+    """Translate common compact timeframe spelling into Pine timeframe spelling."""
 
     match = re.fullmatch(r"([1-9][0-9]*)([smhdwM])", timeframe)
     if match is None:
-        raise ValueError(f"cannot translate CCXT timeframe to PineForge: {timeframe}")
+        raise ValueError(f"cannot translate source timeframe to PineForge: {timeframe}")
     count = int(match.group(1))
     unit = match.group(2)
     if unit == "s":
@@ -53,6 +54,10 @@ def ccxt_timeframe_to_pine(timeframe: str) -> str:
     return f"{count}{unit.upper() if unit != 'M' else unit}"
 
 
+# Backward-compatible import for callers of the CCXT-only bootstrap API.
+ccxt_timeframe_to_pine = source_timeframe_to_pine
+
+
 def _load_json_object(path: Path | None) -> dict[str, JsonValue]:
     if path is None:
         return {}
@@ -62,16 +67,56 @@ def _load_json_object(path: Path | None) -> dict[str, JsonValue]:
     return cast(dict[str, JsonValue], value)
 
 
+def _market_payload(listing: MarketListing) -> dict[str, JsonValue]:
+    instrument = listing.instrument
+    contract = instrument.contract
+    contract_payload: JsonValue = None
+    if contract is not None:
+        contract_payload = {
+            "contract_size": contract.contract_size,
+            "linear": contract.linear,
+            "inverse": contract.inverse,
+            "expiry_ms": contract.expiry_ms,
+            "strike": contract.strike,
+            "option_type": contract.option_type.value if contract.option_type else None,
+        }
+    return {
+        "symbol": instrument.symbol,
+        "provider_id": instrument.provider_id,
+        "asset_class": instrument.asset_class.value,
+        "market_type": instrument.market_type.value,
+        "base": instrument.base,
+        "quote": instrument.quote,
+        "settle": instrument.settle,
+        "volume_unit": instrument.volume_unit,
+        "active": listing.active,
+        "margin_supported": listing.margin_supported,
+        "contract": contract_payload,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pineforge-backtest",
         description="Transpile raw PineScript and backtest provider OHLCV in Docker",
     )
     parser.add_argument("--pine", type=Path, required=True, help="raw PineScript v6 strategy")
-    parser.add_argument("--provider", choices=("ccxt",), default="ccxt")
-    parser.add_argument("--exchange", required=True, help="CCXT exchange id, such as kraken")
-    parser.add_argument("--symbol", required=True, help="CCXT unified symbol, such as BTC/USD")
-    parser.add_argument("--timeframe", required=True, help="CCXT timeframe, such as 15m or 1h")
+    parser.add_argument(
+        "--provider", default="ccxt", help="provider adapter name; defaults to ccxt"
+    )
+    parser.add_argument(
+        "--venue",
+        "--exchange",
+        dest="venue",
+        required=True,
+        help="exchange, broker, or provider environment; for example kraken",
+    )
+    parser.add_argument(
+        "--symbol",
+        required=True,
+        help="exact provider-normalized symbol, such as BTC/USD or BTC/USDT:USDT",
+    )
+    parser.add_argument("--timeframe", required=True, help="source timeframe, such as 15m or 1h")
     parser.add_argument("--start", type=parse_timestamp, required=True)
     parser.add_argument("--end", type=parse_timestamp, required=True)
     parser.add_argument("--limit", type=int)
@@ -82,7 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="PineForge input timeframe; defaults to a translation of --timeframe",
     )
     parser.add_argument("--script-timeframe", default="")
-    parser.add_argument("--provider-config", type=Path, help="CCXT constructor options JSON file")
+    parser.add_argument("--provider-config", type=Path, help="provider options JSON file")
     parser.add_argument("--strategy-params", type=Path, help="strategy parameters JSON file")
     parser.add_argument("--bar-magnifier", action="store_true")
     parser.add_argument("--magnifier-samples", type=int, default=4)
@@ -105,26 +150,29 @@ async def run_harness(args: argparse.Namespace) -> dict[str, JsonValue]:
 
     provider_config = _load_json_object(args.provider_config)
     strategy_params = _load_json_object(args.strategy_params)
-    instrument = Instrument(
-        args.symbol,
-        venue=args.exchange,
-        timezone=args.timezone,
-        session=args.session,
-    )
-    request = BarRequest(
-        instrument,
-        args.timeframe,
-        args.start,
-        args.end,
-        limit=args.limit,
-    )
-    async with CcxtProvider(args.exchange, config=provider_config) as provider:
+    provider = create_provider(args.provider, args.venue, config=provider_config)
+    try:
+        listing = await provider.resolve_market(args.symbol)
+        instrument = replace(
+            listing.instrument,
+            timezone=args.timezone,
+            session=args.session,
+        )
+        request = BarRequest(
+            instrument,
+            args.timeframe,
+            args.start,
+            args.end,
+            limit=args.limit,
+        )
         bars = await provider.fetch_bars(request)
         provider_name = provider.name
+    finally:
+        await provider.close()
     if not bars:
         raise RuntimeError("provider returned no confirmed bars for the requested interval")
 
-    engine_timeframe = args.engine_timeframe or ccxt_timeframe_to_pine(args.timeframe)
+    engine_timeframe = args.engine_timeframe or source_timeframe_to_pine(args.timeframe)
     options = BacktestOptions(
         input_timeframe=engine_timeframe,
         script_timeframe=args.script_timeframe or engine_timeframe,
@@ -157,9 +205,10 @@ async def run_harness(args: argparse.Namespace) -> dict[str, JsonValue]:
     return {
         "provider": {
             "name": provider_name,
-            "exchange": args.exchange,
-            "symbol": args.symbol,
+            "adapter": args.provider,
+            "venue": args.venue,
             "source_timeframe": args.timeframe,
+            "market": _market_payload(listing),
         },
         "data": {
             "requested_start_ms": args.start,

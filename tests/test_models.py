@@ -2,7 +2,17 @@ from __future__ import annotations
 
 import pytest
 
-from pineforge_data import Bar, Instrument, MacroObservation, TradeTick
+from pineforge_data import (
+    Bar,
+    ContractSpec,
+    Instrument,
+    MacroObservation,
+    MarketListing,
+    MarketQuery,
+    MarketType,
+    OptionType,
+    TradeTick,
+)
 
 
 def test_normalized_records_accept_valid_values() -> None:
@@ -64,3 +74,48 @@ def test_trade_tick_rejects_values_outside_c_abi_ranges() -> None:
 
     with pytest.raises(ValueError, match="unsigned 64-bit"):
         TradeTick(Instrument("BTCUSD"), 1_000, 2**64, 10.0, 1.0, "example")
+
+
+def test_contract_spec_and_market_query_are_provider_neutral() -> None:
+    contract = ContractSpec(
+        contract_size=0.01,
+        linear=True,
+        inverse=False,
+        expiry_ms=1_800_000_000_000,
+        strike=100_000,
+        option_type=OptionType.CALL,
+    )
+    listing = MarketListing(
+        Instrument(
+            "BTC/USD:USD-OPTION",
+            venue="broker",
+            market_type=MarketType.OPTION,
+            base="BTC",
+            quote="USD",
+            settle="USD",
+            provider_id="native-123",
+            contract=contract,
+        ),
+        active=True,
+        margin_supported=False,
+    )
+
+    assert MarketQuery(
+        market_types=frozenset({MarketType.OPTION}),
+        settle="usd",
+        linear=True,
+    ).matches(listing)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"contract_size": 0}, "contract_size"),
+        ({"linear": True, "inverse": True}, "both linear and inverse"),
+        ({"expiry_ms": -1}, "expiry_ms"),
+        ({"strike": -1}, "strike"),
+    ],
+)
+def test_contract_spec_rejects_invalid_terms(kwargs: dict[str, object], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        ContractSpec(**kwargs)  # type: ignore[arg-type]

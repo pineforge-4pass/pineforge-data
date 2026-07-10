@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from math import isfinite
 
 
@@ -22,21 +23,101 @@ def _unix_ms(value: int, field: str) -> None:
         raise ValueError(f"{field} must fit a signed 64-bit integer")
 
 
+def _optional_text(value: str, field: str) -> None:
+    if value and not value.strip():
+        raise ValueError(f"{field} must not contain only whitespace")
+
+
+class AssetClass(StrEnum):
+    """Broad economic asset class, independent of execution venue."""
+
+    UNKNOWN = "unknown"
+    CRYPTO = "crypto"
+    EQUITY = "equity"
+    FOREX = "forex"
+    COMMODITY = "commodity"
+    INDEX = "index"
+    FUND = "fund"
+    BOND = "bond"
+
+
+class MarketType(StrEnum):
+    """Trading-market structure for an instrument listing."""
+
+    UNKNOWN = "unknown"
+    SPOT = "spot"
+    CASH = "cash"
+    SWAP = "swap"
+    FUTURE = "future"
+    OPTION = "option"
+    CFD = "cfd"
+
+
+class OptionType(StrEnum):
+    CALL = "call"
+    PUT = "put"
+
+
+@dataclass(frozen=True, slots=True)
+class ContractSpec:
+    """Normalized derivative terms supplied by a market catalog."""
+
+    contract_size: float | None = None
+    linear: bool | None = None
+    inverse: bool | None = None
+    expiry_ms: int | None = None
+    strike: float | None = None
+    option_type: OptionType | None = None
+
+    def __post_init__(self) -> None:
+        if self.contract_size is not None and (
+            not isfinite(self.contract_size) or self.contract_size <= 0
+        ):
+            raise ValueError("contract_size must be finite and positive")
+        if self.linear is True and self.inverse is True:
+            raise ValueError("a contract cannot be both linear and inverse")
+        if self.expiry_ms is not None:
+            _unix_ms(self.expiry_ms, "expiry_ms")
+        if self.strike is not None and (not isfinite(self.strike) or self.strike <= 0):
+            raise ValueError("strike must be finite and positive")
+
+
 @dataclass(frozen=True, slots=True)
 class Instrument:
-    """A normalized instrument independent of any provider's symbol spelling."""
+    """A normalized market instrument with provider identity kept explicit."""
 
     symbol: str
     venue: str = ""
     timezone: str = "UTC"
     session: str = "24x7"
     volume_unit: str = "base"
+    asset_class: AssetClass = AssetClass.UNKNOWN
+    market_type: MarketType = MarketType.UNKNOWN
+    base: str = ""
+    quote: str = ""
+    settle: str = ""
+    provider_id: str = ""
+    contract: ContractSpec | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.symbol, "symbol")
         _non_empty(self.timezone, "timezone")
         _non_empty(self.session, "session")
         _non_empty(self.volume_unit, "volume_unit")
+        _optional_text(self.venue, "venue")
+        _optional_text(self.base, "base")
+        _optional_text(self.quote, "quote")
+        _optional_text(self.settle, "settle")
+        _optional_text(self.provider_id, "provider_id")
+
+
+@dataclass(frozen=True, slots=True)
+class MarketListing:
+    """One instrument as listed by one provider-bound venue."""
+
+    instrument: Instrument
+    active: bool | None = None
+    margin_supported: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -15,7 +15,17 @@ from .docker_runtime import (
 )
 from .engine import EngineStreamSink, PfBar, PfTradeTick, pack_bars, pack_trade_ticks
 from .errors import EngineStreamError
-from .models import Bar, Instrument, MacroObservation, TradeTick
+from .models import (
+    AssetClass,
+    Bar,
+    ContractSpec,
+    Instrument,
+    MacroObservation,
+    MarketListing,
+    MarketType,
+    OptionType,
+    TradeTick,
+)
 from .providers import (
     CcxtCapabilityError,
     CcxtDataError,
@@ -25,10 +35,20 @@ from .providers import (
     HistoricalBarProvider,
     LiveTradeProvider,
     MacroDataProvider,
+    MarketCatalogProvider,
+    MarketDataProvider,
+    MarketNotFoundError,
+    ProviderFactory,
+    ProviderNotFoundError,
+    ProviderRegistry,
+    ProviderRegistryError,
+    create_provider,
+    default_registry,
 )
-from .requests import BarRequest, MacroRequest, TradeSubscription
+from .requests import BarRequest, MacroRequest, MarketQuery, TradeSubscription
 
 __all__ = [
+    "AssetClass",
     "BacktestOptions",
     "BacktestReport",
     "Bar",
@@ -38,6 +58,7 @@ __all__ = [
     "CcxtDependencyError",
     "CcxtError",
     "CcxtProvider",
+    "ContractSpec",
     "DockerBacktestRuntime",
     "DockerExecutionError",
     "DockerPrerequisiteError",
@@ -51,11 +72,24 @@ __all__ = [
     "MacroObservation",
     "MacroRequest",
     "MagnifierDistribution",
+    "MarketCatalogProvider",
+    "MarketDataProvider",
+    "MarketListing",
+    "MarketNotFoundError",
+    "MarketQuery",
+    "MarketType",
+    "OptionType",
     "PfBar",
     "PfTradeTick",
     "PineForgeBacktestRunner",
+    "ProviderFactory",
+    "ProviderNotFoundError",
+    "ProviderRegistry",
+    "ProviderRegistryError",
     "TradeSubscription",
     "TradeTick",
+    "create_provider",
+    "default_registry",
     "discover_repository_root",
     "pack_bars",
     "pack_trade_ticks",

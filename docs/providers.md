@@ -7,6 +7,10 @@ They are selected independently from venues:
 - venue: an exchange or broker environment, such as `kraken`;
 - symbol: the exact normalized market symbol on that provider.
 
+Built-in `csv`, `sqlite`, and `sqlalchemy` providers expose the same catalog and
+historical-bar protocol for user-owned data. They discover and map arbitrary
+columns at runtime; see [Local files and databases](local-data.md).
+
 ## Create a registered provider
 
 ```python

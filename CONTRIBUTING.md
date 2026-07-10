@@ -34,6 +34,8 @@ docker version
 - Make retries, timeouts, and rate limits explicit.
 - Add offline fixture tests. CI must not require network access or API keys.
 - Declare provider-specific libraries as optional dependencies.
+- Keep local/database adapters read-only, validate mapped identifiers against
+  reflected metadata, and bind query values instead of accepting raw SQL.
 - Keep provider-specific request parameters inside the adapter rather than
   extending the normalized records.
 - Never make `pineforge-engine` depend on this package.

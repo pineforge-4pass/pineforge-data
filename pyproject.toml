@@ -28,6 +28,7 @@ pineforge-backtest-server = "pineforge_data.server:main"
 
 [project.optional-dependencies]
 ccxt = ["ccxt>=4.5.64,<5"]
+database = ["sqlalchemy>=2.0,<3"]
 server = [
     "fastapi>=0.139,<0.140",
     "uvicorn>=0.51,<0.52",
@@ -39,6 +40,7 @@ dev = [
     "mypy>=1.13",
     "pytest>=8.3",
     "ruff>=0.8",
+    "sqlalchemy>=2.0,<3",
     "uvicorn>=0.51,<0.52",
 ]
 

@@ -95,6 +95,12 @@ Pine input overrides:
 Input and override values sent to the FastAPI service must be scalar strings,
 numbers, or booleans.
 
+The same harness accepts `--provider csv`, `--provider sqlite`, or
+`--provider sqlalchemy`. Their provider configuration maps arbitrary source
+columns to normalized OHLCV, while raw Pine and normalized bars follow the
+same local-container or FastAPI path. See
+[Local files and databases](local-data.md) for complete configuration examples.
+
 ## Runtime image policy
 
 The package default is an exact `pineforge-release` version and OCI digest. The

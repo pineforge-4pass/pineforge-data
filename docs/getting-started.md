@@ -24,6 +24,7 @@ Available extras:
 | Extra | Purpose |
 |---|---|
 | `ccxt` | CCXT async exchange adapter |
+| `database` | SQLAlchemy 2.x database reflection and queries |
 | `server` | FastAPI and Uvicorn server dependencies |
 | `dev` | tests, type checking, formatting, and package builds |
 
@@ -103,5 +104,6 @@ cache.
 
 - [Learn the normalized data model](data-model.md).
 - [Search and filter provider markets](providers.md).
+- [Connect local CSV, SQLite, or SQLAlchemy data](local-data.md).
 - [Configure parameters, runtime channels, and reports](backtesting.md).
 - [Deploy the concurrent server](server.md).

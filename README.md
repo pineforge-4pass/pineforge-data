@@ -72,6 +72,39 @@ the same `LiveTradeProvider` contract later.
 after an engine warmup. `start_sequence` is the last accepted sequence, so the
 adapter emits `start_sequence + 1` next.
 
+## Direct backtest harness
+
+`pineforge-backtest` fetches confirmed OHLCV through a data provider, packs the
+normalized bars into the PineForge C ABI, and calls a compiled strategy library
+directly. It does not create an intermediate CSV.
+
+```bash
+pineforge-backtest \
+  --strategy /path/to/strategy.so \
+  --exchange kraken \
+  --symbol BTC/USD \
+  --timeframe 15m \
+  --start 2026-07-01T00:00:00Z \
+  --end 2026-07-08T00:00:00Z \
+  --output report.json \
+  --pretty
+```
+
+The JSON report contains data provenance, processed-bar counts, every closed
+trade, all/long/short trade statistics, equity statistics, security-feed
+diagnostics, optional trace values, and the complete equity curve. Unix
+millisecond timestamps can be used instead of ISO-8601 values.
+
+Use `--provider-config config.json` for CCXT constructor options and
+`--strategy-params inputs.json` for Pine input overrides. The provider config
+file may contain credentials, so keep it outside version control.
+
+Provider implementations are organized by their strongest supported runtime.
+The current Python bucket contains CCXT and the harness; native low-latency
+providers will live in the C++ bucket. Both buckets must emit the same
+normalized records, but an individual provider does not need implementations
+in both languages.
+
 ## Development
 
 ```bash

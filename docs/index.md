@@ -23,8 +23,7 @@ exchange / broker / macro API
 |---|---|
 | Install the package and run a first backtest | [Getting started](getting-started.md) |
 | Understand instruments, contracts, bars, trades, and macro vintages | [Data model](data-model.md) |
-| Discover markets and use CCXT or another provider | [Using providers](providers.md) |
-| Connect a CSV file, SQLite table, or SQLAlchemy database | [Local files and databases](local-data.md) |
+| Choose a provider and open its API guide | [Provider catalog](providers.md) |
 | Configure local and remote raw-Pine backtests | [Backtesting](backtesting.md) |
 | Deploy and operate the concurrent FastAPI service | [FastAPI server](server.md) |
 | Implement a new exchange or broker adapter | [Provider contract](provider-contract.md) |

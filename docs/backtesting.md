@@ -99,7 +99,8 @@ The same harness accepts `--provider csv`, `--provider sqlite`, or
 `--provider sqlalchemy`. Their provider configuration maps arbitrary source
 columns to normalized OHLCV, while raw Pine and normalized bars follow the
 same local-container or FastAPI path. See
-[Local files and databases](local-data.md) for complete configuration examples.
+the [provider catalog](providers.md) for their individual API and configuration
+guides.
 
 ## Runtime image policy
 

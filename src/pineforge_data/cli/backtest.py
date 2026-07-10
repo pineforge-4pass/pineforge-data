@@ -11,7 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import cast
 
-from ..backtest import BacktestOptions, JsonValue, PineForgeBacktestRunner
+from ..backtest import BacktestOptions, JsonValue
+from ..docker_runtime import DockerBacktestRuntime, discover_repository_root
 from ..models import Instrument
 from ..providers import CcxtProvider
 from ..requests import BarRequest
@@ -64,9 +65,9 @@ def _load_json_object(path: Path | None) -> dict[str, JsonValue]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pineforge-backtest",
-        description="Feed provider OHLCV directly into a compiled PineForge strategy",
+        description="Transpile raw PineScript and backtest provider OHLCV in Docker",
     )
-    parser.add_argument("--strategy", type=Path, required=True, help="compiled strategy library")
+    parser.add_argument("--pine", type=Path, required=True, help="raw PineScript v6 strategy")
     parser.add_argument("--provider", choices=("ccxt",), default="ccxt")
     parser.add_argument("--exchange", required=True, help="CCXT exchange id, such as kraken")
     parser.add_argument("--symbol", required=True, help="CCXT unified symbol, such as BTC/USD")
@@ -86,6 +87,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bar-magnifier", action="store_true")
     parser.add_argument("--magnifier-samples", type=int, default=4)
     parser.add_argument("--trace", action="store_true")
+    parser.add_argument("--image", help="Docker image override; default tag follows submodule pins")
+    parser.add_argument("--repository-root", type=Path, help="pineforge-data checkout path")
+    parser.add_argument("--rebuild-image", action="store_true")
+    parser.add_argument(
+        "--no-image-build",
+        action="store_true",
+        help="fail instead of building when the pinned image is absent",
+    )
     parser.add_argument("--output", type=Path, help="report path; defaults to stdout")
     parser.add_argument("--pretty", action="store_true", help="pretty-print report JSON")
     return parser
@@ -124,13 +133,27 @@ async def run_harness(args: argparse.Namespace) -> dict[str, JsonValue]:
         trace_enabled=args.trace,
         chart_timezone=args.timezone,
     )
-    runner = PineForgeBacktestRunner.load(args.strategy)
-    report = runner.run(
+    pine_path = args.pine.expanduser().resolve()
+    if not pine_path.is_file():
+        raise FileNotFoundError(f"PineScript file not found: {pine_path}")
+    repository_root = discover_repository_root(args.repository_root)
+    runtime = DockerBacktestRuntime(
+        repository_root,
+        image=args.image,
+        rebuild=args.rebuild_image,
+        build_if_missing=not args.no_image_build,
+    )
+    container = runtime.run(
+        pine_path.read_text(encoding="utf-8"),
         bars,
         instrument=instrument,
+        source=provider_name,
         options=options,
         strategy_params=strategy_params,
     )
+    required_sections = ("runtime", "transpile", "compile", "backtest")
+    if any(section not in container for section in required_sections):
+        raise RuntimeError("Docker report is missing a required section")
     return {
         "provider": {
             "name": provider_name,
@@ -146,11 +169,14 @@ async def run_harness(args: argparse.Namespace) -> dict[str, JsonValue]:
             "bars": len(bars),
         },
         "strategy": {
-            "library": str(args.strategy.expanduser().resolve()),
+            "pine": str(pine_path),
             "input_timeframe": engine_timeframe,
             "script_timeframe": options.script_timeframe,
         },
-        "backtest": report.to_dict(),
+        "runtime": cast(JsonValue, container["runtime"]),
+        "transpile": cast(JsonValue, container["transpile"]),
+        "compile": cast(JsonValue, container["compile"]),
+        "backtest": cast(JsonValue, container["backtest"]),
     }
 
 

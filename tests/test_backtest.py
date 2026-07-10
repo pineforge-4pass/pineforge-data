@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import json
 from math import nan
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -15,7 +16,7 @@ from pineforge_data import (
     PineForgeBacktestRunner,
 )
 from pineforge_data.backtest import _PfEquityPoint, _PfReport, _PfTrade
-from pineforge_data.cli.backtest import ccxt_timeframe_to_pine, parse_timestamp
+from pineforge_data.cli.backtest import build_parser, ccxt_timeframe_to_pine, parse_timestamp
 
 
 class FakeFunction:
@@ -143,3 +144,25 @@ def test_ccxt_timeframe_conversion(ccxt: str, pine: str) -> None:
 def test_timestamp_parser_accepts_unix_ms_and_iso_8601() -> None:
     assert parse_timestamp("1000") == 1_000
     assert parse_timestamp("1970-01-01T00:00:01Z") == 1_000
+
+
+def test_cli_requires_raw_pine_instead_of_shared_library() -> None:
+    args = build_parser().parse_args(
+        [
+            "--pine",
+            "strategy.pine",
+            "--exchange",
+            "kraken",
+            "--symbol",
+            "BTC/USD",
+            "--timeframe",
+            "15m",
+            "--start",
+            "1000",
+            "--end",
+            "2000",
+        ]
+    )
+
+    assert args.pine == Path("strategy.pine")
+    assert not hasattr(args, "strategy")

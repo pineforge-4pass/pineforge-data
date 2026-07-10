@@ -22,12 +22,14 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - run: python -m pip install --upgrade pip
-      - run: python -m pip install -e '.[dev,ccxt]'
+      - run: python -m pip install -e '.[dev,ccxt,release]'
       - run: ruff check .
       - run: mypy src
       - run: pytest
       - if: matrix.python-version == '3.13'
         run: python -m build
+      - if: matrix.python-version == '3.13'
+        run: python -m twine check --strict dist/*
 
   docker:
     runs-on: ubuntu-latest

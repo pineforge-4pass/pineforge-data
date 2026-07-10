@@ -27,7 +27,9 @@ exchange / broker / macro API
 | Configure local and remote raw-Pine backtests | [Backtesting](backtesting.md) |
 | Deploy and operate the concurrent FastAPI service | [FastAPI server](server.md) |
 | Implement a new exchange or broker adapter | [Provider contract](provider-contract.md) |
-| Prepare a contribution | [Contributing](../CONTRIBUTING.md) |
+| Look up Python signatures, types, and docstrings | [Python API reference](api/index.md) |
+| Publish a verified package release | [Releasing](releasing.md) |
+| Prepare a contribution | [Contributing](https://github.com/pineforge-4pass/pineforge-data/blob/main/CONTRIBUTING.md) |
 
 ## Package boundaries
 

@@ -67,9 +67,16 @@ became available; using today's revised value in an old backtest is lookahead.
 ## Checks
 
 ```bash
+python -m pip install -e '.[dev,ccxt,database,server,docs,release]'
 ruff check .
 mypy src
 pytest
+mkdocs build --strict
 python -m build
+python -m twine check dist/*
 PINEFORGE_DOCKER_TEST=1 pytest tests/test_docker_integration.py
 ```
+
+Maintainers should follow the version, tag, artifact, and Trusted Publishing
+steps in the [release guide](docs/releasing.md). Contributors cannot publish a
+package from a pull request.

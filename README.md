@@ -16,18 +16,19 @@ the engine receives only normalized bars and ordered trades.
 
 ## Documentation
 
-- [Documentation home](docs/index.md) — architecture, guarantees, and guide map.
-- [Getting started](docs/getting-started.md) — installation, first provider
+- [Documentation home](https://pineforge-4pass.github.io/pineforge-data/) — architecture, guarantees, and guide map.
+- [Getting started](https://pineforge-4pass.github.io/pineforge-data/getting-started/) — installation, first provider
   request, and local or remote backtest.
-- [Normalized data model](docs/data-model.md) — instruments, contracts, bars,
+- [Python API reference](https://pineforge-4pass.github.io/pineforge-data/api/) — generated signatures, types, and docstrings.
+- [Normalized data model](https://pineforge-4pass.github.io/pineforge-data/data-model/) — instruments, contracts, bars,
   live trades, macro vintages, and validation rules.
-- [Provider catalog](docs/providers.md) — shared lifecycle and second-level API
+- [Provider catalog](https://pineforge-4pass.github.io/pineforge-data/providers/) — shared lifecycle and second-level API
   guides for CCXT, CSV, SQLite, and SQLAlchemy.
-- [Backtesting](docs/backtesting.md) — CLI options, configuration files, runtime
+- [Backtesting](https://pineforge-4pass.github.io/pineforge-data/backtesting/) — CLI options, configuration files, runtime
   channels, report schema, and reproducibility.
-- [FastAPI server](docs/server.md) — concurrency, authentication, timeouts,
+- [FastAPI server](https://pineforge-4pass.github.io/pineforge-data/server/) — concurrency, authentication, timeouts,
   compile cache, and deployment.
-- [Provider contract](docs/provider-contract.md) — implementing and testing a
+- [Provider contract](https://pineforge-4pass.github.io/pineforge-data/provider-contract/) — implementing and testing a
   community exchange or broker adapter.
 
 ## Why Python first
@@ -129,9 +130,11 @@ schema = await provider.inspect_schema()
 SQL identifiers are validated against reflected metadata; filter values are
 bound parameters. For complex transformations, expose a database view rather
 than putting raw SQL in harness configuration. See the complete
-[provider catalog](docs/providers.md), with dedicated API guides for
-[CSV](docs/providers/csv.md), [SQLite](docs/providers/sqlite.md), and
-[SQLAlchemy](docs/providers/sqlalchemy.md).
+[provider catalog](https://pineforge-4pass.github.io/pineforge-data/providers/),
+with dedicated API guides for
+[CSV](https://pineforge-4pass.github.io/pineforge-data/providers/csv/),
+[SQLite](https://pineforge-4pass.github.io/pineforge-data/providers/sqlite/), and
+[SQLAlchemy](https://pineforge-4pass.github.io/pineforge-data/providers/sqlalchemy/).
 
 ## Direct backtest harness
 
@@ -238,8 +241,8 @@ The server always transpiles Pine deterministically and hashes the generated
 C++. Its cache stores the compiled `.so` under a key containing that C++ hash
 plus the release, engine, architecture, and compile flags. Concurrent misses
 for the same key compile once; subsequent requests skip compilation. Cache
-hit/key/hash are included in response provenance. See
-[docs/server.md](docs/server.md) for endpoints, limits, deployment, and cache
+hit/key/hash are included in response provenance. See the
+[server guide](https://pineforge-4pass.github.io/pineforge-data/server/) for endpoints, limits, deployment, and cache
 settings.
 
 ## Contributing
@@ -253,10 +256,10 @@ through `pineforge-release`.
 
 | Contribution | Primary location | Start here |
 |---|---|---|
-| Exchange or broker adapter | `src/pineforge_data/providers/` | [Provider contract](docs/provider-contract.md) |
+| Exchange or broker adapter | `src/pineforge_data/providers/` | [Provider contract](https://pineforge-4pass.github.io/pineforge-data/provider-contract/) |
 | Market, contract, bar, or request model | `src/pineforge_data/models.py`, `src/pineforge_data/requests.py`, `src/pineforge_data/providers/base.py` | Existing public models and protocols |
 | Backtest harness or HTTP client | `src/pineforge_data/cli/backtest.py`, `src/pineforge_data/server_client.py` | Harness unit tests |
-| FastAPI concurrency or compile cache | `src/pineforge_data/server.py`, `src/pineforge_data/compile_cache.py` | [Server guide](docs/server.md) |
+| FastAPI concurrency or compile cache | `src/pineforge_data/server.py`, `src/pineforge_data/compile_cache.py` | [Server guide](https://pineforge-4pass.github.io/pineforge-data/server/) |
 | Release-container integration | `src/pineforge_data/release_contract.py`, `src/pineforge_data/docker_runtime.py` | Pinned release contract and Docker tests |
 | Documentation or examples | `README.md`, `docs/` | A focused documentation PR |
 
@@ -303,8 +306,8 @@ end-to-end backtest work.
    PINEFORGE_DOCKER_TEST=1 .venv/bin/pytest tests/test_docker_integration.py
    ```
 
-Read the [documentation home](docs/index.md) and
-[CONTRIBUTING.md](CONTRIBUTING.md) for provider requirements,
+Read the [documentation home](https://pineforge-4pass.github.io/pineforge-data/)
+and [CONTRIBUTING.md](https://github.com/pineforge-4pass/pineforge-data/blob/main/CONTRIBUTING.md) for provider requirements,
 determinism rules, external provider entry points, and the complete checklist.
 For broad changes to public models or the report contract, open an issue first
 so providers and runtime consumers can agree on the shape before implementation.

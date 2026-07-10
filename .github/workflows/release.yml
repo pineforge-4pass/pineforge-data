@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install '.[release]'
+      - name: Verify release tag
+        run: python scripts/verify_release.py "${{ github.event.release.tag_name }}"
+      - name: Build wheel and source distribution
+        run: python -m build
+      - name: Check distribution metadata
+        run: python -m twine check --strict dist/*
+      - name: Install wheel in a clean environment
+        run: |
+          python -m venv /tmp/pineforge-wheel
+          /tmp/pineforge-wheel/bin/python -m pip install dist/*.whl
+          /tmp/pineforge-wheel/bin/python -c "import pineforge_data; assert 'Bar' in pineforge_data.__all__"
+      - name: Upload validated distributions
+        uses: actions/upload-artifact@v5
+        with:
+          name: python-package-distributions
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/pineforge-data/
+    permissions:
+      id-token: write
+    steps:
+      - name: Download validated distributions
+        uses: actions/download-artifact@v6
+        with:
+          name: python-package-distributions
+          path: dist/
+      - name: Publish to PyPI with Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@release/v1

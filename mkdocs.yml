@@ -1,0 +1,97 @@
+site_name: PineForge Data
+site_description: Provider-neutral market and macro data adapters for PineForge
+site_url: https://pineforge-4pass.github.io/pineforge-data/
+repo_url: https://github.com/pineforge-4pass/pineforge-data
+repo_name: pineforge-4pass/pineforge-data
+edit_uri: edit/main/docs/
+copyright: Copyright &copy; PineForge contributors
+
+theme:
+  name: material
+  features:
+    - content.code.copy
+    - content.code.annotate
+    - navigation.footer
+    - navigation.indexes
+    - navigation.sections
+    - navigation.top
+    - search.highlight
+    - search.suggest
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Use dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Use light mode
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            docstring_style: google
+            filters: ["!^_"]
+            heading_level: 2
+            inherited_members: false
+            members_order: source
+            merge_init_into_class: true
+            separate_signature: true
+            show_object_full_path: false
+            show_root_full_path: false
+            show_root_heading: true
+            show_signature_annotations: true
+            show_source: false
+            signature_crossrefs: true
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Concepts:
+      - Data model: data-model.md
+      - Provider contract: provider-contract.md
+  - Providers:
+      - Provider catalog: providers.md
+      - Shared tabular mapping: providers/tabular-schema.md
+      - CCXT: providers/ccxt.md
+      - CSV: providers/csv.md
+      - SQLite: providers/sqlite.md
+      - SQLAlchemy: providers/sqlalchemy.md
+  - Backtesting:
+      - Harness and reports: backtesting.md
+      - FastAPI server: server.md
+  - API reference:
+      - Overview: api/index.md
+      - Models: api/models.md
+      - Requests: api/requests.md
+      - Providers: api/providers.md
+      - Backtesting: api/backtesting.md
+      - Streaming and C ABI: api/streaming.md
+      - Server components: api/server.md
+  - Maintainers:
+      - Releasing: releasing.md
+      - Contributing: https://github.com/pineforge-4pass/pineforge-data/blob/main/CONTRIBUTING.md

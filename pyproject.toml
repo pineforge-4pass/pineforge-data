@@ -22,6 +22,9 @@ classifiers = [
 ]
 dependencies = []
 
+[project.scripts]
+pineforge-backtest = "pineforge_data.cli.backtest:main"
+
 [project.optional-dependencies]
 ccxt = ["ccxt>=4.5.64,<5"]
 dev = [

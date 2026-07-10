@@ -41,3 +41,50 @@ jobs:
           cache: pip
       - run: python -m pip install -e '.[dev]'
       - run: PINEFORGE_DOCKER_TEST=1 pytest tests/test_docker_integration.py
+
+  database-e2e:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: pineforge
+          MYSQL_USER: pineforge
+          MYSQL_PASSWORD: pineforge
+          MYSQL_ROOT_PASSWORD: pineforge-root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping --host=127.0.0.1 --user=pineforge --password=pineforge --silent"
+          --health-interval=2s
+          --health-timeout=5s
+          --health-retries=30
+          --health-start-period=15s
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: pineforge
+          POSTGRES_USER: pineforge
+          POSTGRES_PASSWORD: pineforge
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready --username=pineforge --dbname=pineforge"
+          --health-interval=2s
+          --health-timeout=5s
+          --health-retries=30
+          --health-start-period=10s
+    env:
+      PINEFORGE_DATABASE_E2E: "1"
+      PINEFORGE_CORPUS_OHLCV: tests/fixtures/corpus_ohlcv_ETH-USDT-USDT_1m_sample.csv
+      PINEFORGE_MYSQL_URL: mysql+pymysql://pineforge:pineforge@127.0.0.1:3306/pineforge
+      PINEFORGE_POSTGRES_URL: postgresql+psycopg://pineforge:pineforge@127.0.0.1:5432/pineforge
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e '.[dev,database-e2e]'
+      - run: pytest tests/test_database_e2e.py

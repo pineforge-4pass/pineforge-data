@@ -1,0 +1,33 @@
+name: pineforge-data-database-e2e
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: pineforge
+      MYSQL_USER: pineforge
+      MYSQL_PASSWORD: pineforge
+      MYSQL_ROOT_PASSWORD: pineforge-root
+    ports:
+      - "127.0.0.1::3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping --host=127.0.0.1 --user=pineforge --password=pineforge --silent"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: pineforge
+      POSTGRES_USER: pineforge
+      POSTGRES_PASSWORD: pineforge
+    ports:
+      - "127.0.0.1::5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready --username=pineforge --dbname=pineforge"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 10s

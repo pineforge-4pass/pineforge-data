@@ -77,6 +77,20 @@ python -m twine check dist/*
 PINEFORGE_DOCKER_TEST=1 pytest tests/test_docker_integration.py
 ```
 
+Database-provider changes must also pass the corpus-backed database suite:
+
+```bash
+python -m pip install -e '.[dev,database-e2e]'
+./scripts/run_database_e2e.sh
+```
+
+The harness starts disposable MySQL and PostgreSQL containers and creates a
+temporary SQLite database. If the sibling engine corpus exists, it streams the
+first requested rows from
+`../pineforge-engine/corpus/data/ohlcv_ETH-USDT-USDT_1m.csv`; otherwise it uses
+the provenance-pinned sample under `tests/fixtures/`. Override the source or
+row count with `PINEFORGE_CORPUS_OHLCV` and `PINEFORGE_DATABASE_E2E_ROWS`.
+
 Maintainers should follow the version, tag, artifact, and Trusted Publishing
 steps in the [release guide](docs/releasing.md). Contributors cannot publish a
 package from a pull request.

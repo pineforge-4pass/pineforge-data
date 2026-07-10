@@ -29,6 +29,11 @@ pineforge-backtest-server = "pineforge_data.server:main"
 [project.optional-dependencies]
 ccxt = ["ccxt>=4.5.64,<5"]
 database = ["sqlalchemy>=2.0,<3"]
+database-e2e = [
+    "sqlalchemy>=2.0,<3",
+    "pymysql>=1.1,<2",
+    "psycopg[binary]>=3.2,<4",
+]
 docs = [
     "mkdocs>=1.6,<2",
     "mkdocs-material>=9.7,<10",

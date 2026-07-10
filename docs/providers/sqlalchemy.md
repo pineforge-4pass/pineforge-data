@@ -12,12 +12,20 @@ without requiring ORM models or a PineForge-owned DDL.
 Install PineForge's database extra and the driver for the target dialect:
 
 ```bash
-pip install 'pineforge-data[database]' psycopg
+pip install 'pineforge-data[database]' 'psycopg[binary]'  # PostgreSQL
+pip install 'pineforge-data[database]' pymysql             # MySQL
 ```
 
 The `database` extra installs SQLAlchemy, not every database driver. For
 example, PostgreSQL may use `psycopg`, MySQL may use `pymysql`, and an
 organization-specific dialect may have its own package.
+
+Use an explicit synchronous driver in the URL:
+
+```text
+postgresql+psycopg://user:password@host/database
+mysql+pymysql://user:password@host/database
+```
 
 ## Construct the provider
 
@@ -159,3 +167,19 @@ Only synchronous engines are supported initially. Each provider owns one
 engine and reflected table cache. Query pagination is delegated to the database
 filter and ordering plan; PineForge Data currently materializes the selected
 rows before final normalization and `limit` application.
+
+## Corpus-backed compatibility test
+
+Contributors can verify reflection, arbitrary column mapping, bound
+symbol/timeframe filters, timestamp pushdown, and normalization against SQLite,
+MySQL, and PostgreSQL with one command:
+
+```bash
+python -m pip install -e '.[dev,database-e2e]'
+./scripts/run_database_e2e.sh
+```
+
+The three databases receive the same OHLCV slice from the PineForge validation
+corpus. The test constructs providers through the public registry API and
+requires every backend to return identical normalized bars. The containers and
+their volumes are removed when the command exits.

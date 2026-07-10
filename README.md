@@ -144,12 +144,16 @@ timestamps to Unix milliseconds, and add deterministic offline tests.
 ```bash
 git clone https://github.com/pineforge-4pass/pineforge-data.git
 cd pineforge-data
-python -m pip install -e '.[dev,ccxt,database,server,docs,release]'
+python -m pip install -e '.[dev,ccxt,database-e2e,server,docs,release]'
 ruff check .
 mypy src
 pytest
 mkdocs build --strict
 ```
+
+Run `./scripts/run_database_e2e.sh` to seed corpus OHLCV into disposable
+SQLite, MySQL, and PostgreSQL databases and verify the public provider API
+against all three.
 
 Read [CONTRIBUTING.md](https://github.com/pineforge-4pass/pineforge-data/blob/main/CONTRIBUTING.md)
 for the provider contract, entry points, security rules, and full validation

@@ -48,7 +48,7 @@ def test_client_posts_normalized_request(monkeypatch: pytest.MonkeyPatch) -> Non
         bars,
         instrument=instrument,
         source="ccxt:kraken",
-        options=BacktestOptions(input_timeframe="1"),
+        options=BacktestOptions(input_timeframe="1", trade_start_time_ms=1_000),
         strategy_params={"Length": 14},
     )
 
@@ -58,6 +58,7 @@ def test_client_posts_normalized_request(monkeypatch: pytest.MonkeyPatch) -> Non
     body = json.loads(cast(bytes, observed[0].data))
     assert body["bars"][0]["timestamp_ms"] == 1_000
     assert body["strategy_params"] == {"Length": 14}
+    assert body["options"]["trade_start_time_ms"] == 1_000
 
 
 def test_client_rejects_non_scalar_strategy_values() -> None:

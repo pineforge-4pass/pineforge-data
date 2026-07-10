@@ -51,6 +51,7 @@ def test_release_environment_maps_runtime_options() -> None:
             script_timeframe="60",
             bar_magnifier=True,
             magnifier_samples=8,
+            trade_start_time_ms=1_700_000_000_000,
         ),
         {"Length": 14},
         {"commission_value": 0.1},
@@ -61,6 +62,7 @@ def test_release_environment_maps_runtime_options() -> None:
     assert environment["PINEFORGE_INPUT_TF"] == "15"
     assert environment["PINEFORGE_SCRIPT_TF"] == "60"
     assert environment["PINEFORGE_SYMINFO"] == "/in/syminfo.json"
+    assert environment["PINEFORGE_TRADE_START_MS"] == "1700000000000"
 
 
 def test_release_contract_rejects_unsupported_trace() -> None:

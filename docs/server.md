@@ -18,6 +18,11 @@ Clients may supply `X-Request-ID`; otherwise the server creates one. When
 `Authorization: Bearer <token>`. Health endpoints intentionally remain
 unauthenticated for container orchestration.
 
+The request option `trade_start_time_ms` suppresses order execution before the
+given Unix-millisecond boundary while still processing every submitted bar.
+The CLI harness sets this automatically when `--warmup-bars` is nonzero; direct
+API clients must submit both the warmup bars and the boundary explicitly.
+
 ## Concurrency and overload behavior
 
 Run one Uvicorn worker per container. The service owns a process-wide semaphore;

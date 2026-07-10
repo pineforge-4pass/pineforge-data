@@ -86,6 +86,7 @@ class ApiBacktestOptions(BaseModel):
     magnifier_distribution: MagnifierName = "endpoints"
     trace_enabled: bool = False
     chart_timezone: str | None = Field(default=None, max_length=128)
+    trade_start_time_ms: int | None = Field(default=None, ge=0, le=2**63 - 1)
 
 
 class BacktestApiRequest(BaseModel):
@@ -143,6 +144,7 @@ class BacktestApiRequest(BaseModel):
             ],
             trace_enabled=self.options.trace_enabled,
             chart_timezone=self.options.chart_timezone,
+            trade_start_time_ms=self.options.trade_start_time_ms,
         )
         return self.pine_source, bars, instrument, options
 
@@ -519,6 +521,8 @@ class BacktestService:
                 "--chart-tz",
                 options.chart_timezone or "",
             ]
+            if options.trade_start_time_ms is not None:
+                command.extend(("--trade-start-ms", str(options.trade_start_time_ms)))
             try:
                 stdout = await self._run_command(
                     command,

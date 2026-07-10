@@ -16,7 +16,12 @@ from pineforge_data import (
     PineForgeBacktestRunner,
 )
 from pineforge_data.backtest import _PfEquityPoint, _PfReport, _PfTrade
-from pineforge_data.cli.backtest import build_parser, ccxt_timeframe_to_pine, parse_timestamp
+from pineforge_data.cli.backtest import (
+    build_parser,
+    ccxt_timeframe_to_pine,
+    parse_timestamp,
+    source_timeframe_to_pine,
+)
 
 
 class FakeFunction:
@@ -139,6 +144,7 @@ def test_runner_rejects_abi_mismatch_and_unsorted_bars() -> None:
 )
 def test_ccxt_timeframe_conversion(ccxt: str, pine: str) -> None:
     assert ccxt_timeframe_to_pine(ccxt) == pine
+    assert source_timeframe_to_pine(ccxt) == pine
 
 
 def test_timestamp_parser_accepts_unix_ms_and_iso_8601() -> None:
@@ -165,4 +171,28 @@ def test_cli_requires_raw_pine_instead_of_shared_library() -> None:
     )
 
     assert args.pine == Path("strategy.pine")
+    assert args.venue == "kraken"
     assert not hasattr(args, "strategy")
+
+
+def test_cli_accepts_generic_provider_and_venue_names() -> None:
+    args = build_parser().parse_args(
+        [
+            "--pine",
+            "strategy.pine",
+            "--provider",
+            "community-broker",
+            "--venue",
+            "paper",
+            "--symbol",
+            "ES/SEP26",
+            "--timeframe",
+            "1m",
+            "--start",
+            "1000",
+            "--end",
+            "2000",
+        ]
+    )
+
+    assert (args.provider, args.venue) == ("community-broker", "paper")

@@ -21,18 +21,19 @@ and asynchronous I/O. Python makes those integrations accessible to community
 contributors. Engine throughput remains native: normalized records are packed
 into contiguous C ABI arrays and submitted in one call.
 
-If profiling later identifies a normalization hot path, it can gain an optional
-native extension without changing the public provider contracts.
-
 ## Initial contracts
 
-- `Instrument` — normalized symbol, venue, timezone, session, and volume units.
+- `Instrument` — normalized symbol, provider-native ID, venue, asset/market type,
+  currencies, contract terms, timezone, session, and volume units.
+- `MarketListing` and `MarketQuery` — catalog discovery without vendor schemas.
 - `Bar` — confirmed OHLCV with source provenance.
 - `TradeTick` — the provider-neutral four-field engine payload plus provenance.
 - `MacroObservation` — observation period, first release, and vintage timestamps
   to prevent revised-data lookahead.
-- `HistoricalBarProvider`, `LiveTradeProvider`, and `MacroDataProvider` — small
-  structural protocols that community adapters implement.
+- `MarketCatalogProvider`, `HistoricalBarProvider`, `LiveTradeProvider`, and
+  `MacroDataProvider` — small structural protocols that community adapters
+  implement.
+- `ProviderRegistry` — built-in and installed broker adapters selected by name.
 - `PfBar`, `PfTradeTick`, and `EngineStreamSink` — dependency-free `ctypes`
   interoperability with PineForge strategy libraries.
 
@@ -59,14 +60,21 @@ request = BarRequest(
 )
 
 async with CcxtProvider("kraken") as provider:
+    listing = await provider.resolve_market("BTC/USDT")
     confirmed_bars = await provider.fetch_bars(request)
 ```
 
-`Instrument.symbol` uses CCXT's unified spelling. Exchange credentials and
-exchange-specific options can be passed through `config`, while endpoint
-options remain isolated in `ohlcv_params` and `trade_params`. Realtime public
-trades use REST polling in this bootstrap; a WebSocket transport can implement
-the same `LiveTradeProvider` contract later.
+`Instrument.symbol` uses CCXT's exact unified spelling. Do not infer a market
+by parsing it: `resolve_market()` uses CCXT's catalog fields to distinguish
+spot, swap, future, and option listings and captures `base`, `quote`, `settle`,
+raw exchange ID, contract size, linear/inverse settlement, expiry, strike, and
+option type. For example, `BTC/USDT` and `BTC/USDT:USDT` are separate markets.
+
+Exchange credentials and exchange-specific options can be passed through
+`config`, while endpoint options remain isolated in `market_params`,
+`ohlcv_params`, and `trade_params`. Realtime public trades use REST polling in
+this bootstrap; a WebSocket transport can implement the same
+`LiveTradeProvider` contract later.
 
 `TradeSubscription.start_ms` can pin the live handoff to the next timestamp
 after an engine warmup. `start_sequence` is the last accepted sequence, so the
@@ -104,7 +112,8 @@ git submodule update --init
 ```bash
 .venv/bin/pineforge-backtest \
   --pine strategy.pine \
-  --exchange kraken \
+  --provider ccxt \
+  --venue kraken \
   --symbol BTC/USD \
   --timeframe 15m \
   --start 2026-07-01T00:00:00Z \
@@ -136,11 +145,9 @@ source-available under its own PolyForm Noncommercial license and supplemental
 terms; review `vendor/pineforge-codegen-oss/LICENSE` before distribution or
 commercial use. The engine remains Apache-2.0.
 
-Provider implementations are organized by their strongest supported runtime.
-The current Python bucket contains CCXT and the harness; native low-latency
-providers live under `cpp/providers`. Both buckets must emit the same normalized
-records, but an individual provider does not need implementations in both
-languages.
+Provider implementations in this repository are Python-only. The compiled C++
+strategy and engine stay behind the Docker/runtime boundary; broker SDKs and
+provider-specific types do not cross into `pineforge-engine`.
 
 ## Development
 
@@ -157,14 +164,16 @@ PINEFORGE_DOCKER_TEST=1 .venv/bin/pytest tests/test_docker_integration.py
 
 A provider adapter should:
 
-1. fetch or subscribe to its external service;
-2. retain source and instrument provenance;
-3. normalize timestamps to Unix milliseconds and records to the public models;
-4. emit stable ordering sequences when the provider supplies them;
-5. batch records before crossing the engine ABI when practical.
+1. expose exact market discovery and symbol resolution;
+2. fetch or subscribe to its external service;
+3. retain source and instrument provenance;
+4. normalize timestamps to Unix milliseconds and records to the public models;
+5. emit stable ordering sequences when the provider supplies them;
+6. batch records before crossing the engine ABI when practical.
 
 It should not add provider-specific fields to `pineforge-engine`. Data that the
 engine does not consume remains in provider-owned metadata or higher-level
 models in this repository.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) before adding a provider.
+See [the provider contract](docs/provider-contract.md) and
+[CONTRIBUTING.md](CONTRIBUTING.md) before adding a provider.

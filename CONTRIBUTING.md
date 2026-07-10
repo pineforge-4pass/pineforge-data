@@ -52,6 +52,11 @@ The callable receives `(venue, config)` and returns a structural
 `MarketDataProvider`. See [docs/provider-contract.md](docs/provider-contract.md)
 for the normalized model and a complete skeleton.
 
+Every provider must have a second-level API guide at
+`docs/providers/<provider>.md` and a catalog row in
+`docs/providers.md`. Keep provider-specific installation, constructor,
+configuration, behavior, errors, and limitations out of the catalog page.
+
 ## Determinism and macro vintages
 
 Historical results must be reproducible. Cache or snapshot mutable upstream

@@ -103,7 +103,6 @@ cache.
 ## Next steps
 
 - [Learn the normalized data model](data-model.md).
-- [Search and filter provider markets](providers.md).
-- [Connect local CSV, SQLite, or SQLAlchemy data](local-data.md).
+- [Choose a provider and open its API guide](providers.md).
 - [Configure parameters, runtime channels, and reports](backtesting.md).
 - [Deploy the concurrent server](server.md).

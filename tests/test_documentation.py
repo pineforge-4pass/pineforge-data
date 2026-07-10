@@ -8,10 +8,18 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 MARKDOWN_LINK = re.compile(r"\[[^]]*]\(([^)]+)\)")
-DOCUMENTS = [ROOT / "README.md", ROOT / "CONTRIBUTING.md", *sorted((ROOT / "docs").glob("*.md"))]
+DOCUMENTS = [
+    ROOT / "README.md",
+    ROOT / "CONTRIBUTING.md",
+    *sorted((ROOT / "docs").rglob("*.md")),
+]
 
 
-@pytest.mark.parametrize("document", DOCUMENTS, ids=lambda path: path.name)
+@pytest.mark.parametrize(
+    "document",
+    DOCUMENTS,
+    ids=lambda path: str(path.relative_to(ROOT)),
+)
 def test_relative_documentation_links_exist(document: Path) -> None:
     for raw_target in MARKDOWN_LINK.findall(document.read_text(encoding="utf-8")):
         target = raw_target.split("#", 1)[0]

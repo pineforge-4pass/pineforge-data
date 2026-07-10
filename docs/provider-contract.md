@@ -88,3 +88,11 @@ passes `--venue` plus the JSON object from `--provider-config` to the factory.
 - confirmed OHLCV behavior, pagination, deduplication, and source provenance;
 - close/cleanup behavior and explicit missing-capability errors;
 - no network access or credentials in CI.
+
+## Documentation required for a provider PR
+
+Add `docs/providers/<provider>.md` with installation, constructor and registry
+configuration, supported capabilities, symbol semantics, examples, errors, and
+limitations. Add the provider to the catalog in [providers.md](providers.md).
+Provider-specific API details belong on that second-level page; keep the
+catalog focused on discovery and shared lifecycle behavior.

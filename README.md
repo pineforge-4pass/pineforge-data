@@ -21,10 +21,8 @@ the engine receives only normalized bars and ordered trades.
   request, and local or remote backtest.
 - [Normalized data model](docs/data-model.md) — instruments, contracts, bars,
   live trades, macro vintages, and validation rules.
-- [Using providers](docs/providers.md) — registry, CCXT market discovery,
-  historical bars, live trades, configuration, and errors.
-- [Local files and databases](docs/local-data.md) — runtime schema discovery,
-  arbitrary CSV/SQLite DDL, SQLAlchemy databases, and column mappings.
+- [Provider catalog](docs/providers.md) — shared lifecycle and second-level API
+  guides for CCXT, CSV, SQLite, and SQLAlchemy.
 - [Backtesting](docs/backtesting.md) — CLI options, configuration files, runtime
   channels, report schema, and reproducibility.
 - [FastAPI server](docs/server.md) — concurrency, authentication, timeouts,
@@ -131,8 +129,9 @@ schema = await provider.inspect_schema()
 SQL identifiers are validated against reflected metadata; filter values are
 bound parameters. For complex transformations, expose a database view rather
 than putting raw SQL in harness configuration. See the complete
-[local-data guide](docs/local-data.md) for CSV, native read-only SQLite,
-SQLAlchemy URLs, timestamp handling, symbol/timeframe semantics, and CLI JSON.
+[provider catalog](docs/providers.md), with dedicated API guides for
+[CSV](docs/providers/csv.md), [SQLite](docs/providers/sqlite.md), and
+[SQLAlchemy](docs/providers/sqlalchemy.md).
 
 ## Direct backtest harness
 

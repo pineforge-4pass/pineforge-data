@@ -1,28 +1,171 @@
 name: Release
 
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Semantic version component to increment
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
 
 permissions:
   contents: read
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      published: ${{ steps.release.outputs.published }}
+      sha: ${{ steps.release.outputs.sha }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Create and merge version bump
+        id: release
+        env:
+          BUMP: ${{ inputs.bump }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ]]; then
+            echo "Release must be dispatched from $DEFAULT_BRANCH, not $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
+          current_version="$(python scripts/bump_version.py current)"
+          version="$(python scripts/bump_version.py "$BUMP")"
+          tag="v$version"
+          git fetch origin "$DEFAULT_BRANCH" --tags
+
+          if sha="$(git rev-list -n 1 "$tag" 2>/dev/null)" && [[ -n "$sha" ]]; then
+            echo "Reusing existing tag $tag at $sha"
+          else
+            git show "origin/$DEFAULT_BRANCH:pyproject.toml" > "$RUNNER_TEMP/main-pyproject.toml"
+            main_version="$(python scripts/bump_version.py current --pyproject "$RUNNER_TEMP/main-pyproject.toml")"
+            if [[ "$main_version" == "$version" ]]; then
+              sha="$(git rev-parse "origin/$DEFAULT_BRANCH")"
+              echo "Reusing version bump already merged at $sha"
+            elif [[ "$main_version" != "$current_version" ]]; then
+              echo "main moved from version $current_version to $main_version; dispatch again" >&2
+              exit 1
+            else
+              branch="release/$tag-$GITHUB_RUN_ID"
+              git switch --create "$branch" "origin/$DEFAULT_BRANCH"
+              written_version="$(python scripts/bump_version.py "$BUMP" --write)"
+              [[ "$written_version" == "$version" ]]
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git add pyproject.toml
+              git commit -m "Release $tag"
+              head_sha="$(git rev-parse HEAD)"
+              git push --set-upstream origin "$branch"
+
+              gh label create skip-changelog \
+                --description "Exclude this PR from generated release notes" \
+                --color "ededed" \
+                --force
+              pr_url="$(gh pr create \
+                --base "$DEFAULT_BRANCH" \
+                --head "$branch" \
+                --title "Release $tag" \
+                --body "Automated **$BUMP** version bump from $current_version to $version.")"
+              pr_number="${pr_url##*/}"
+              gh pr edit "$pr_number" --add-label skip-changelog
+              mergeable=UNKNOWN
+              for _attempt in {1..30}; do
+                mergeable="$(gh pr view "$pr_number" --json mergeable --jq ".mergeable")"
+                [[ "$mergeable" == "MERGEABLE" ]] && break
+                if [[ "$mergeable" == "CONFLICTING" ]]; then
+                  echo "Release PR $pr_number conflicts with $DEFAULT_BRANCH" >&2
+                  exit 1
+                fi
+                sleep 2
+              done
+              if [[ "$mergeable" != "MERGEABLE" ]]; then
+                echo "Release PR $pr_number did not become mergeable" >&2
+                exit 1
+              fi
+              gh pr merge "$pr_number" \
+                --squash \
+                --delete-branch \
+                --match-head-commit "$head_sha" \
+                --subject "Release $tag" \
+                --body "Automated semantic version bump."
+              sha="$(gh pr view "$pr_number" --json mergeCommit --jq ".mergeCommit.oid")"
+            fi
+          fi
+
+          pypi_status="$(curl \
+            --silent \
+            --output /dev/null \
+            --write-out '%{http_code}' \
+            --retry 3 \
+            --retry-all-errors \
+            "https://pypi.org/pypi/pineforge-data/$version/json")"
+          case "$pypi_status" in
+            200) published=true ;;
+            404) published=false ;;
+            *)
+              echo "Unexpected PyPI status $pypi_status while checking $version" >&2
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "published=$published"
+            echo "sha=$sha"
+            echo "tag=$tag"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+          printf "Prepared %s at %s (already on PyPI: %s).\n" \
+            "$tag" "$sha" "$published" >> "$GITHUB_STEP_SUMMARY"
+
   build:
+    if: needs.prepare.outputs.published != 'true'
+    needs: prepare
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ needs.prepare.outputs.sha }}
           persist-credentials: false
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
           cache: pip
       - run: python -m pip install --upgrade pip
-      - run: python -m pip install '.[release]'
-      - name: Verify release tag
-        run: python scripts/verify_release.py "${{ github.event.release.tag_name }}"
+      - run: python -m pip install -e '.[dev,ccxt,release]'
+      - name: Verify release tag and source
+        run: python scripts/verify_release.py "${{ needs.prepare.outputs.tag }}"
+      - name: Run static and unit checks
+        run: |
+          ruff check .
+          mypy src
+          pytest
+      - name: Run Docker integration checks
+        run: PINEFORGE_DOCKER_TEST=1 pytest tests/test_docker_integration.py
       - name: Build wheel and source distribution
         run: python -m build
       - name: Check distribution metadata
@@ -39,8 +182,39 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  github-release:
+    if: needs.prepare.outputs.published != 'true'
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create GitHub Release with generated notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "GitHub Release $TAG already exists"
+          else
+            gh release create "$TAG" \
+              --target "$SHA" \
+              --title "pineforge-data $TAG" \
+              --generate-notes \
+              --latest
+          fi
+
   publish:
-    needs: build
+    if: needs.prepare.outputs.published != 'true'
+    needs:
+      - prepare
+      - build
+      - github-release
     runs-on: ubuntu-latest
     environment:
       name: pypi

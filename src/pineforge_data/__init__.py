@@ -7,6 +7,12 @@ from .backtest import (
     MagnifierDistribution,
     PineForgeBacktestRunner,
 )
+from .docker_runtime import (
+    DockerBacktestRuntime,
+    DockerExecutionError,
+    DockerPrerequisiteError,
+    discover_repository_root,
+)
 from .engine import EngineStreamSink, PfBar, PfTradeTick, pack_bars, pack_trade_ticks
 from .errors import EngineStreamError
 from .models import Bar, Instrument, MacroObservation, TradeTick
@@ -32,6 +38,9 @@ __all__ = [
     "CcxtDependencyError",
     "CcxtError",
     "CcxtProvider",
+    "DockerBacktestRuntime",
+    "DockerExecutionError",
+    "DockerPrerequisiteError",
     "EngineBacktestError",
     "EngineStreamError",
     "EngineStreamSink",
@@ -47,6 +56,7 @@ __all__ = [
     "PineForgeBacktestRunner",
     "TradeSubscription",
     "TradeTick",
+    "discover_repository_root",
     "pack_bars",
     "pack_trade_ticks",
 ]

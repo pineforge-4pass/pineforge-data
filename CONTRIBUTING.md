@@ -3,6 +3,14 @@
 Community data providers are the reason this repository exists. Keep the core
 contracts small and put vendor behavior behind provider modules.
 
+Docker and initialized codegen/engine submodules are required for raw-Pine
+integration work:
+
+```bash
+git submodule update --init
+docker version
+```
+
 ## Provider checklist
 
 - Implement one or more protocols from `pineforge_data.providers`.
@@ -31,4 +39,5 @@ ruff check .
 mypy src
 pytest
 python -m build
+PINEFORGE_DOCKER_TEST=1 pytest tests/test_docker_integration.py
 ```

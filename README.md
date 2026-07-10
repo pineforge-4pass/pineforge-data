@@ -74,13 +74,36 @@ adapter emits `start_sequence + 1` next.
 
 ## Direct backtest harness
 
-`pineforge-backtest` fetches confirmed OHLCV through a data provider, packs the
-normalized bars into the PineForge C ABI, and calls a compiled strategy library
-directly. It does not create an intermediate CSV.
+The public backtest input is raw PineScript v6. `pineforge-backtest` fetches
+confirmed OHLCV through a data provider and runs this pinned pipeline:
+
+```text
+raw .pine + provider OHLCV
+        ↓ read-only mount
+Docker: Python codegen → C++ strategy → pineforge-engine → JSON report
+```
+
+Docker is a prerequisite. A host C++ compiler and a precompiled strategy
+library are not required.
+
+Clone with both pinned runtime dependencies:
 
 ```bash
-pineforge-backtest \
-  --strategy /path/to/strategy.so \
+git clone --recurse-submodules https://github.com/pineforge-4pass/pineforge-data.git
+cd pineforge-data
+python3 -m venv .venv
+.venv/bin/pip install -e '.[ccxt]'
+```
+
+For an existing checkout:
+
+```bash
+git submodule update --init
+```
+
+```bash
+.venv/bin/pineforge-backtest \
+  --pine strategy.pine \
   --exchange kraken \
   --symbol BTC/USD \
   --timeframe 15m \
@@ -89,6 +112,14 @@ pineforge-backtest \
   --output report.json \
   --pretty
 ```
+
+The first invocation builds a local image tagged from the container source and
+the exact codegen and engine submodule commits. Later invocations reuse it.
+Pass `--rebuild-image` to force a rebuild or `--no-image-build` to require a
+prebuilt local image.
+Compilation and execution run as a non-root user with networking disabled, all
+Linux capabilities dropped, a read-only root filesystem, and only a read-only
+temporary input mount.
 
 The JSON report contains data provenance, processed-bar counts, every closed
 trade, all/long/short trade statistics, equity statistics, security-feed
@@ -99,11 +130,17 @@ Use `--provider-config config.json` for CCXT constructor options and
 `--strategy-params inputs.json` for Pine input overrides. The provider config
 file may contain credentials, so keep it outside version control.
 
+The report records the Pine source hash, generated C++ hash, transpile and
+compile timings, and the exact codegen and engine commits. The OSS codegen is
+source-available under its own PolyForm Noncommercial license and supplemental
+terms; review `vendor/pineforge-codegen-oss/LICENSE` before distribution or
+commercial use. The engine remains Apache-2.0.
+
 Provider implementations are organized by their strongest supported runtime.
 The current Python bucket contains CCXT and the harness; native low-latency
-providers will live in the C++ bucket. Both buckets must emit the same
-normalized records, but an individual provider does not need implementations
-in both languages.
+providers live under `cpp/providers`. Both buckets must emit the same normalized
+records, but an individual provider does not need implementations in both
+languages.
 
 ## Development
 
@@ -113,6 +150,7 @@ python3 -m venv .venv
 .venv/bin/ruff check .
 .venv/bin/mypy src
 .venv/bin/pytest
+PINEFORGE_DOCKER_TEST=1 .venv/bin/pytest tests/test_docker_integration.py
 ```
 
 ## Provider boundary

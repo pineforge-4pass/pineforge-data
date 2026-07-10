@@ -1,0 +1,6 @@
+[submodule "vendor/pineforge-codegen-oss"]
+	path = vendor/pineforge-codegen-oss
+	url = https://github.com/pineforge-4pass/pineforge-codegen-oss.git
+[submodule "vendor/pineforge-engine"]
+	path = vendor/pineforge-engine
+	url = https://github.com/pineforge-4pass/pineforge-engine.git

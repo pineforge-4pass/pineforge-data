@@ -1,0 +1,11 @@
+//@version=6
+strategy("Docker SMA cross", initial_capital=10000)
+
+fast = ta.sma(close, 2)
+slow = ta.sma(close, 4)
+
+if ta.crossover(fast, slow)
+    strategy.entry("Long", strategy.long)
+
+if ta.crossunder(fast, slow)
+    strategy.close("Long")

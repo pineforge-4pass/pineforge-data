@@ -212,10 +212,18 @@ class DockerBacktestRuntime:
                 },
                 "strategy_params": dict(strategy_params or {}),
             }
-            (workspace / "request.json").write_text(
+            request_path = workspace / "request.json"
+            request_path.write_text(
                 json.dumps(request, separators=(",", ":"), allow_nan=False),
                 encoding="utf-8",
             )
+            for input_path in (
+                workspace / "strategy.pine",
+                workspace / "ohlcv.csv",
+                request_path,
+            ):
+                input_path.chmod(0o644)
+            workspace.chmod(0o755)
             completed = subprocess.run(
                 [
                     "docker",

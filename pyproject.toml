@@ -29,9 +29,19 @@ pineforge-backtest-server = "pineforge_data.server:main"
 [project.optional-dependencies]
 ccxt = ["ccxt>=4.5.64,<5"]
 database = ["sqlalchemy>=2.0,<3"]
+docs = [
+    "mkdocs>=1.6,<2",
+    "mkdocs-material>=9.7,<10",
+    "mkdocstrings-python>=2.0,<3",
+    "ruff>=0.8",
+]
 server = [
     "fastapi>=0.139,<0.140",
     "uvicorn>=0.51,<0.52",
+]
+release = [
+    "build>=1.2,<2",
+    "twine>=6.2,<7",
 ]
 dev = [
     "build>=1.2",
@@ -46,6 +56,7 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/pineforge-4pass/pineforge-data"
+Documentation = "https://pineforge-4pass.github.io/pineforge-data/"
 Issues = "https://github.com/pineforge-4pass/pineforge-data/issues"
 Source = "https://github.com/pineforge-4pass/pineforge-data"
 

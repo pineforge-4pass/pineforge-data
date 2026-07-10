@@ -14,6 +14,22 @@ The engine does not import or link this package. Provider transport,
 authentication, retries, caching, symbol mapping, and vendor schemas stay here;
 the engine receives only normalized bars and ordered trades.
 
+## Documentation
+
+- [Documentation home](docs/index.md) — architecture, guarantees, and guide map.
+- [Getting started](docs/getting-started.md) — installation, first provider
+  request, and local or remote backtest.
+- [Normalized data model](docs/data-model.md) — instruments, contracts, bars,
+  live trades, macro vintages, and validation rules.
+- [Using providers](docs/providers.md) — registry, CCXT market discovery,
+  historical bars, live trades, configuration, and errors.
+- [Backtesting](docs/backtesting.md) — CLI options, configuration files, runtime
+  channels, report schema, and reproducibility.
+- [FastAPI server](docs/server.md) — concurrency, authentication, timeouts,
+  compile cache, and deployment.
+- [Provider contract](docs/provider-contract.md) — implementing and testing a
+  community exchange or broker adapter.
+
 ## Why Python first
 
 Provider integrations are dominated by HTTP, WebSockets, JSON, credentials,
@@ -189,31 +205,69 @@ hit/key/hash are included in response provenance. See
 [docs/server.md](docs/server.md) for endpoints, limits, deployment, and cache
 settings.
 
-## Development
+## Contributing
+
+Community providers, market-model improvements, server/runtime work, tests, and
+documentation are welcome. Provider integrations are Python-only; engine and
+codegen changes belong in their upstream repositories and are consumed here
+through `pineforge-release`.
+
+### Choose the right contribution path
+
+| Contribution | Primary location | Start here |
+|---|---|---|
+| Exchange or broker adapter | `src/pineforge_data/providers/` | [Provider contract](docs/provider-contract.md) |
+| Market, contract, bar, or request model | `src/pineforge_data/models.py`, `src/pineforge_data/requests.py`, `src/pineforge_data/providers/base.py` | Existing public models and protocols |
+| Backtest harness or HTTP client | `src/pineforge_data/cli/backtest.py`, `src/pineforge_data/server_client.py` | Harness unit tests |
+| FastAPI concurrency or compile cache | `src/pineforge_data/server.py`, `src/pineforge_data/compile_cache.py` | [Server guide](docs/server.md) |
+| Release-container integration | `src/pineforge_data/release_contract.py`, `src/pineforge_data/docker_runtime.py` | Pinned release contract and Docker tests |
+| Documentation or examples | `README.md`, `docs/` | A focused documentation PR |
+
+For a new provider, implement the smallest applicable structural protocols,
+register its factory, keep its SDK in an optional dependency extra, and add
+offline fixture tests. Resolve exact upstream markets through their catalog;
+do not parse symbols to infer base, quote, settlement, or contract terms.
+Provider-specific fields stay in this repository and must not leak into
+`pineforge-engine`.
+
+### Development setup
 
 ```bash
+git clone https://github.com/pineforge-4pass/pineforge-data.git
+cd pineforge-data
 python3 -m venv .venv
 .venv/bin/pip install -e '.[dev,ccxt,server]'
-.venv/bin/ruff check .
-.venv/bin/mypy src
-.venv/bin/pytest
-PINEFORGE_DOCKER_TEST=1 .venv/bin/pytest tests/test_docker_integration.py
 ```
 
-## Provider boundary
+No Git submodules are required. Docker is needed only for release-runtime and
+end-to-end backtest work.
 
-A provider adapter should:
+### Before opening a pull request
 
-1. expose exact market discovery and symbol resolution;
-2. fetch or subscribe to its external service;
-3. retain source and instrument provenance;
-4. normalize timestamps to Unix milliseconds and records to the public models;
-5. emit stable ordering sequences when the provider supplies them;
-6. batch records before crossing the engine ABI when practical.
+1. Keep the change focused and document any public API, report-schema, provider,
+   runtime-image, or cache-key compatibility impact.
+2. Add deterministic offline tests; CI must not require credentials or live
+   provider access.
+3. Keep credentials out of fixtures, logs, exception messages, and committed
+   configuration.
+4. Run the standard checks:
 
-It should not add provider-specific fields to `pineforge-engine`. Data that the
-engine does not consume remains in provider-owned metadata or higher-level
-models in this repository.
+   ```bash
+   .venv/bin/ruff format --check src tests
+   .venv/bin/ruff check .
+   .venv/bin/mypy src
+   .venv/bin/pytest
+   .venv/bin/python -m build
+   ```
 
-See [the provider contract](docs/provider-contract.md) and
-[CONTRIBUTING.md](CONTRIBUTING.md) before adding a provider.
+5. For Docker, FastAPI server, cache, or release-contract changes, also run:
+
+   ```bash
+   PINEFORGE_DOCKER_TEST=1 .venv/bin/pytest tests/test_docker_integration.py
+   ```
+
+Read the [documentation home](docs/index.md) and
+[CONTRIBUTING.md](CONTRIBUTING.md) for provider requirements,
+determinism rules, external provider entry points, and the complete checklist.
+For broad changes to public models or the report contract, open an issue first
+so providers and runtime consumers can agree on the shape before implementation.

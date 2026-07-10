@@ -4,11 +4,11 @@ Community data providers are the reason this repository exists. Keep the core
 contracts small and put vendor behavior behind Python provider modules. This
 repository does not accept a separate C++ provider implementation surface.
 
-Docker and initialized codegen/engine submodules are required for raw-Pine
-integration work:
+Docker is required for raw-Pine integration work. Engine and codegen are
+consumed only through the pinned `pineforge-release` image; do not add source
+submodules or duplicate their build logic here.
 
 ```bash
-git submodule update --init
 docker version
 ```
 

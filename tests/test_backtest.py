@@ -196,3 +196,29 @@ def test_cli_accepts_generic_provider_and_venue_names() -> None:
     )
 
     assert (args.provider, args.venue) == ("community-broker", "paper")
+
+
+def test_cli_can_route_harness_to_concurrent_server() -> None:
+    args = build_parser().parse_args(
+        [
+            "--pine",
+            "strategy.pine",
+            "--venue",
+            "kraken",
+            "--symbol",
+            "BTC/USD",
+            "--timeframe",
+            "15m",
+            "--start",
+            "1000",
+            "--end",
+            "2000",
+            "--server-url",
+            "http://127.0.0.1:8000",
+            "--execution-timeout",
+            "60",
+        ]
+    )
+
+    assert args.server_url == "http://127.0.0.1:8000"
+    assert args.execution_timeout == 60

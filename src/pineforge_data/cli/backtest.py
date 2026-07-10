@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
 import sys
 from dataclasses import replace
@@ -13,10 +14,12 @@ from pathlib import Path
 from typing import cast
 
 from ..backtest import BacktestOptions, JsonValue
-from ..docker_runtime import DockerBacktestRuntime, discover_repository_root
+from ..docker_runtime import DockerBacktestRuntime
 from ..models import MarketListing
 from ..providers import create_provider
+from ..release_contract import DEFAULT_RELEASE_IMAGE
 from ..requests import BarRequest
+from ..server_client import FastApiBacktestClient
 
 
 def parse_timestamp(value: str) -> int:
@@ -129,16 +132,39 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--script-timeframe", default="")
     parser.add_argument("--provider-config", type=Path, help="provider options JSON file")
     parser.add_argument("--strategy-params", type=Path, help="strategy parameters JSON file")
+    parser.add_argument(
+        "--strategy-overrides", type=Path, help="strategy() header overrides JSON file"
+    )
     parser.add_argument("--bar-magnifier", action="store_true")
     parser.add_argument("--magnifier-samples", type=int, default=4)
     parser.add_argument("--trace", action="store_true")
-    parser.add_argument("--image", help="Docker image override; default tag follows submodule pins")
-    parser.add_argument("--repository-root", type=Path, help="pineforge-data checkout path")
-    parser.add_argument("--rebuild-image", action="store_true")
     parser.add_argument(
-        "--no-image-build",
-        action="store_true",
-        help="fail instead of building when the pinned image is absent",
+        "--runtime-image",
+        "--image",
+        dest="runtime_image",
+        default=DEFAULT_RELEASE_IMAGE,
+        help="pineforge-release image; defaults to the package's pinned digest",
+    )
+    parser.add_argument(
+        "--pull-policy",
+        choices=("always", "missing", "never"),
+        default="missing",
+        help="local release-image pull policy",
+    )
+    parser.add_argument(
+        "--execution-timeout",
+        type=float,
+        default=300.0,
+        help="local or server request timeout in seconds",
+    )
+    parser.add_argument(
+        "--server-url",
+        help="FastAPI base URL; also read from PINEFORGE_SERVER_URL",
+    )
+    parser.add_argument(
+        "--server-api-key-env",
+        default="PINEFORGE_SERVER_API_KEY",
+        help="environment variable containing the server bearer token",
     )
     parser.add_argument("--output", type=Path, help="report path; defaults to stdout")
     parser.add_argument("--pretty", action="store_true", help="pretty-print report JSON")
@@ -150,6 +176,7 @@ async def run_harness(args: argparse.Namespace) -> dict[str, JsonValue]:
 
     provider_config = _load_json_object(args.provider_config)
     strategy_params = _load_json_object(args.strategy_params)
+    strategy_overrides = _load_json_object(args.strategy_overrides)
     provider = create_provider(args.provider, args.venue, config=provider_config)
     try:
         listing = await provider.resolve_market(args.symbol)
@@ -184,25 +211,47 @@ async def run_harness(args: argparse.Namespace) -> dict[str, JsonValue]:
     pine_path = args.pine.expanduser().resolve()
     if not pine_path.is_file():
         raise FileNotFoundError(f"PineScript file not found: {pine_path}")
-    repository_root = discover_repository_root(args.repository_root)
-    runtime = DockerBacktestRuntime(
-        repository_root,
-        image=args.image,
-        rebuild=args.rebuild_image,
-        build_if_missing=not args.no_image_build,
-    )
-    container = runtime.run(
-        pine_path.read_text(encoding="utf-8"),
-        bars,
-        instrument=instrument,
-        source=provider_name,
-        options=options,
-        strategy_params=strategy_params,
-    )
-    required_sections = ("runtime", "transpile", "compile", "backtest")
+    pine_source = pine_path.read_text(encoding="utf-8")
+    server_url = args.server_url or os.environ.get("PINEFORGE_SERVER_URL")
+    if server_url:
+        api_key = os.environ.get(args.server_api_key_env) if args.server_api_key_env else None
+        client = FastApiBacktestClient(
+            server_url,
+            timeout_seconds=args.execution_timeout + 30,
+            api_key=api_key,
+        )
+        container = await asyncio.to_thread(
+            client.run,
+            pine_source,
+            bars,
+            instrument=instrument,
+            source=provider_name,
+            options=options,
+            strategy_params=strategy_params,
+            strategy_overrides=strategy_overrides,
+        )
+    else:
+        runtime = DockerBacktestRuntime(
+            image=args.runtime_image,
+            pull_policy=args.pull_policy,
+            timeout_seconds=args.execution_timeout,
+        )
+        container = await asyncio.to_thread(
+            runtime.run,
+            pine_source,
+            bars,
+            instrument=instrument,
+            source=provider_name,
+            options=options,
+            strategy_params=strategy_params,
+            strategy_overrides=strategy_overrides,
+        )
+    required_sections = ("runtime", "backtest")
     if any(section not in container for section in required_sections):
         raise RuntimeError("Docker report is missing a required section")
     return {
+        "schema_version": 1,
+        "request_id": cast(JsonValue, container.get("request_id")),
         "provider": {
             "name": provider_name,
             "adapter": args.provider,
@@ -223,8 +272,6 @@ async def run_harness(args: argparse.Namespace) -> dict[str, JsonValue]:
             "script_timeframe": options.script_timeframe,
         },
         "runtime": cast(JsonValue, container["runtime"]),
-        "transpile": cast(JsonValue, container["transpile"]),
-        "compile": cast(JsonValue, container["compile"]),
         "backtest": cast(JsonValue, container["backtest"]),
     }
 

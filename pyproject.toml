@@ -24,14 +24,22 @@ dependencies = []
 
 [project.scripts]
 pineforge-backtest = "pineforge_data.cli.backtest:main"
+pineforge-backtest-server = "pineforge_data.server:main"
 
 [project.optional-dependencies]
 ccxt = ["ccxt>=4.5.64,<5"]
+server = [
+    "fastapi>=0.139,<0.140",
+    "uvicorn>=0.51,<0.52",
+]
 dev = [
     "build>=1.2",
+    "fastapi>=0.139,<0.140",
+    "httpx2>=2.5,<2.6",
     "mypy>=1.13",
     "pytest>=8.3",
     "ruff>=0.8",
+    "uvicorn>=0.51,<0.52",
 ]
 
 [project.urls]

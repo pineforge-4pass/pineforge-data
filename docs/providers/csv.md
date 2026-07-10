@@ -15,23 +15,37 @@ provider = CsvBarProvider(
     "./exports/equity-bars.csv",
     venue="research",
     mapping={
-        "timestamp": "Bucket Start",
-        "volume": "Total Traded Qty",
+        "timestamp": "epoch seconds",
+        "open": "first px",
+        "high": "top px",
+        "low": "bottom px",
+        "close": "last px",
+        "volume": "traded qty",
+        "symbol": "security code",
+        "timeframe": "bar interval",
     },
-    timestamp_unit="iso8601",
+    timestamp_unit="seconds",
 )
 ```
 
-Plain mappings are partial overrides. Common open, high, low, close, symbol,
-and timeframe columns are inferred from the header. Use an explicit
-`BarColumnMapping` when every name is custom.
+The keys are PineForge's canonical fields and the values are exact CSV header
+names. For example, the mapping above accepts this header:
+
+```csv
+epoch seconds,first px,top px,bottom px,last px,traded qty,security code,bar interval
+```
+
+Plain mappings may be complete or partial. When a canonical field is omitted,
+common names such as `open`, `px_open`, `ticker`, and `interval` are inferred
+from the header. Use an explicit `BarColumnMapping` when a typed, reusable
+complete mapping is preferable.
 
 ## Inspect the header
 
 ```python
 schema = await provider.inspect_schema()
 print(schema.column_names)
-mapping = schema.infer_bar_mapping({"timestamp": "Bucket Start"})
+mapping = schema.infer_bar_mapping({"timestamp": "epoch seconds"})
 ```
 
 The first record must be a non-empty, unique header. Files with duplicate or
@@ -84,12 +98,16 @@ large datasets queried repeatedly.
   "path": "/data/equity-bars.csv",
   "encoding": "utf-8-sig",
   "delimiter": ",",
-  "timestamp_unit": "iso8601",
+  "timestamp_unit": "seconds",
   "columns": {
-    "timestamp": "Bucket Start",
-    "volume": "Total Traded Qty",
-    "symbol": "Ticker",
-    "timeframe": "Bar Size"
+    "timestamp": "epoch seconds",
+    "open": "first px",
+    "high": "top px",
+    "low": "bottom px",
+    "close": "last px",
+    "volume": "traded qty",
+    "symbol": "security code",
+    "timeframe": "bar interval"
   }
 }
 ```

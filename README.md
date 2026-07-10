@@ -1,159 +1,90 @@
 # PineForge Data
 
-Provider-neutral market and macro data adapters for PineForge.
+[![PyPI](https://img.shields.io/pypi/v/pineforge-data.svg)](https://pypi.org/project/pineforge-data/)
+[![Python](https://img.shields.io/pypi/pyversions/pineforge-data.svg)](https://pypi.org/project/pineforge-data/)
+[![CI](https://github.com/pineforge-4pass/pineforge-data/actions/workflows/ci.yml/badge.svg)](https://github.com/pineforge-4pass/pineforge-data/actions/workflows/ci.yml)
+[![Documentation](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://pineforge-4pass.github.io/pineforge-data/)
 
-`pineforge-data` is the boundary between third-party services and the
-deterministic [`pineforge-engine`](https://github.com/pineforge-4pass/pineforge-engine)
-runtime:
+Fetch normalized market data and run raw PineScript strategies through
+PineForge.
 
-```text
-provider APIs → pineforge-data normalization → PineForge C ABI
-```
-
-The engine does not import or link this package. Provider transport,
-authentication, retries, caching, symbol mapping, and vendor schemas stay here;
-the engine receives only normalized bars and ordered trades.
-
-## Documentation
-
-- [Documentation home](https://pineforge-4pass.github.io/pineforge-data/) — architecture, guarantees, and guide map.
-- [Getting started](https://pineforge-4pass.github.io/pineforge-data/getting-started/) — installation, first provider
-  request, and local or remote backtest.
-- [Python API reference](https://pineforge-4pass.github.io/pineforge-data/api/) — generated signatures, types, and docstrings.
-- [Normalized data model](https://pineforge-4pass.github.io/pineforge-data/data-model/) — instruments, contracts, bars,
-  live trades, macro vintages, and validation rules.
-- [Provider catalog](https://pineforge-4pass.github.io/pineforge-data/providers/) — shared lifecycle and second-level API
-  guides for CCXT, CSV, SQLite, and SQLAlchemy.
-- [Backtesting](https://pineforge-4pass.github.io/pineforge-data/backtesting/) — CLI options, configuration files, runtime
-  channels, report schema, and reproducibility.
-- [FastAPI server](https://pineforge-4pass.github.io/pineforge-data/server/) — concurrency, authentication, timeouts,
-  compile cache, and deployment.
-- [Provider contract](https://pineforge-4pass.github.io/pineforge-data/provider-contract/) — implementing and testing a
-  community exchange or broker adapter.
-
-## Why Python first
-
-Provider integrations are dominated by HTTP, WebSockets, JSON, credentials,
-and asynchronous I/O. Python makes those integrations accessible to community
-contributors. Engine throughput remains native: normalized records are packed
-into contiguous C ABI arrays and submitted in one call.
-
-## Initial contracts
-
-- `Instrument` — normalized symbol, provider-native ID, venue, asset/market type,
-  currencies, contract terms, timezone, session, and volume units.
-- `MarketListing` and `MarketQuery` — catalog discovery without vendor schemas.
-- `Bar` — confirmed OHLCV with source provenance.
-- `TradeTick` — the provider-neutral four-field engine payload plus provenance.
-- `MacroObservation` — observation period, first release, and vintage timestamps
-  to prevent revised-data lookahead.
-- `MarketCatalogProvider`, `HistoricalBarProvider`, `LiveTradeProvider`, and
-  `MacroDataProvider` — small structural protocols that community adapters
-  implement.
-- `ProviderRegistry` — built-in and installed broker adapters selected by name.
-- `BarColumnMapping` and `TabularSchema` — runtime discovery and safe OHLCV
-  mappings for user-owned files, tables, and views.
-- `PfBar`, `PfTradeTick`, and `EngineStreamSink` — dependency-free `ctypes`
-  interoperability with PineForge strategy libraries.
-
-## CCXT adapter
-
-The first community adapter uses CCXT's unified async API for exchange-neutral
-crypto data. It paginates OHLCV, removes duplicate timestamps, excludes the
-currently forming candle, and polls public trades into a strictly increasing
-per-stream sequence.
-
-```bash
-pip install 'pineforge-data[ccxt]'
-```
-
-```python
-from pineforge_data import BarRequest, CcxtProvider, Instrument
-
-instrument = Instrument("BTC/USDT", venue="kraken")
-request = BarRequest(
-    instrument,
-    timeframe="1m",
-    start_ms=1_767_225_600_000,
-    end_ms=1_767_312_000_000,
-)
-
-async with CcxtProvider("kraken") as provider:
-    listing = await provider.resolve_market("BTC/USDT")
-    confirmed_bars = await provider.fetch_bars(request)
-```
-
-`Instrument.symbol` uses CCXT's exact unified spelling. Do not infer a market
-by parsing it: `resolve_market()` uses CCXT's catalog fields to distinguish
-spot, swap, future, and option listings and captures `base`, `quote`, `settle`,
-raw exchange ID, contract size, linear/inverse settlement, expiry, strike, and
-option type. For example, `BTC/USDT` and `BTC/USDT:USDT` are separate markets.
-
-Exchange credentials and exchange-specific options can be passed through
-`config`, while endpoint options remain isolated in `market_params`,
-`ohlcv_params`, and `trade_params`. Realtime public trades use REST polling in
-this bootstrap; a WebSocket transport can implement the same
-`LiveTradeProvider` contract later.
-
-`TradeSubscription.start_ms` can pin the live handoff to the next timestamp
-after an engine warmup. `start_sequence` is the last accepted sequence, so the
-adapter emits `start_sequence + 1` next.
-
-## Local files and databases
-
-Built-in `csv`, `sqlite`, and `sqlalchemy` providers let users backtest their
-own data without adopting a fixed PineForge DDL. They inspect file headers or
-database reflection metadata at runtime, infer common OHLCV names, and accept
-partial mappings for arbitrary names. Ambiguous schemas fail instead of being
-guessed.
-
-```python
-from pineforge_data import SqliteBarProvider
-
-
-provider = SqliteBarProvider(
-    "warehouse.sqlite3",
-    table="price candles",
-    mapping={
-        "timestamp": "epoch seconds",
-        "open": "first px",
-        "high": "top px",
-        "low": "bottom px",
-        "close": "last px",
-        "volume": "traded qty",
-    },
-    timestamp_unit="seconds",
-)
-schema = await provider.inspect_schema()
-```
-
-SQL identifiers are validated against reflected metadata; filter values are
-bound parameters. For complex transformations, expose a database view rather
-than putting raw SQL in harness configuration. See the complete
-[provider catalog](https://pineforge-4pass.github.io/pineforge-data/providers/),
-with dedicated API guides for
-[CSV](https://pineforge-4pass.github.io/pineforge-data/providers/csv/),
-[SQLite](https://pineforge-4pass.github.io/pineforge-data/providers/sqlite/), and
-[SQLAlchemy](https://pineforge-4pass.github.io/pineforge-data/providers/sqlalchemy/).
-
-## Direct backtest harness
-
-The public backtest input is raw PineScript v6. `pineforge-backtest` fetches
-confirmed OHLCV through a data provider and runs this pinned pipeline:
+PineForge Data provides Python adapters for exchanges, CSV files, SQLite, and
+SQLAlchemy-compatible databases. Its backtest harness sends normalized OHLCV
+to the `pineforge-release` container, which transpiles the PineScript, compiles
+it, and runs `pineforge-engine`.
 
 ```text
-raw .pine + provider OHLCV
-        ↓ local read-only mount or FastAPI request
-pineforge-release → generated C++ → cached/compiled strategy → JSON report
+exchange / CSV / database
+          ↓
+    pineforge-data
+          ↓
+ pineforge-release container
+          ↓
+     backtest report
 ```
 
-Docker is a prerequisite. A host C++ compiler and a precompiled strategy
-library are not required. Install the package without cloning engine or codegen
-repositories:
+The provider layer is Python-only. You do not need a C++ compiler, Git
+submodules, or local engine and codegen checkouts.
+
+## Quick start
+
+You need Python 3.11 or newer. Docker is required only for backtests; fetching
+and normalizing data does not use Docker.
+
+### 1. Install an exchange provider
 
 ```bash
-pip install 'pineforge-data[ccxt]'
+python -m pip install 'pineforge-data[ccxt]'
 ```
+
+### 2. Fetch confirmed OHLCV
+
+```python
+import asyncio
+
+from pineforge_data import BarRequest, CcxtProvider
+
+
+async def main() -> None:
+    async with CcxtProvider("kraken") as provider:
+        market = await provider.resolve_market("BTC/USD")
+        bars = await provider.fetch_bars(
+            BarRequest(
+                instrument=market.instrument,
+                timeframe="15m",
+                start_ms=1_751_328_000_000,
+                end_ms=1_751_414_400_000,
+            )
+        )
+        print(bars[-1])
+
+
+asyncio.run(main())
+```
+
+Symbols are resolved through the provider catalog. For example, CCXT spot
+`BTC/USDT` and linear swap `BTC/USDT:USDT` are distinct instruments with
+different contract metadata.
+
+### 3. Backtest raw PineScript
+
+Save a strategy as `strategy.pine`:
+
+```pinescript
+//@version=6
+strategy("SMA cross", initial_capital=10000)
+
+fast = ta.sma(close, 2)
+slow = ta.sma(close, 4)
+
+if ta.crossover(fast, slow)
+    strategy.entry("Long", strategy.long)
+
+if ta.crossunder(fast, slow)
+    strategy.close("Long")
+```
+
+Then run:
 
 ```bash
 pineforge-backtest \
@@ -162,157 +93,66 @@ pineforge-backtest \
   --venue kraken \
   --symbol BTC/USD \
   --timeframe 15m \
-  --start 2026-07-01T00:00:00Z \
-  --end 2026-07-08T00:00:00Z \
-  --warmup-bars 500 \
+  --start 2025-07-01T00:00:00Z \
+  --end 2025-07-08T00:00:00Z \
+  --warmup-bars 100 \
   --output report.json \
   --pretty
 ```
 
-`--warmup-bars` fetches additional source bars before `--start` to initialize
-indicators and higher-timeframe state. Order execution remains disabled until
-`--start`, and the report records both requested and loaded warmup counts.
+The first run pulls a digest-pinned `pineforge-release` image. The JSON report
+includes trades, performance statistics, the equity curve, data provenance,
+and exact runtime versions. The strategy is compiled inside an isolated Docker
+container; the provider and its credentials remain on the host.
 
-The first local invocation pulls an immutable, multi-architecture
-`pineforge-release` image pinned by both version and OCI digest. It never builds
-engine or codegen locally. Use `--pull-policy never` for offline runs or opt in
-to the rolling channel with:
+## Bring your own data
 
-```bash
-pineforge-backtest ... \
-  --runtime-image ghcr.io/pineforge-4pass/pineforge-release:latest \
-  --pull-policy always
-```
+PineForge does not require a fixed table definition. Local providers inspect
+headers or reflected database columns at runtime, infer common OHLCV names,
+and accept an explicit mapping when your schema uses different names.
 
-`latest` is convenient for development but not deterministic. The report
-records the resolved image digest and component versions when Docker exposes
-them.
+| Source | Install | Guide |
+|---|---|---|
+| CSV | `pip install pineforge-data` | [CSV API](https://pineforge-4pass.github.io/pineforge-data/providers/csv/) |
+| SQLite | `pip install pineforge-data` | [SQLite API](https://pineforge-4pass.github.io/pineforge-data/providers/sqlite/) |
+| SQLAlchemy database | `pip install 'pineforge-data[database]'` | [SQLAlchemy API](https://pineforge-4pass.github.io/pineforge-data/providers/sqlalchemy/) |
+| CCXT exchange | `pip install 'pineforge-data[ccxt]'` | [CCXT API](https://pineforge-4pass.github.io/pineforge-data/providers/ccxt/) |
 
-Compilation and execution run as a non-root user with networking disabled, all
-Linux capabilities dropped, a read-only root filesystem, and only a read-only
-temporary input mount.
+The same `pineforge-backtest` command supports `--provider csv`, `sqlite`, and
+`sqlalchemy`. See the [backtesting guide](https://pineforge-4pass.github.io/pineforge-data/backtesting/)
+for provider configuration, warmup behavior, strategy inputs, reports, and
+local versus remote execution.
 
-The JSON report contains provider and market provenance, the release runtime
-identity and fingerprint, processed-bar counts, every closed trade,
-all/long/short statistics, equity statistics, diagnostics, and the complete
-equity curve. Unix millisecond timestamps can be used instead of ISO-8601
-values. The pinned `pineforge-release` does not currently expose trace
-collection; `--trace` fails explicitly rather than silently omitting it.
+## Documentation
 
-Use `--provider-config config.json` for CCXT constructor options and
-`--strategy-params inputs.json` for Pine inputs. Use `--strategy-overrides` for
-`strategy()` header overrides. The provider config file may contain
-credentials, so keep it outside version control.
-
-The generated C++ hash and exact engine/codegen versions are recorded in the
-release fingerprint. The combined runtime and its component licensing are
-owned by [`pineforge-release`](https://github.com/pineforge-4pass/pineforge-release),
-not vendored into this repository.
-
-Provider implementations in this repository are Python-only. The compiled C++
-strategy and engine stay behind the Docker/runtime boundary; broker SDKs and
-provider-specific types do not cross into `pineforge-engine`.
-
-## Concurrent FastAPI server
-
-The server image derives from the same pinned `pineforge-release` image. It
-admits a bounded number of compiler/backtest processes, keeps a bounded queue,
-isolates every request in its own temporary directory, and optionally requires
-a bearer token.
-
-```bash
-docker build -f docker/server.Dockerfile -t pineforge-data-server .
-docker volume create pineforge-compile-cache
-docker run --rm -p 127.0.0.1:8000:8000 \
-  --read-only \
-  --tmpfs /tmp:rw,exec,nosuid,nodev,size=512m \
-  --cap-drop ALL \
-  --security-opt no-new-privileges \
-  --mount type=volume,src=pineforge-compile-cache,dst=/cache \
-  -e PINEFORGE_SERVER_API_KEY=change-me \
-  pineforge-data-server
-```
-
-Point the same harness at it without putting the token on the command line:
-
-```bash
-export PINEFORGE_SERVER_URL=http://127.0.0.1:8000
-export PINEFORGE_SERVER_API_KEY=change-me
-pineforge-backtest --pine strategy.pine --venue kraken --symbol BTC/USD \
-  --timeframe 15m --start 2026-07-01T00:00:00Z --end 2026-07-08T00:00:00Z
-```
-
-The server always transpiles Pine deterministically and hashes the generated
-C++. Its cache stores the compiled `.so` under a key containing that C++ hash
-plus the release, engine, architecture, and compile flags. Concurrent misses
-for the same key compile once; subsequent requests skip compilation. Cache
-hit/key/hash are included in response provenance. See the
-[server guide](https://pineforge-4pass.github.io/pineforge-data/server/) for endpoints, limits, deployment, and cache
-settings.
+| I want to… | Read… |
+|---|---|
+| Install and run the first request | [Getting started](https://pineforge-4pass.github.io/pineforge-data/getting-started/) |
+| Look up Python classes and signatures | [API reference](https://pineforge-4pass.github.io/pineforge-data/api/) |
+| Choose or configure a provider | [Provider catalog](https://pineforge-4pass.github.io/pineforge-data/providers/) |
+| Understand instruments, contracts, and bars | [Data model](https://pineforge-4pass.github.io/pineforge-data/data-model/) |
+| Run and reproduce backtests | [Backtesting](https://pineforge-4pass.github.io/pineforge-data/backtesting/) |
+| Deploy the concurrent compile/backtest service | [FastAPI server](https://pineforge-4pass.github.io/pineforge-data/server/) |
+| Implement a broker or exchange adapter | [Provider contract](https://pineforge-4pass.github.io/pineforge-data/provider-contract/) |
 
 ## Contributing
 
-Community providers, market-model improvements, server/runtime work, tests, and
-documentation are welcome. Provider integrations are Python-only; engine and
-codegen changes belong in their upstream repositories and are consumed here
-through `pineforge-release`.
-
-### Choose the right contribution path
-
-| Contribution | Primary location | Start here |
-|---|---|---|
-| Exchange or broker adapter | `src/pineforge_data/providers/` | [Provider contract](https://pineforge-4pass.github.io/pineforge-data/provider-contract/) |
-| Market, contract, bar, or request model | `src/pineforge_data/models.py`, `src/pineforge_data/requests.py`, `src/pineforge_data/providers/base.py` | Existing public models and protocols |
-| Backtest harness or HTTP client | `src/pineforge_data/cli/backtest.py`, `src/pineforge_data/server_client.py` | Harness unit tests |
-| FastAPI concurrency or compile cache | `src/pineforge_data/server.py`, `src/pineforge_data/compile_cache.py` | [Server guide](https://pineforge-4pass.github.io/pineforge-data/server/) |
-| Release-container integration | `src/pineforge_data/release_contract.py`, `src/pineforge_data/docker_runtime.py` | Pinned release contract and Docker tests |
-| Documentation or examples | `README.md`, `docs/` | A focused documentation PR |
-
-For a new provider, implement the smallest applicable structural protocols,
-register its factory, keep its SDK in an optional dependency extra, and add
-offline fixture tests. Resolve exact upstream markets through their catalog;
-do not parse symbols to infer base, quote, settlement, or contract terms.
-Provider-specific fields stay in this repository and must not leak into
-`pineforge-engine`.
-
-### Development setup
+Community providers are welcome. Keep vendor SDKs and schemas inside the
+adapter, resolve instruments through the upstream market catalog, normalize
+timestamps to Unix milliseconds, and add deterministic offline tests.
 
 ```bash
 git clone https://github.com/pineforge-4pass/pineforge-data.git
 cd pineforge-data
-python3 -m venv .venv
-.venv/bin/pip install -e '.[dev,ccxt,server]'
+python -m pip install -e '.[dev,ccxt,database,server,docs,release]'
+ruff check .
+mypy src
+pytest
+mkdocs build --strict
 ```
 
-No Git submodules are required. Docker is needed only for release-runtime and
-end-to-end backtest work.
+Read [CONTRIBUTING.md](https://github.com/pineforge-4pass/pineforge-data/blob/main/CONTRIBUTING.md)
+for the provider contract, entry points, security rules, and full validation
+checklist.
 
-### Before opening a pull request
-
-1. Keep the change focused and document any public API, report-schema, provider,
-   runtime-image, or cache-key compatibility impact.
-2. Add deterministic offline tests; CI must not require credentials or live
-   provider access.
-3. Keep credentials out of fixtures, logs, exception messages, and committed
-   configuration.
-4. Run the standard checks:
-
-   ```bash
-   .venv/bin/ruff format --check src tests
-   .venv/bin/ruff check .
-   .venv/bin/mypy src
-   .venv/bin/pytest
-   .venv/bin/python -m build
-   ```
-
-5. For Docker, FastAPI server, cache, or release-contract changes, also run:
-
-   ```bash
-   PINEFORGE_DOCKER_TEST=1 .venv/bin/pytest tests/test_docker_integration.py
-   ```
-
-Read the [documentation home](https://pineforge-4pass.github.io/pineforge-data/)
-and [CONTRIBUTING.md](https://github.com/pineforge-4pass/pineforge-data/blob/main/CONTRIBUTING.md) for provider requirements,
-determinism rules, external provider entry points, and the complete checklist.
-For broad changes to public models or the report contract, open an issue first
-so providers and runtime consumers can agree on the shape before implementation.
+Apache-2.0 licensed.

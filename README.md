@@ -23,6 +23,8 @@ the engine receives only normalized bars and ordered trades.
   live trades, macro vintages, and validation rules.
 - [Using providers](docs/providers.md) — registry, CCXT market discovery,
   historical bars, live trades, configuration, and errors.
+- [Local files and databases](docs/local-data.md) — runtime schema discovery,
+  arbitrary CSV/SQLite DDL, SQLAlchemy databases, and column mappings.
 - [Backtesting](docs/backtesting.md) — CLI options, configuration files, runtime
   channels, report schema, and reproducibility.
 - [FastAPI server](docs/server.md) — concurrency, authentication, timeouts,
@@ -50,6 +52,8 @@ into contiguous C ABI arrays and submitted in one call.
   `MacroDataProvider` — small structural protocols that community adapters
   implement.
 - `ProviderRegistry` — built-in and installed broker adapters selected by name.
+- `BarColumnMapping` and `TabularSchema` — runtime discovery and safe OHLCV
+  mappings for user-owned files, tables, and views.
 - `PfBar`, `PfTradeTick`, and `EngineStreamSink` — dependency-free `ctypes`
   interoperability with PineForge strategy libraries.
 
@@ -95,6 +99,40 @@ this bootstrap; a WebSocket transport can implement the same
 `TradeSubscription.start_ms` can pin the live handoff to the next timestamp
 after an engine warmup. `start_sequence` is the last accepted sequence, so the
 adapter emits `start_sequence + 1` next.
+
+## Local files and databases
+
+Built-in `csv`, `sqlite`, and `sqlalchemy` providers let users backtest their
+own data without adopting a fixed PineForge DDL. They inspect file headers or
+database reflection metadata at runtime, infer common OHLCV names, and accept
+partial mappings for arbitrary names. Ambiguous schemas fail instead of being
+guessed.
+
+```python
+from pineforge_data import SqliteBarProvider
+
+
+provider = SqliteBarProvider(
+    "warehouse.sqlite3",
+    table="price candles",
+    mapping={
+        "timestamp": "epoch seconds",
+        "open": "first px",
+        "high": "top px",
+        "low": "bottom px",
+        "close": "last px",
+        "volume": "traded qty",
+    },
+    timestamp_unit="seconds",
+)
+schema = await provider.inspect_schema()
+```
+
+SQL identifiers are validated against reflected metadata; filter values are
+bound parameters. For complex transformations, expose a database view rather
+than putting raw SQL in harness configuration. See the complete
+[local-data guide](docs/local-data.md) for CSV, native read-only SQLite,
+SQLAlchemy URLs, timestamp handling, symbol/timeframe semantics, and CLI JSON.
 
 ## Direct backtest harness
 

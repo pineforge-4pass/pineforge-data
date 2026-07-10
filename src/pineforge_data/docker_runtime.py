@@ -1,9 +1,7 @@
-"""Docker boundary for raw PineScript compilation and engine execution."""
+"""Run backtests through the published pineforge-release container."""
 
 from __future__ import annotations
 
-import csv
-import hashlib
 import json
 import os
 import shutil
@@ -12,33 +10,28 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from .backtest import BacktestOptions, JsonValue
 from .models import Bar, Instrument
+from .release_contract import (
+    DEFAULT_RELEASE_IMAGE,
+    ReleaseContractError,
+    parse_release_report,
+    release_environment,
+    release_response,
+    write_release_inputs,
+)
+
+PullPolicy = Literal["always", "missing", "never"]
 
 
 class DockerPrerequisiteError(RuntimeError):
-    """Docker or an initialized source submodule is unavailable."""
+    """Docker or the configured release image is unavailable."""
 
 
 class DockerExecutionError(RuntimeError):
-    """The isolated transpile, compile, or backtest command failed."""
-
-
-def discover_repository_root(start: Path | None = None) -> Path:
-    """Find a checkout containing the Dockerfile and both pinned submodules."""
-
-    configured = os.environ.get("PINEFORGE_DATA_ROOT")
-    origin = Path(configured).expanduser() if configured else start
-    if origin is None:
-        origin = Path(__file__).resolve()
-    candidates = [origin, *origin.parents]
-    for candidate in candidates:
-        if (candidate / "docker/Dockerfile").is_file() and (candidate / ".gitmodules").is_file():
-            return candidate.resolve()
-    raise DockerPrerequisiteError(
-        "pineforge-data checkout not found; set PINEFORGE_DATA_ROOT to a cloned repository"
-    )
+    """The isolated release-container backtest failed."""
 
 
 def _completed_error(completed: subprocess.CompletedProcess[str]) -> str:
@@ -47,57 +40,22 @@ def _completed_error(completed: subprocess.CompletedProcess[str]) -> str:
 
 @dataclass(slots=True)
 class DockerBacktestRuntime:
-    """Build and execute the pinned raw-Pine backtest image."""
+    """Pull and execute an immutable pineforge-release image."""
 
-    repository_root: Path
-    image: str | None = None
-    rebuild: bool = False
-    build_if_missing: bool = True
+    image: str = DEFAULT_RELEASE_IMAGE
+    pull_policy: PullPolicy = "missing"
+    timeout_seconds: float = 300.0
 
-    def _submodule_commit(self, relative_path: str) -> str:
-        path = self.repository_root / relative_path
-        if not (path / ".git").exists() or not any(path.iterdir()):
-            raise DockerPrerequisiteError(
-                f"missing submodule {relative_path}; run `git submodule update --init`"
-            )
-        completed = subprocess.run(
-            ["git", "-C", str(path), "rev-parse", "HEAD"],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if completed.returncode != 0:
-            raise DockerPrerequisiteError(_completed_error(completed))
-        return completed.stdout.strip()
-
-    def _pins(self) -> tuple[str, str]:
-        engine = self._submodule_commit("vendor/pineforge-engine")
-        codegen = self._submodule_commit("vendor/pineforge-codegen-oss")
-        return engine, codegen
-
-    def _source_digest(self) -> str:
-        digest = hashlib.sha256()
-        paths = [
-            self.repository_root / "docker/Dockerfile",
-            self.repository_root / "docker/entrypoint.py",
-            *sorted((self.repository_root / "src/pineforge_data").rglob("*.py")),
-        ]
-        for path in paths:
-            relative = path.relative_to(self.repository_root).as_posix()
-            digest.update(relative.encode())
-            digest.update(b"\0")
-            digest.update(path.read_bytes())
-            digest.update(b"\0")
-        return digest.hexdigest()
+    def __post_init__(self) -> None:
+        if not self.image.strip():
+            raise ValueError("image must not be empty")
+        if self.pull_policy not in ("always", "missing", "never"):
+            raise ValueError(f"invalid pull policy: {self.pull_policy}")
+        if self.timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
 
     def resolved_image(self) -> str:
-        """Return the explicit image or a tag derived from both submodule pins."""
-
-        if self.image:
-            return self.image
-        engine, codegen = self._pins()
-        source = self._source_digest()
-        return f"pineforge-data-backtest:d{source[:12]}-e{engine[:12]}-c{codegen[:12]}"
+        return self.image
 
     def _check_docker(self) -> None:
         if shutil.which("docker") is None:
@@ -115,9 +73,9 @@ class DockerBacktestRuntime:
                 f"Docker daemon is unavailable: {_completed_error(completed)}"
             )
 
-    def _image_exists(self, image: str) -> bool:
+    def _image_exists(self) -> bool:
         completed = subprocess.run(
-            ["docker", "image", "inspect", image],
+            ["docker", "image", "inspect", self.image],
             text=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -125,38 +83,69 @@ class DockerBacktestRuntime:
         )
         return completed.returncode == 0
 
+    def _pull_image(self) -> None:
+        completed = subprocess.run(
+            ["docker", "pull", self.image],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise DockerPrerequisiteError(
+                f"failed to pull pineforge-release image: {_completed_error(completed)}"
+            )
+
+    def _image_identity(self) -> dict[str, object]:
+        completed = subprocess.run(
+            ["docker", "image", "inspect", self.image],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            return {}
+        try:
+            values = json.loads(completed.stdout)
+            value = values[0]
+            labels = value.get("Config", {}).get("Labels", {})
+            digests = value.get("RepoDigests", [])
+        except (IndexError, AttributeError, json.JSONDecodeError, TypeError):
+            return {}
+        if not isinstance(labels, dict) or not isinstance(digests, list):
+            return {}
+        return {
+            "resolved_digest": str(digests[0]) if digests else None,
+            "release_version": labels.get("org.opencontainers.image.version"),
+            "engine_version": labels.get("io.pineforge.engine.version"),
+            "codegen_version": labels.get("io.pineforge.codegen.version"),
+        }
+
     def ensure_image(self) -> str:
-        """Check Docker and build the pin-addressed image when necessary."""
+        """Apply the configured pull policy and return the immutable image ref."""
 
         self._check_docker()
-        engine, codegen = self._pins()
-        source = self._source_digest()
-        image = self.resolved_image()
-        if not self.rebuild and self._image_exists(image):
-            return image
-        if not self.build_if_missing:
-            raise DockerPrerequisiteError(f"Docker image is not available locally: {image}")
-        command = [
-            "docker",
-            "build",
-            "--file",
-            str(self.repository_root / "docker/Dockerfile"),
-            "--tag",
-            image,
-            "--build-arg",
-            f"ENGINE_SHA={engine}",
-            "--build-arg",
-            f"CODEGEN_SHA={codegen}",
-            "--build-arg",
-            f"DATA_SOURCE_DIGEST={source}",
-            str(self.repository_root),
-        ]
-        completed = subprocess.run(command, text=True, check=False)
-        if completed.returncode != 0:
-            raise DockerExecutionError(
-                f"Docker image build failed with exit {completed.returncode}"
+        exists = self._image_exists()
+        if self.pull_policy == "always" or (self.pull_policy == "missing" and not exists):
+            self._pull_image()
+            exists = True
+        if not exists:
+            raise DockerPrerequisiteError(
+                f"pineforge-release image is not available locally: {self.image}"
             )
-        return image
+        return self.image
+
+    @staticmethod
+    def _remove_timed_out_container(cid_path: Path) -> None:
+        if not cid_path.is_file():
+            return
+        container_id = cid_path.read_text(encoding="utf-8").strip()
+        if container_id:
+            subprocess.run(
+                ["docker", "rm", "--force", container_id],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
 
     def run(
         self,
@@ -167,91 +156,71 @@ class DockerBacktestRuntime:
         source: str,
         options: BacktestOptions,
         strategy_params: Mapping[str, JsonValue] | None = None,
+        strategy_overrides: Mapping[str, JsonValue] | None = None,
     ) -> dict[str, object]:
-        """Run raw Pine and normalized OHLCV inside the isolated image."""
+        """Run PineScript and normalized OHLCV in pineforge-release."""
 
-        if not pine_source.strip():
-            raise ValueError("PineScript source must not be empty")
-        if not bars:
-            raise ValueError("bars must not be empty")
         image = self.ensure_image()
         with tempfile.TemporaryDirectory(prefix="pineforge-data-") as temporary:
             workspace = Path(temporary)
-            (workspace / "strategy.pine").write_text(pine_source, encoding="utf-8")
-            with (workspace / "ohlcv.csv").open("w", newline="", encoding="utf-8") as handle:
-                writer = csv.writer(handle)
-                writer.writerow(("timestamp", "open", "high", "low", "close", "volume"))
-                for bar in bars:
-                    writer.writerow(
-                        (
-                            bar.timestamp_ms,
-                            bar.open,
-                            bar.high,
-                            bar.low,
-                            bar.close,
-                            bar.volume,
-                        )
-                    )
-            request = {
-                "instrument": {
-                    "symbol": instrument.symbol,
-                    "venue": instrument.venue,
-                    "timezone": instrument.timezone,
-                    "session": instrument.session,
-                    "volume_unit": instrument.volume_unit,
-                },
-                "source": source,
-                "options": {
-                    "input_timeframe": options.input_timeframe,
-                    "script_timeframe": options.script_timeframe,
-                    "bar_magnifier": options.bar_magnifier,
-                    "magnifier_samples": options.magnifier_samples,
-                    "magnifier_distribution": int(options.magnifier_distribution),
-                    "trace_enabled": options.trace_enabled,
-                    "chart_timezone": options.chart_timezone,
-                },
-                "strategy_params": dict(strategy_params or {}),
-            }
-            request_path = workspace / "request.json"
-            request_path.write_text(
-                json.dumps(request, separators=(",", ":"), allow_nan=False),
-                encoding="utf-8",
+            write_release_inputs(workspace, pine_source, bars, instrument)
+            environment = release_environment(
+                "/in",
+                instrument,
+                options,
+                strategy_params,
+                strategy_overrides,
             )
-            for input_path in (
-                workspace / "strategy.pine",
-                workspace / "ohlcv.csv",
-                request_path,
-            ):
-                input_path.chmod(0o644)
-            workspace.chmod(0o755)
-            completed = subprocess.run(
-                [
-                    "docker",
-                    "run",
-                    "--rm",
-                    "--network",
-                    "none",
-                    "--read-only",
-                    "--tmpfs",
-                    "/tmp:rw,exec,nosuid,nodev,size=512m",
-                    "--cap-drop",
-                    "ALL",
-                    "--security-opt",
-                    "no-new-privileges",
-                    "--mount",
-                    f"type=bind,src={workspace},dst=/work,readonly",
-                    image,
-                ],
-                text=True,
-                capture_output=True,
-                check=False,
-            )
+            environment["PINEFORGE_DATA_SOURCE"] = source
+            cid_path = workspace / "container.cid"
+            command = [
+                "docker",
+                "run",
+                "--rm",
+                "--cidfile",
+                str(cid_path),
+                "--network",
+                "none",
+                "--read-only",
+                "--tmpfs",
+                "/tmp:rw,exec,nosuid,nodev,size=512m",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--mount",
+                f"type=bind,src={workspace},dst=/in,readonly",
+            ]
+            for key, value in sorted(environment.items()):
+                command.extend(("--env", f"{key}={value}"))
+            command.append(image)
+            try:
+                completed = subprocess.run(
+                    command,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=self.timeout_seconds,
+                    env=os.environ.copy(),
+                )
+            except subprocess.TimeoutExpired as exc:
+                self._remove_timed_out_container(cid_path)
+                raise DockerExecutionError(
+                    f"pineforge-release exceeded {self.timeout_seconds:g} seconds"
+                ) from exc
         if completed.returncode != 0:
-            raise DockerExecutionError(_completed_error(completed))
+            phase = {2: "input", 3: "compile", 4: "backtest", 5: "transpile"}.get(
+                completed.returncode, "container"
+            )
+            raise DockerExecutionError(f"{phase} failed: {_completed_error(completed)}")
         try:
-            payload = json.loads(completed.stdout)
-        except json.JSONDecodeError as exc:
-            raise DockerExecutionError("container returned invalid JSON") from exc
-        if not isinstance(payload, dict):
-            raise DockerExecutionError("container report must be a JSON object")
-        return payload
+            report = parse_release_report(completed.stdout)
+        except ReleaseContractError as exc:
+            raise DockerExecutionError(str(exc)) from exc
+        return release_response(
+            report,
+            release_image=image,
+            mode="local-container",
+            request_id=None,
+            runtime_metadata=self._image_identity(),
+        )

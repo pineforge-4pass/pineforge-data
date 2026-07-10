@@ -7,11 +7,11 @@ from .backtest import (
     MagnifierDistribution,
     PineForgeBacktestRunner,
 )
+from .compile_cache import CompileCache
 from .docker_runtime import (
     DockerBacktestRuntime,
     DockerExecutionError,
     DockerPrerequisiteError,
-    discover_repository_root,
 )
 from .engine import EngineStreamSink, PfBar, PfTradeTick, pack_bars, pack_trade_ticks
 from .errors import EngineStreamError
@@ -45,12 +45,16 @@ from .providers import (
     create_provider,
     default_registry,
 )
+from .release_contract import DEFAULT_RELEASE_IMAGE, ReleaseContractError
 from .requests import BarRequest, MacroRequest, MarketQuery, TradeSubscription
+from .server_client import BacktestServerError, FastApiBacktestClient
 
 __all__ = [
+    "DEFAULT_RELEASE_IMAGE",
     "AssetClass",
     "BacktestOptions",
     "BacktestReport",
+    "BacktestServerError",
     "Bar",
     "BarRequest",
     "CcxtCapabilityError",
@@ -58,6 +62,7 @@ __all__ = [
     "CcxtDependencyError",
     "CcxtError",
     "CcxtProvider",
+    "CompileCache",
     "ContractSpec",
     "DockerBacktestRuntime",
     "DockerExecutionError",
@@ -65,6 +70,7 @@ __all__ = [
     "EngineBacktestError",
     "EngineStreamError",
     "EngineStreamSink",
+    "FastApiBacktestClient",
     "HistoricalBarProvider",
     "Instrument",
     "LiveTradeProvider",
@@ -86,11 +92,11 @@ __all__ = [
     "ProviderNotFoundError",
     "ProviderRegistry",
     "ProviderRegistryError",
+    "ReleaseContractError",
     "TradeSubscription",
     "TradeTick",
     "create_provider",
     "default_registry",
-    "discover_repository_root",
     "pack_bars",
     "pack_trade_ticks",
 ]

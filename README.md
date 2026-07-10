@@ -45,7 +45,7 @@ currently forming candle, and polls public trades into a strictly increasing
 per-stream sequence.
 
 ```bash
-pip install -e '.[ccxt]'
+pip install 'pineforge-data[ccxt]'
 ```
 
 ```python
@@ -87,30 +87,20 @@ confirmed OHLCV through a data provider and runs this pinned pipeline:
 
 ```text
 raw .pine + provider OHLCV
-        ↓ read-only mount
-Docker: Python codegen → C++ strategy → pineforge-engine → JSON report
+        ↓ local read-only mount or FastAPI request
+pineforge-release → generated C++ → cached/compiled strategy → JSON report
 ```
 
 Docker is a prerequisite. A host C++ compiler and a precompiled strategy
-library are not required.
-
-Clone with both pinned runtime dependencies:
-
-```bash
-git clone --recurse-submodules https://github.com/pineforge-4pass/pineforge-data.git
-cd pineforge-data
-python3 -m venv .venv
-.venv/bin/pip install -e '.[ccxt]'
-```
-
-For an existing checkout:
+library are not required. Install the package without cloning engine or codegen
+repositories:
 
 ```bash
-git submodule update --init
+pip install 'pineforge-data[ccxt]'
 ```
 
 ```bash
-.venv/bin/pineforge-backtest \
+pineforge-backtest \
   --pine strategy.pine \
   --provider ccxt \
   --venue kraken \
@@ -122,38 +112,88 @@ git submodule update --init
   --pretty
 ```
 
-The first invocation builds a local image tagged from the container source and
-the exact codegen and engine submodule commits. Later invocations reuse it.
-Pass `--rebuild-image` to force a rebuild or `--no-image-build` to require a
-prebuilt local image.
+The first local invocation pulls an immutable, multi-architecture
+`pineforge-release` image pinned by both version and OCI digest. It never builds
+engine or codegen locally. Use `--pull-policy never` for offline runs or opt in
+to the rolling channel with:
+
+```bash
+pineforge-backtest ... \
+  --runtime-image ghcr.io/pineforge-4pass/pineforge-release:latest \
+  --pull-policy always
+```
+
+`latest` is convenient for development but not deterministic. The report
+records the resolved image digest and component versions when Docker exposes
+them.
+
 Compilation and execution run as a non-root user with networking disabled, all
 Linux capabilities dropped, a read-only root filesystem, and only a read-only
 temporary input mount.
 
-The JSON report contains data provenance, processed-bar counts, every closed
-trade, all/long/short trade statistics, equity statistics, security-feed
-diagnostics, optional trace values, and the complete equity curve. Unix
-millisecond timestamps can be used instead of ISO-8601 values.
+The JSON report contains provider and market provenance, the release runtime
+identity and fingerprint, processed-bar counts, every closed trade,
+all/long/short statistics, equity statistics, diagnostics, and the complete
+equity curve. Unix millisecond timestamps can be used instead of ISO-8601
+values. The pinned `pineforge-release` does not currently expose trace
+collection; `--trace` fails explicitly rather than silently omitting it.
 
 Use `--provider-config config.json` for CCXT constructor options and
-`--strategy-params inputs.json` for Pine input overrides. The provider config
-file may contain credentials, so keep it outside version control.
+`--strategy-params inputs.json` for Pine inputs. Use `--strategy-overrides` for
+`strategy()` header overrides. The provider config file may contain
+credentials, so keep it outside version control.
 
-The report records the Pine source hash, generated C++ hash, transpile and
-compile timings, and the exact codegen and engine commits. The OSS codegen is
-source-available under its own PolyForm Noncommercial license and supplemental
-terms; review `vendor/pineforge-codegen-oss/LICENSE` before distribution or
-commercial use. The engine remains Apache-2.0.
+The generated C++ hash and exact engine/codegen versions are recorded in the
+release fingerprint. The combined runtime and its component licensing are
+owned by [`pineforge-release`](https://github.com/pineforge-4pass/pineforge-release),
+not vendored into this repository.
 
 Provider implementations in this repository are Python-only. The compiled C++
 strategy and engine stay behind the Docker/runtime boundary; broker SDKs and
 provider-specific types do not cross into `pineforge-engine`.
 
+## Concurrent FastAPI server
+
+The server image derives from the same pinned `pineforge-release` image. It
+admits a bounded number of compiler/backtest processes, keeps a bounded queue,
+isolates every request in its own temporary directory, and optionally requires
+a bearer token.
+
+```bash
+docker build -f docker/server.Dockerfile -t pineforge-data-server .
+docker volume create pineforge-compile-cache
+docker run --rm -p 127.0.0.1:8000:8000 \
+  --read-only \
+  --tmpfs /tmp:rw,exec,nosuid,nodev,size=512m \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  --mount type=volume,src=pineforge-compile-cache,dst=/cache \
+  -e PINEFORGE_SERVER_API_KEY=change-me \
+  pineforge-data-server
+```
+
+Point the same harness at it without putting the token on the command line:
+
+```bash
+export PINEFORGE_SERVER_URL=http://127.0.0.1:8000
+export PINEFORGE_SERVER_API_KEY=change-me
+pineforge-backtest --pine strategy.pine --venue kraken --symbol BTC/USD \
+  --timeframe 15m --start 2026-07-01T00:00:00Z --end 2026-07-08T00:00:00Z
+```
+
+The server always transpiles Pine deterministically and hashes the generated
+C++. Its cache stores the compiled `.so` under a key containing that C++ hash
+plus the release, engine, architecture, and compile flags. Concurrent misses
+for the same key compile once; subsequent requests skip compilation. Cache
+hit/key/hash are included in response provenance. See
+[docs/server.md](docs/server.md) for endpoints, limits, deployment, and cache
+settings.
+
 ## Development
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -e '.[dev,ccxt]'
+.venv/bin/pip install -e '.[dev,ccxt,server]'
 .venv/bin/ruff check .
 .venv/bin/mypy src
 .venv/bin/pytest

@@ -39,7 +39,7 @@ pineforge-backtest \
 | Group | Options |
 |---|---|
 | Strategy | `--pine`, `--strategy-params`, `--strategy-overrides` |
-| Data source | `--provider`, `--venue`/`--exchange`, `--symbol`, `--timeframe`, `--start`, `--end`, `--limit`, `--provider-config` |
+| Data source | `--provider`, `--venue`/`--exchange`, `--symbol`, `--timeframe`, `--start`, `--end`, `--limit`, `--warmup-bars`, `--provider-config` |
 | Pine context | `--timezone`, `--session`, `--engine-timeframe`, `--script-timeframe` |
 | Fill modeling | `--bar-magnifier`, `--magnifier-samples` |
 | Local runtime | `--runtime-image`/`--image`, `--pull-policy`, `--execution-timeout` |
@@ -50,6 +50,34 @@ pineforge-backtest \
 end is exclusive. `--engine-timeframe` defaults to a Pine-compatible conversion
 of the provider timeframe, and `--script-timeframe` defaults to the engine
 timeframe.
+
+### Indicator warmup
+
+Use `--warmup-bars` to load source bars before `--start` without allowing the
+strategy to place orders during that earlier interval:
+
+```bash
+pineforge-backtest \
+  --pine strategy.pine \
+  --provider ccxt \
+  --venue kraken \
+  --symbol BTC/USD \
+  --timeframe 15m \
+  --start 2025-07-01T00:00:00Z \
+  --end 2025-07-08T00:00:00Z \
+  --warmup-bars 500
+```
+
+The warmup bars initialize indicators, higher-timeframe feeds, and persistent
+Pine variables. PineForge suppresses order commands until `--start`, so broker
+state and trade counters begin at the requested backtest boundary. The default
+is `0` for backward compatibility.
+
+Providers can return fewer warmup bars when history is unavailable or the
+market has gaps. The report records `warmup_bars_requested`,
+`warmup_bars_loaded`, the expanded `provider_start_ms`, and the effective
+`trade_start_time_ms`. When `--limit` is set, warmup capacity is added to that
+limit so it does not consume the requested-window allowance.
 
 ## Configuration files
 
@@ -141,9 +169,14 @@ The harness combines provider provenance with the release report:
   "data": {
     "requested_start_ms": 1751328000000,
     "requested_end_ms": 1751932800000,
-    "first_bar_ms": 1751328000000,
+    "provider_start_ms": 1746828000000,
+    "first_bar_ms": 1746828000000,
     "last_bar_ms": 1751931900000,
-    "bars": 672
+    "bars": 1172,
+    "requested_bars": 672,
+    "warmup_bars_requested": 500,
+    "warmup_bars_loaded": 500,
+    "trade_start_time_ms": 1751328000000
   },
   "runtime": {
     "mode": "local-container",

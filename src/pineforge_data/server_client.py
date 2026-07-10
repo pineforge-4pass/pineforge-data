@@ -83,6 +83,7 @@ class FastApiBacktestClient:
                 "magnifier_distribution": options.magnifier_distribution.name.lower(),
                 "trace_enabled": options.trace_enabled,
                 "chart_timezone": options.chart_timezone,
+                "trade_start_time_ms": options.trade_start_time_ms,
             },
             "strategy_params": _scalar_inputs(strategy_params, "strategy_params"),
             "strategy_overrides": _scalar_inputs(strategy_overrides, "strategy_overrides"),

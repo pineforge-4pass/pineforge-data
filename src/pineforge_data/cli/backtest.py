@@ -57,6 +57,32 @@ def source_timeframe_to_pine(timeframe: str) -> str:
     return f"{count}{unit.upper() if unit != 'M' else unit}"
 
 
+def warmup_request_start_ms(start_ms: int, timeframe: str, warmup_bars: int) -> int:
+    """Return an inclusive provider start that can contain ``warmup_bars`` bars."""
+
+    if warmup_bars < 0:
+        raise ValueError("warmup_bars must be non-negative")
+    if warmup_bars == 0:
+        return start_ms
+    match = re.fullmatch(r"([1-9][0-9]*)([smhdwM])", timeframe)
+    if match is None:
+        raise ValueError(f"cannot calculate warmup for source timeframe: {timeframe}")
+    count = int(match.group(1))
+    unit = match.group(2)
+    # A calendar month has no fixed duration. Thirty-one days deliberately
+    # over-fetches; run_harness trims the result to the requested bar count.
+    unit_ms = {
+        "s": 1_000,
+        "m": 60_000,
+        "h": 3_600_000,
+        "d": 86_400_000,
+        "w": 604_800_000,
+        "M": 2_678_400_000,
+    }[unit]
+    duration_ms = count * unit_ms * warmup_bars
+    return max(0, start_ms - duration_ms)
+
+
 # Backward-compatible import for callers of the CCXT-only bootstrap API.
 ccxt_timeframe_to_pine = source_timeframe_to_pine
 
@@ -123,6 +149,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start", type=parse_timestamp, required=True)
     parser.add_argument("--end", type=parse_timestamp, required=True)
     parser.add_argument("--limit", type=int)
+    parser.add_argument(
+        "--warmup-bars",
+        type=int,
+        default=0,
+        help="source bars before --start used for indicator warmup; trading stays disabled",
+    )
     parser.add_argument("--timezone", default="UTC", help="IANA chart and exchange timezone")
     parser.add_argument("--session", default="24x7", help="PineForge syminfo session")
     parser.add_argument(
@@ -174,6 +206,13 @@ def build_parser() -> argparse.ArgumentParser:
 async def run_harness(args: argparse.Namespace) -> dict[str, JsonValue]:
     """Execute the provider-to-engine pipeline for parsed CLI arguments."""
 
+    if args.warmup_bars < 0:
+        raise ValueError("--warmup-bars must be non-negative")
+    if args.end <= args.start:
+        raise ValueError("--end must be later than --start")
+    if args.limit is not None and args.limit <= 0:
+        raise ValueError("--limit must be positive")
+
     provider_config = _load_json_object(args.provider_config)
     strategy_params = _load_json_object(args.strategy_params)
     strategy_overrides = _load_json_object(args.strategy_overrides)
@@ -185,19 +224,27 @@ async def run_harness(args: argparse.Namespace) -> dict[str, JsonValue]:
             timezone=args.timezone,
             session=args.session,
         )
+        provider_start_ms = warmup_request_start_ms(args.start, args.timeframe, args.warmup_bars)
+        request_limit = None if args.limit is None else args.limit + args.warmup_bars
         request = BarRequest(
             instrument,
             args.timeframe,
-            args.start,
+            provider_start_ms,
             args.end,
-            limit=args.limit,
+            limit=request_limit,
         )
-        bars = await provider.fetch_bars(request)
+        fetched_bars = list(await provider.fetch_bars(request))
         provider_name = provider.name
     finally:
         await provider.close()
-    if not bars:
+    if not fetched_bars:
         raise RuntimeError("provider returned no confirmed bars for the requested interval")
+    requested_bars = [bar for bar in fetched_bars if bar.timestamp_ms >= args.start]
+    if not requested_bars:
+        raise RuntimeError("provider returned no confirmed bars at or after --start")
+    warmup_candidates = [bar for bar in fetched_bars if bar.timestamp_ms < args.start]
+    warmup = warmup_candidates[-args.warmup_bars :] if args.warmup_bars else []
+    bars = [*warmup, *requested_bars]
 
     engine_timeframe = args.engine_timeframe or source_timeframe_to_pine(args.timeframe)
     options = BacktestOptions(
@@ -207,6 +254,7 @@ async def run_harness(args: argparse.Namespace) -> dict[str, JsonValue]:
         magnifier_samples=args.magnifier_samples,
         trace_enabled=args.trace,
         chart_timezone=args.timezone,
+        trade_start_time_ms=args.start if args.warmup_bars else None,
     )
     pine_path = args.pine.expanduser().resolve()
     if not pine_path.is_file():
@@ -262,9 +310,14 @@ async def run_harness(args: argparse.Namespace) -> dict[str, JsonValue]:
         "data": {
             "requested_start_ms": args.start,
             "requested_end_ms": args.end,
+            "provider_start_ms": provider_start_ms,
             "first_bar_ms": bars[0].timestamp_ms,
             "last_bar_ms": bars[-1].timestamp_ms,
             "bars": len(bars),
+            "requested_bars": len(requested_bars),
+            "warmup_bars_requested": args.warmup_bars,
+            "warmup_bars_loaded": len(warmup),
+            "trade_start_time_ms": options.trade_start_time_ms,
         },
         "strategy": {
             "pine": str(pine_path),

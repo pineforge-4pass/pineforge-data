@@ -91,7 +91,7 @@ def release_environment(
         raise ReleaseContractError("pineforge-release 0.1.12 does not expose trace collection")
     if options.bar_magnifier and options.magnifier_samples < 2:
         raise ReleaseContractError("bar magnifier requires at least two samples")
-    return {
+    environment = {
         "PINEFORGE_IN_DIR": input_directory,
         "PINEFORGE_INPUTS": json.dumps(
             dict(strategy_params or {}), separators=(",", ":"), allow_nan=False
@@ -109,6 +109,9 @@ def release_environment(
         "PINEFORGE_DATA_SYMBOL": instrument.symbol,
         "PINEFORGE_DATA_VENUE": instrument.venue,
     }
+    if options.trade_start_time_ms is not None:
+        environment["PINEFORGE_TRADE_START_MS"] = str(options.trade_start_time_ms)
+    return environment
 
 
 def parse_release_report(stdout: str) -> dict[str, object]:

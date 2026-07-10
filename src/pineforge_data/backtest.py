@@ -47,6 +47,7 @@ class BacktestOptions:
     magnifier_distribution: MagnifierDistribution = MagnifierDistribution.ENDPOINTS
     trace_enabled: bool = False
     chart_timezone: str | None = None
+    trade_start_time_ms: int | None = None
 
     def __post_init__(self) -> None:
         if self.magnifier_samples <= 0:
@@ -57,6 +58,8 @@ class BacktestOptions:
             raise ValueError("script_timeframe must not be whitespace")
         if self.chart_timezone is not None and not self.chart_timezone.strip():
             raise ValueError("chart_timezone must not be empty")
+        if self.trade_start_time_ms is not None and not 0 <= self.trade_start_time_ms <= 2**63 - 1:
+            raise ValueError("trade_start_time_ms must be a non-negative signed 64-bit integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,6 +371,9 @@ class PineForgeBacktestRunner:
         if hasattr(library, "strategy_set_syminfo_session"):
             library.strategy_set_syminfo_session.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
             library.strategy_set_syminfo_session.restype = None
+        if hasattr(library, "strategy_set_trade_start_time"):
+            library.strategy_set_trade_start_time.argtypes = [ctypes.c_void_p, ctypes.c_int64]
+            library.strategy_set_trade_start_time.restype = None
 
     def _apply_context(
         self, state: int | ctypes.c_void_p, instrument: Instrument, options: BacktestOptions
@@ -382,6 +388,12 @@ class PineForgeBacktestRunner:
             library.strategy_set_syminfo_timezone(state, instrument.timezone.encode())
         if instrument.session and hasattr(library, "strategy_set_syminfo_session"):
             library.strategy_set_syminfo_session(state, instrument.session.encode())
+        if options.trade_start_time_ms is not None:
+            if not hasattr(library, "strategy_set_trade_start_time"):
+                raise EngineBacktestError(
+                    "strategy library does not expose strategy_set_trade_start_time"
+                )
+            library.strategy_set_trade_start_time(state, options.trade_start_time_ms)
 
     def _last_error(self, state: int | ctypes.c_void_p) -> str:
         if not hasattr(self._library, "strategy_get_last_error"):

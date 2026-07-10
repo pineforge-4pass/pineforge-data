@@ -161,9 +161,14 @@ pineforge-backtest \
   --timeframe 15m \
   --start 2026-07-01T00:00:00Z \
   --end 2026-07-08T00:00:00Z \
+  --warmup-bars 500 \
   --output report.json \
   --pretty
 ```
+
+`--warmup-bars` fetches additional source bars before `--start` to initialize
+indicators and higher-timeframe state. Order execution remains disabled until
+`--start`, and the report records both requested and loaded warmup counts.
 
 The first local invocation pulls an immutable, multi-architecture
 `pineforge-release` image pinned by both version and OCI digest. It never builds

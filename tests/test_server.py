@@ -160,3 +160,16 @@ def test_request_rejects_unsorted_bars() -> None:
 
     with pytest.raises(ValueError, match="strictly increasing"):
         BacktestApiRequest.model_validate(payload)
+
+
+def test_request_maps_trade_start_to_domain_options() -> None:
+    payload = request_payload()
+    options = payload["options"]
+    assert isinstance(options, dict)
+    options["trade_start_time_ms"] = 1_000
+
+    _pine, _bars, _instrument, domain_options = BacktestApiRequest.model_validate(
+        payload
+    ).domain_values()
+
+    assert domain_options.trade_start_time_ms == 1_000

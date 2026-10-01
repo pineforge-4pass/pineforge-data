@@ -25,6 +25,15 @@ CSV, SQLite, and SQLAlchemy share runtime schema discovery and arbitrary column
 mapping. Read the [tabular schema mapping](providers/tabular-schema.md) guide
 before configuring one of them.
 
+## Macro providers
+
+| Provider | Data source | Capabilities | Install extra | API guide |
+|---|---|---|---|---|
+| `FxMacroDataProvider` | FXMacroData economic announcements | macro observations with release and vintage times | none | [FXMacroData](providers/fxmacrodata.md) |
+
+Macro providers implement `MacroDataProvider` and are constructed directly;
+they are not registry entries for the backtest harness.
+
 ## Shared provider lifecycle
 
 Create a provider by registry name when configuration comes from a CLI, service,

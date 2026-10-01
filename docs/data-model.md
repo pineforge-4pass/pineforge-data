@@ -117,8 +117,8 @@ The enforced ordering is `period_end_ms <= released_at_ms <= vintage_at_ms`.
 Backtests must align on availability/vintage time rather than inserting today's
 revised value into historical periods.
 
-`MacroDataProvider` and `MacroRequest` define the public contract; the bootstrap
-package does not yet ship a built-in macro provider.
+`MacroDataProvider` and `MacroRequest` define the public contract.
+[`FxMacroDataProvider`](providers/fxmacrodata.md) is the built-in macro provider.
 
 ## Low-level engine streaming
 

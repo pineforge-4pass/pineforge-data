@@ -42,6 +42,14 @@
 
 ::: pineforge_data.providers.sqlalchemy.SqlAlchemyBarProvider
 
+::: pineforge_data.providers.fxmacrodata.FxMacroDataProvider
+
+::: pineforge_data.providers.fxmacrodata.FxMacroDataTransport
+
+::: pineforge_data.providers.fxmacrodata.FxMacroDataResponse
+
+::: pineforge_data.providers.fxmacrodata.UrllibTransport
+
 ## Provider errors
 
 ::: pineforge_data.providers.ccxt.CcxtError
@@ -53,3 +61,11 @@
 ::: pineforge_data.providers.ccxt.CcxtDataError
 
 ::: pineforge_data.providers.sqlalchemy.SqlAlchemyDependencyError
+
+::: pineforge_data.providers.fxmacrodata.FxMacroDataError
+
+::: pineforge_data.providers.fxmacrodata.FxMacroDataHTTPError
+
+::: pineforge_data.providers.fxmacrodata.FxMacroDataDataError
+
+::: pineforge_data.providers.fxmacrodata.FxMacroDataAccessWarning

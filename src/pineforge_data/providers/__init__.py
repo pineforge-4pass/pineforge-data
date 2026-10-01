@@ -15,6 +15,16 @@ from .ccxt import (
     CcxtError,
     CcxtProvider,
 )
+from .fxmacrodata import (
+    FXMACRODATA_API_URL,
+    FxMacroDataAccessWarning,
+    FxMacroDataDataError,
+    FxMacroDataError,
+    FxMacroDataHTTPError,
+    FxMacroDataProvider,
+    FxMacroDataResponse,
+    FxMacroDataTransport,
+)
 from .local import CsvBarProvider, SqliteBarProvider
 from .registry import (
     ENTRY_POINT_GROUP,
@@ -38,6 +48,7 @@ from .tabular import (
 
 __all__ = [
     "ENTRY_POINT_GROUP",
+    "FXMACRODATA_API_URL",
     "BarColumnMapping",
     "CcxtCapabilityError",
     "CcxtDataError",
@@ -45,6 +56,13 @@ __all__ = [
     "CcxtError",
     "CcxtProvider",
     "CsvBarProvider",
+    "FxMacroDataAccessWarning",
+    "FxMacroDataDataError",
+    "FxMacroDataError",
+    "FxMacroDataHTTPError",
+    "FxMacroDataProvider",
+    "FxMacroDataResponse",
+    "FxMacroDataTransport",
     "HistoricalBarProvider",
     "LiveTradeProvider",
     "MacroDataProvider",

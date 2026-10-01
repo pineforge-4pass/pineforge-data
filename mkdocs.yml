@@ -81,6 +81,7 @@ nav:
       - CSV: providers/csv.md
       - SQLite: providers/sqlite.md
       - SQLAlchemy: providers/sqlalchemy.md
+      - FXMacroData: providers/fxmacrodata.md
   - Backtesting:
       - Harness and reports: backtesting.md
       - FastAPI server: server.md

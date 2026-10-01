@@ -1,0 +1,91 @@
+{
+  "_comment": "Two pages of /v1/announcements/USD/non_farm_payrolls?revisions=all, trimmed to the fields the provider reads.",
+  "pages": [
+    {
+      "currency": "USD",
+      "indicator": "non_farm_payrolls",
+      "source": "BLS",
+      "value_metadata": {"source_unit": "Persons", "normalization_applied": true},
+      "pagination": {"limit": 100, "offset": 0, "returned_count": 2, "has_more": true, "next_offset": 2},
+      "data": [
+        {
+          "date": "2026-06-30",
+          "val": 158936000.0,
+          "announcement_datetime": 1783513800,
+          "publication_time_status": "unverified"
+        },
+        {
+          "date": "2026-07-31",
+          "val": 158913000.0,
+          "source": "BLS",
+          "announcement_datetime": 1786105800,
+          "publication_time_status": "unverified",
+          "vintage_status": "captured_snapshot",
+          "observed_at_ns": 1789364950289573500,
+          "revisions": [
+            {
+              "epoch": 1786105800,
+              "val": 158858000.0,
+              "publication_time_status": "confirmed",
+              "vintage_status": "source_vintage",
+              "is_first_release": true
+            },
+            {
+              "epoch": 1786105800,
+              "val": 158913000.0,
+              "observed_at_ns": 1789364950289573500,
+              "vintage_status": "captured_snapshot",
+              "is_first_release": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "currency": "USD",
+      "indicator": "non_farm_payrolls",
+      "source": "BLS",
+      "value_metadata": {"source_unit": "Persons", "normalization_applied": true},
+      "pagination": {"limit": 100, "offset": 2, "returned_count": 3, "has_more": false},
+      "data": [
+        {
+          "date": "2026-08-31",
+          "val": 159075000.0,
+          "announcement_datetime": 1788525000,
+          "publication_time_status": "unverified",
+          "vintage_status": "captured_snapshot",
+          "observed_at_ns": 1789104351424651147,
+          "revisions": [
+            {
+              "epoch": 1788525000,
+              "val": 159075000.0,
+              "publication_time_status": "confirmed",
+              "vintage_status": "source_vintage",
+              "is_first_release": true
+            },
+            {
+              "epoch": 1788525000,
+              "val": 159075000.0,
+              "observed_at_ns": 1789104351424651147,
+              "vintage_status": "captured_snapshot",
+              "is_first_release": false
+            }
+          ]
+        },
+        {
+          "date": "2026-05-31",
+          "val": 158900000.0,
+          "announcement_datetime": null,
+          "publication_time_status": "unknown"
+        },
+        {
+          "date": "2026-04-30",
+          "val": 158700000.0,
+          "announcement_datetime": 1778247000,
+          "publication_time_status": "assumed_historical",
+          "release_time_assumed": true
+        }
+      ]
+    }
+  ]
+}

@@ -68,6 +68,9 @@ Source = "https://github.com/pineforge-4pass/pineforge-data"
 [tool.hatch.build.targets.wheel]
 packages = ["src/pineforge_data"]
 
+[tool.hatch.build.targets.sdist]
+exclude = ["/native"]
+
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]

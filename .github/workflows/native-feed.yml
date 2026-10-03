@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Native feed
+on:
+  push:
+    paths: ['native/feed/**', '.github/workflows/native-feed.yml']
+  pull_request:
+    paths: ['native/feed/**', '.github/workflows/native-feed.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Release (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Linux prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build libssl-dev
+      - name: macOS prerequisites
+        if: runner.os == 'macOS'
+        run: |
+          brew install ninja openssl@3
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+      - name: Pinned WebSocket curl
+        run: bash native/feed/tests/build_ci_curl.sh "$RUNNER_TEMP/curl"
+      - name: Configure, build and test
+        run: |
+          export LD_LIBRARY_PATH="$RUNNER_TEMP/curl/lib:${LD_LIBRARY_PATH:-}"
+          export DYLD_LIBRARY_PATH="$RUNNER_TEMP/curl/lib:${DYLD_LIBRARY_PATH:-}"
+          cmake -S native/feed -B build-feed -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCURL_DIR="$RUNNER_TEMP/curl/lib/cmake/CURL"
+          cmake --build build-feed -j4
+          ctest --test-dir build-feed --output-on-failure
+
+  asan-ubsan:
+    name: ASan + UBSan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build libssl-dev clang-18
+      - run: bash native/feed/tests/build_ci_curl.sh "$RUNNER_TEMP/curl"
+      - name: Instrumented core and mock venue
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          export LD_LIBRARY_PATH="$RUNNER_TEMP/curl/lib:${LD_LIBRARY_PATH:-}"
+          cmake -S native/feed -B build-feed -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_COMPILER=clang++-18 -DCURL_DIR="$RUNNER_TEMP/curl/lib/cmake/CURL" \
+            -DPINEFORGE_FEED_SANITIZER=address,undefined
+          cmake --build build-feed -j4
+          ctest --test-dir build-feed --output-on-failure
+
+  tsan:
+    name: TSan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build libssl-dev clang-18
+      - run: bash native/feed/tests/build_ci_curl.sh "$RUNNER_TEMP/curl"
+      - name: Threaded receive, healing and termination
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+        run: |
+          export LD_LIBRARY_PATH="$RUNNER_TEMP/curl/lib:${LD_LIBRARY_PATH:-}"
+          cmake -S native/feed -B build-feed -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_COMPILER=clang++-18 -DCURL_DIR="$RUNNER_TEMP/curl/lib/cmake/CURL" \
+            -DPINEFORGE_FEED_SANITIZER=thread
+          cmake --build build-feed -j4
+          ctest --test-dir build-feed --output-on-failure

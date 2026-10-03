@@ -1,0 +1,25 @@
+PineForge Feed
+Apache License, Version 2.0. See LICENSE.
+
+This product includes runner/json.hpp from PineForge Engine:
+  PineForge Engine
+  Copyright 2026 PineForge contributors
+  This product includes software developed for the PineForge project.
+  The PineForge runtime is licensed under the Apache License, Version 2.0.
+
+The header is an unchanged copy from engine revision
+227c2236e4769ae926d2c6e4811c37ff5119c4a0, path runner/json.hpp.
+SHA-256: 9431c7c311d74be1cea0e8d1a3942a33528ac11f6e67ee67d000cf4a8af7f830
+Source: https://github.com/pineforge-4pass/pineforge-engine
+No engine, strategy compiler, Eigen, or Python runtime is linked by the feed.
+
+Linked dependencies retain their upstream terms:
+  libcurl: curl license (MIT/X derivative), https://curl.se/docs/copyright.html
+  OpenSSL 3.x: Apache License, Version 2.0, https://openssl.org
+Preserve upstream licenses/notices when distributing bundled libraries.
+
+CI builds libcurl 8.14.1 from curl-8.14.1.tar.xz.
+Archive SHA-256: f4619a1e2474c4bbfedc88a7c2191209c8334b48fa1f4e53fd584cc12e9120dd
+Source: https://curl.se/download/curl-8.14.1.tar.xz
+
+Market-data access and redistribution remain subject to the venue's terms.

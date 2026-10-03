@@ -29,6 +29,13 @@ jobs:
       - if: matrix.python-version == '3.13'
         run: python -m build
       - if: matrix.python-version == '3.13'
+        name: The sdist does not ship the native feed
+        run: |
+          if tar -tzf dist/*.tar.gz | grep -E '^[^/]+/native/'; then
+            echo "native/ must stay out of the Python sdist" >&2
+            exit 1
+          fi
+      - if: matrix.python-version == '3.13'
         run: python -m twine check --strict dist/*
 
   docker:

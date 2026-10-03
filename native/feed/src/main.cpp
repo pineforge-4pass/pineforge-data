@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "binance.hpp"
+#include "session.hpp"
+#include "transport.hpp"
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <csignal>
@@ -22,10 +24,57 @@ struct StdoutFlags {
     ~StdoutFlags() { if (saved >= 0) ::fcntl(STDOUT_FILENO, F_SETFL, saved); }
 };
 void help() {
-    std::cout << "pineforge-feed warmup --venue binance --market spot --symbol SYMBOL --start UTC|MS --end UTC|MS --output FILE\n"
-                 "pineforge-feed run --venue binance --market spot --symbol SYMBOL --mode bars|ticks --state-dir DIR [--start UTC|MS | --resume] [--output-from INDEX]\n"
-                 "Limits: --max-messages N --max-log-bytes N --max-replay-seconds N --max-queue-bytes N --reconnect-seconds N\n"
+    std::cout << "pineforge-feed warmup --venue VENUE --market MARKET --symbol SYMBOL --start UTC|MS --end UTC|MS --output FILE\n"
+                 "pineforge-feed run --venue VENUE --market MARKET --symbol SYMBOL --mode MODE --state-dir DIR [--start UTC|MS | --resume] [--output-from INDEX]\n"
+                 "Venues and modes:\n"
+                 "  binance spot BTCUSDT        bars | ticks\n"
+                 "  binance usdm BTCUSDT        bars | agg-ticks (aggregate prints, not raw trades; bars can\n"
+                 "                              differ from klines at minute edges: use bars for kline-exact bars)\n"
+                 "  okx spot BTC-USDT           bars | ticks\n"
+                 "  okx swap BTC-USDT-SWAP      bars | ticks (linear swaps; base quantities)\n"
+                 "  bybit spot|linear BTCUSDT   bars\n"
+                 "Limits: --max-messages N --max-log-bytes N --max-replay-seconds N --max-queue-bytes N --reconnect-seconds N --keepalive-seconds N\n"
                  "Testing/public origins: --rest-url ORIGIN --ws-url ORIGIN [--allow-insecure-http (loopback only)]\n";
+}
+// Venue, market and mode gates are checked before any network access.
+void gate(pineforge::feed::Config& config, bool warmup, bool rest_given, bool ws_given) {
+    using pineforge::feed::Error;
+    const auto& venue = config.venue;
+    const auto& market = config.market;
+    const auto& mode = config.mode;
+    std::string rest, ws, grammar = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    if (venue == "coinbase")
+        throw Error(23, "Coinbase is deferred: it has no confirmed one-minute candle stream, and its REST and WebSocket trade "
+                        "timestamps disagree, so no lossless tick paging exists");
+    if (venue == "binance" && market == "spot") {
+        rest = "https://api.binance.com", ws = "wss://stream.binance.com:443";
+        if (!warmup && mode != "bars" && mode != "ticks") throw Error(23, "Binance spot modes are bars and ticks");
+    } else if (venue == "binance" && market == "usdm") {
+        rest = "https://fapi.binance.com", ws = "wss://fstream.binance.com";
+        if (!warmup && mode == "ticks")
+            throw Error(23, "Binance USD-M raw trades have no public REST history; use --mode agg-ticks for aggregate prints");
+        if (!warmup && mode != "bars" && mode != "agg-ticks") throw Error(23, "Binance USD-M modes are bars and agg-ticks");
+    } else if (venue == "okx" && (market == "spot" || market == "swap")) {
+        rest = "https://www.okx.com", ws = "wss://ws.okx.com:8443";
+        grammar += '-';
+        if (!warmup && mode != "bars" && mode != "ticks") throw Error(23, "OKX modes are bars and ticks (trades-all raw prints)");
+    } else if (venue == "bybit" && (market == "spot" || market == "linear")) {
+        rest = "https://api.bybit.com", ws = "wss://stream.bybit.com";
+        if (!warmup && (mode == "ticks" || mode == "agg-ticks"))
+            throw Error(23, "Bybit tick mode is refused: Bybit trade IDs are not a contiguous cursor and its REST cannot page back "
+                            "through trades; use --mode bars (confirmed kline.1 candles)");
+        if (!warmup && mode != "bars") throw Error(23, "Bybit supports bars only");
+    } else throw Error(23, "unsupported venue/market: binance spot|usdm, okx spot|swap, bybit spot|linear");
+    if (config.symbol.empty() || config.symbol.size() > 32 || config.symbol.find_first_not_of(grammar) != std::string::npos)
+        throw Error(23, venue == "okx" ? "use an uppercase OKX instrument ID such as BTC-USDT or BTC-USDT-SWAP" : "use an uppercase ASCII symbol");
+    if (venue == "okx") {
+        const auto dashes = std::count(config.symbol.begin(), config.symbol.end(), '-');
+        const bool swap = config.symbol.size() > 5 && config.symbol.compare(config.symbol.size() - 5, 5, "-SWAP") == 0;
+        if (market == "spot" ? dashes != 1 || swap : dashes != 2 || !swap || config.symbol.front() == '-')
+            throw Error(23, market == "spot" ? "OKX spot instruments look like BTC-USDT" : "OKX perpetual swaps look like BTC-USDT-SWAP");
+    }
+    if (!rest_given) config.rest_url = rest;
+    if (!ws_given) config.ws_url = ws;
 }
 }
 int run(int argc, char** argv) {
@@ -64,17 +113,17 @@ int run(int argc, char** argv) {
             else if (key == "--max-replay-seconds") config.max_replay_seconds = unsigned_value(value);
             else if (key == "--max-queue-bytes") config.max_queue_bytes = unsigned_value(value);
             else if (key == "--reconnect-seconds") config.reconnect_seconds = unsigned_value(value);
+            else if (key == "--keepalive-seconds") config.keepalive_seconds = unsigned_value(value);
             else if (key == "--rest-url") config.rest_url = value;
             else if (key == "--ws-url") config.ws_url = value;
             else throw Error(23, "unknown CLI option: " + key);
         }
-        if (config.venue != "binance" || config.market != "spot") throw Error(23, "this release supports public Binance spot only");
-        if (config.symbol.empty() || config.symbol.size() > 32 || config.symbol.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") != std::string::npos)
-            throw Error(23, "use an uppercase ASCII Binance symbol");
-        if (config.mode != "bars" && config.mode != "ticks") throw Error(23, "mode must be bars or ticks");
+        gate(config, command == "warmup", seen.count("--rest-url") != 0, seen.count("--ws-url") != 0);
         if (!config.max_log_bytes || !config.max_queue_bytes || !config.max_replay_seconds || config.max_replay_seconds > 3600 ||
             !config.reconnect_seconds || config.reconnect_seconds > 86100)
             throw Error(23, "budgets must be positive; reconnect must precede the 24-hour connection limit");
+        // OKX closes a connection after 30 s without traffic; Bybit recommends a ping every 20 s.
+        if (!config.keepalive_seconds || config.keepalive_seconds > 25) throw Error(23, "--keepalive-seconds must be 1..25");
         check_runtime_curl();
         validate_origin(config.rest_url, false, config.allow_insecure);
         validate_origin(config.ws_url, true, config.allow_insecure);

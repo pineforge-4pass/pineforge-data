@@ -25,7 +25,7 @@ bool digest_token(const std::string& token) {
 }
 void advance(Cursor& cursor, const Json& event, const std::string& mode) {
     const auto type = event.at("type").text();
-    if (type == "tick" && mode == "ticks") {
+    if (type == "tick" && tick_mode(mode)) {
         const auto trade = normalized_trade(event);
         const auto previous = cursor.seq ? cursor.seq : cursor.predecessor ? cursor.predecessor->id : 0;
         if (!previous || previous == std::numeric_limits<std::uint64_t>::max() || trade.id != previous + 1 ||
@@ -38,9 +38,10 @@ void advance(Cursor& cursor, const Json& event, const std::string& mode) {
         if (bar.ts != cursor.cut) throw Error(20, "bar does not adjoin the verified cut");
         cursor.last_bar = bar.ts;
         cursor.cut += 60000;
-    } else if (type == "time" && mode == "ticks") {
+    } else if (type == "time" && tick_mode(mode)) {
         const auto cut = event.at("ts").integer<std::int64_t>();
-        if (!cursor.seq || cut != cursor.cut + 60000 || cut <= cursor.last_tick_ts)
+        // A fenced quiet minute may close before any print: the anchored predecessor bounds it.
+        if ((!cursor.seq && !cursor.predecessor) || cut != cursor.cut + 60000 || cut <= cursor.last_tick_ts)
             throw Error(20, "time does not advance exactly one proven closed minute");
         cursor.cut = cut;
     } else throw Error(23, "journal contains an unsupported normalized message");
@@ -59,8 +60,9 @@ Json State::serialize(const Cursor& cursor) const {
         {"symbol", Json::string(config_.symbol)}, {"mode", Json::string(config_.mode)},
         {"rest_origin", Json::string(config_.rest_url)}, {"ws_origin", Json::string(config_.ws_url)},
         {"units", Json::object({{"price", Json::string("quote/base")}, {"qty", Json::string("base")}, {"ts", Json::string("unix-ms")}})},
+        {"qty_multiplier", Json::string(config_.qty_multiplier)},
         {"start", signed_number(cursor.start)}, {"verified_cut", signed_number(cursor.cut)},
-        {"venue_id", config_.mode == "ticks" ? number(cursor.seq) : signed_number(cursor.last_bar)},
+        {"venue_id", tick_mode(config_.mode) ? number(cursor.seq) : signed_number(cursor.last_bar)},
         {"emitted_seq", number(cursor.seq)}, {"last_tick_ts", signed_number(cursor.last_tick_ts)},
         {"last_bar", signed_number(cursor.last_bar)}, {"message_index", number(cursor.message_index)},
         {"log_bytes", number(cursor.log_bytes)}, {"prefix_hash", Json::string(cursor.prefix_hash)},
@@ -125,6 +127,10 @@ void State::recover() {
         const auto& units = document.at("units");
         if (units.at("price").text() != "quote/base" || units.at("qty").text() != "base" || units.at("ts").text() != "unix-ms")
             throw Error(21, "resume units changed");
+        // Contract quantities were converted with this instrument multiplier; a change would mix units.
+        const auto* multiplier = document.find("qty_multiplier");
+        if ((multiplier ? multiplier->text() : std::string("1")) != config_.qty_multiplier)
+            throw Error(21, "resume contract quantity multiplier changed");
         cursor_.epoch = document.at("epoch").text();
         cursor_.prefix_hash = document.at("prefix_hash").text();
         cursor_.overlap_hash = document.at("overlap_hash").text();
@@ -135,7 +141,7 @@ void State::recover() {
         cursor_.seq = document.at("emitted_seq").integer<std::uint64_t>();
         cursor_.last_tick_ts = document.at("last_tick_ts").integer<std::int64_t>();
         cursor_.last_bar = document.at("last_bar").integer<std::int64_t>();
-        if ((config_.mode == "ticks" && document.at("venue_id").integer<std::uint64_t>() != cursor_.seq) ||
+        if ((tick_mode(config_.mode) && document.at("venue_id").integer<std::uint64_t>() != cursor_.seq) ||
             (config_.mode == "bars" && document.at("venue_id").integer<std::int64_t>() != cursor_.last_bar))
             throw Error(21, "venue ID does not match the emitted cursor");
         cursor_.message_index = document.at("message_index").integer<std::uint64_t>();

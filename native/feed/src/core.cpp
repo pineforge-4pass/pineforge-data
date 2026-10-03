@@ -3,6 +3,7 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -238,6 +239,85 @@ Decimal Decimal::add(const Decimal& other) const {
     return Decimal(sum, scale);
 }
 
+Decimal Decimal::multiply(const Decimal& other) const {
+    if (zero() || other.zero()) return Decimal("0", 0);
+    // The constructor bounds the product: at most 128 coefficient digits and 32 fractional digits.
+    std::string product(coefficient_.size() + other.coefficient_.size(), '0');
+    for (std::size_t left = coefficient_.size(); left > 0; --left) {
+        int carry = 0;
+        for (std::size_t right = other.coefficient_.size(); right > 0; --right) {
+            auto& digit = product[left + right - 1];
+            const int value = (digit - '0') + (coefficient_[left - 1] - '0') * (other.coefficient_[right - 1] - '0') + carry;
+            digit = static_cast<char>('0' + value % 10);
+            carry = value / 10;
+        }
+        product[left - 1] = static_cast<char>(product[left - 1] + carry);
+    }
+    return Decimal(product, scale_ + other.scale_);
+}
+
+std::string Decimal::str() const {
+    if (!scale_) return coefficient_;
+    auto digits = coefficient_;
+    if (digits.size() <= scale_) digits.insert(0, scale_ - digits.size() + 1, '0');
+    digits.insert(digits.size() - scale_, 1, '.');
+    return digits;
+}
+
+std::string scaled_quantity(const std::string& token, const std::string& multiplier) {
+    const Decimal amount(token);
+    if (multiplier == "1") return token;
+    return amount.multiply(Decimal(multiplier)).str();
+}
+
+std::string json_member(const std::string& document, const std::string& name) {
+    std::size_t index = 0;
+    const auto space = [&] { while (index < document.size() && std::isspace(static_cast<unsigned char>(document[index]))) ++index; };
+    const auto string_end = [&](std::size_t start) {
+        for (auto cursor = start + 1; cursor < document.size(); ++cursor) {
+            if (document[cursor] == '\\') ++cursor;
+            else if (document[cursor] == '"') return cursor + 1;
+        }
+        throw Error(23, "unterminated JSON string");
+    };
+    const auto value_end = [&](std::size_t start) {
+        if (start >= document.size()) throw Error(23, "truncated JSON member");
+        if (document[start] == '"') return string_end(start);
+        std::size_t depth = 0, cursor = start;
+        while (cursor < document.size()) {
+            const char letter = document[cursor];
+            if (letter == '"') { cursor = string_end(cursor); continue; }
+            if (letter == '{' || letter == '[') ++depth;
+            else if (letter == '}' || letter == ']') {
+                if (!depth) return cursor;
+                if (!--depth) return cursor + 1;
+            } else if (letter == ',' && !depth) return cursor;
+            ++cursor;
+        }
+        throw Error(23, "truncated JSON member");
+    };
+    space();
+    if (index >= document.size() || document[index] != '{') throw Error(23, "expected a JSON object document");
+    ++index;
+    for (;;) {
+        space();
+        if (index >= document.size() || document[index] != '"') throw Error(23, "JSON member not found: " + name);
+        const auto key_end = string_end(index);
+        const auto key = document.substr(index + 1, key_end - index - 2);
+        index = key_end;
+        space();
+        if (index >= document.size() || document[index] != ':') throw Error(23, "invalid JSON object member");
+        ++index;
+        space();
+        const auto start = index;
+        index = value_end(start);
+        if (key == name) return document.substr(start, index - start);
+        space();
+        if (index >= document.size() || document[index] != ',') throw Error(23, "JSON member not found: " + name);
+        ++index;
+    }
+}
+
 void Trade::validate() const {
     if (!id || ts < 0 || ts > std::numeric_limits<std::int64_t>::max() - 60000 || Decimal(price).zero() || Decimal(qty).zero())
         throw Error(23, "invalid positive venue trade");
@@ -247,8 +327,10 @@ std::string Trade::wire() const {
     return "{\"type\":\"tick\",\"ts\":" + std::to_string(ts) + ",\"seq\":" + std::to_string(id) +
         ",\"price\":" + price + ",\"qty\":" + qty + "}";
 }
+// Exact decimal values, not lexemes: a venue may render one number as "100.0" on its WebSocket and as
+// "100" over REST. Emitted tokens stay verbatim; only the comparison is by value.
 bool Trade::operator==(const Trade& other) const {
-    return id == other.id && ts == other.ts && price == other.price && qty == other.qty;
+    return id == other.id && ts == other.ts && Decimal(price) == Decimal(other.price) && Decimal(qty) == Decimal(other.qty);
 }
 void Bar::validate() const {
     if (ts < 0 || ts % 60000 || ts > std::numeric_limits<std::int64_t>::max() - 60000)
@@ -265,7 +347,8 @@ std::string Bar::wire() const {
         ",\"h\":" + high + ",\"l\":" + low + ",\"c\":" + close + ",\"v\":" + volume + "}}";
 }
 bool Bar::operator==(const Bar& other) const {
-    return ts == other.ts && open == other.open && high == other.high && low == other.low && close == other.close && volume == other.volume;
+    return ts == other.ts && Decimal(open) == Decimal(other.open) && Decimal(high) == Decimal(other.high) &&
+        Decimal(low) == Decimal(other.low) && Decimal(close) == Decimal(other.close) && Decimal(volume) == Decimal(other.volume);
 }
 void Aggregate::add(const Trade& trade) {
     trade.validate();

@@ -37,6 +37,9 @@ public:
     bool zero() const { return coefficient_ == "0"; }
     int compare(const Decimal& other) const;
     Decimal add(const Decimal& other) const;
+    Decimal multiply(const Decimal& other) const;
+    // Canonical fixed-point token: no sign, no exponent, no trailing fractional zeros.
+    std::string str() const;
     bool operator==(const Decimal& other) const { return compare(other) == 0; }
 };
 
@@ -71,6 +74,10 @@ struct Aggregate {
     void add(const Trade& trade);
     void reconcile(const Kline& kline, bool require_ids) const;
 };
+// Contract-to-base conversion for a venue quantity token; the token is kept verbatim when the multiplier is 1.
+std::string scaled_quantity(const std::string& token, const std::string& multiplier);
+// The JSON text of one top-level member, found by an exact scan; for documents above the parser bound.
+std::string json_member(const std::string& document, const std::string& name);
 Trade normalized_trade(const Json& event);
 Bar normalized_bar(const Json& event);
 
@@ -78,6 +85,7 @@ struct Config {
     std::string venue = "binance", market = "spot", symbol, mode = "bars", state_dir;
     std::string rest_url = "https://api.binance.com";
     std::string ws_url = "wss://stream.binance.com:443";
+    std::string qty_multiplier = "1";
     std::int64_t start = -1, end = -1;
     bool resume = false, allow_insecure = false;
     std::uint64_t output_from = 0, max_messages = 0;
@@ -85,5 +93,8 @@ struct Config {
     std::uint64_t max_replay_seconds = 60;
     std::size_t max_queue_bytes = 16 * 1024 * 1024;
     std::uint64_t reconnect_seconds = 23 * 3600 + 55 * 60;
+    std::uint64_t keepalive_seconds = 20;
 };
+// Raw ticks and USD-M aggregate prints share the tick/time journal grammar.
+inline bool tick_mode(const std::string& mode) { return mode == "ticks" || mode == "agg-ticks"; }
 }

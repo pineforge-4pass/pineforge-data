@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Synthetic public Binance shapes; standard-library HTTP/WS fault injection."""
+"""Synthetic public Binance, Binance USD-M, OKX and Bybit shapes; standard-library HTTP/WS fault
+injection."""
 
 import base64
 import copy
@@ -90,6 +91,114 @@ def retirement():
     return {"stream": "!serverShutdown", "data": {"e": "serverShutdown", "E": 180000}}
 
 
+# USD-M aggregate prints: id -> (matched time, price, q, nq, first raw id, last raw id). `q` counts
+# every execution and reconciles with the kline volume; `nq` excludes RPI executions. Raw ranges are
+# not contiguous across aggregates (1005 is absent) and are never expanded.
+AGGREGATES = {
+    499: (119999, "10.10000000", "0.10000000", "0.10000000", 998, 999),
+    500: (120001, "10.10000000", "0.10000000", "0.05000000", 1000, 1004),
+    501: (120050, "11.20000000", "0.20000000", "0.20000000", 1006, 1006),
+    502: (179999, "9.90000000", "0.30000000", "0.30000000", 1007, 1009),
+    503: (180001, "12.00000000", "0.40000000", "0.40000000", 1010, 1012),
+    504: (180050, "11.00000000", "0.10000000", "0.10000000", 1013, 1013),
+    505: (240001, "12.00000000", "0.10000000", "0.10000000", 1014, 1014),
+}
+
+
+def aggregate(identifier, **changes):
+    matched, price, quantity, net, first, last = AGGREGATES[identifier]
+    data = {
+        "e": "aggTrade",
+        "E": matched + 1,
+        "a": identifier,
+        "s": "TESTUSDT",
+        "p": price,
+        "q": quantity,
+        "nq": net,
+        "f": first,
+        "l": last,
+        "T": matched,
+        "m": True,
+        "st": 1,
+    }
+    data.update(changes)
+    return {"stream": "testusdt@aggTrade", "data": data}
+
+
+# OKX trades-all prints in contracts (ctVal 0.01): id -> (ts, px, sz). Candle volumes are contracts.
+OKX_TRADES = {
+    99: (119999, "10.1", "10"),
+    100: (120001, "10.1", "10"),
+    101: (120050, "11.2", "20"),
+    102: (179999, "9.9", "30"),
+    103: (180001, "12", "40"),
+    104: (180050, "11", "10"),
+    105: (240001, "12", "10"),
+}
+OKX_CANDLES = {
+    120000: ("10.1", "11.2", "9.9", "9.9", "60"),
+    180000: ("12", "12", "11", "11", "50"),
+    240000: ("12", "12", "12", "12", "10"),
+}
+OKX_SWAP = "TEST-USDT-SWAP"
+
+
+def okx_trades(*identifiers, channel="trades-all", **changes):
+    rows = []
+    for identifier in identifiers:
+        matched, price, size = OKX_TRADES[identifier]
+        row = {
+            "instId": OKX_SWAP,
+            "tradeId": str(identifier),
+            "px": price,
+            "sz": size,
+            "side": "buy",
+            "ts": str(matched),
+            "source": "0",
+        }
+        row.update(changes)
+        rows.append(row)
+    return {"arg": {"channel": channel, "instId": OKX_SWAP}, "data": rows}
+
+
+def okx_candle(minute, confirm="1", candles=None):
+    opening, high, low, close, volume = (candles or OKX_CANDLES)[minute]
+    row = [str(minute), opening, high, low, close, volume, "0", "0", confirm]
+    return {"arg": {"channel": "candle1m", "instId": OKX_SWAP}, "data": [row]}
+
+
+# Bybit linear bars: base quantities already.
+BYBIT_BARS = {
+    120000: ("10.1", "11.2", "9.9", "9.9", "0.6"),
+    180000: ("12", "12", "11", "11", "0.5"),
+    240000: ("12", "12", "12", "12", "0.1"),
+    300000: ("12", "12.5", "12", "12.5", "0.2"),
+}
+
+
+def bybit_row(minute, confirm, **changes):
+    opening, high, low, close, volume = BYBIT_BARS[minute]
+    row = {
+        "start": minute,
+        "end": minute + 59999,
+        "interval": "1",
+        "open": opening,
+        "close": close,
+        "high": high,
+        "low": low,
+        "volume": volume,
+        "turnover": "0",
+        "confirm": confirm,
+        "timestamp": minute + 30000,
+    }
+    row.update(changes)
+    return row
+
+
+def bybit_push(*rows):
+    return {"topic": "kline.1.TESTUSDT", "data": list(rows), "ts": 1, "type": "snapshot"}
+
+
 def frame(connection, payload, opcode=1, final=True):
     if isinstance(payload, dict):
         payload = json.dumps(payload, separators=(",", ":")).encode()
@@ -119,7 +228,7 @@ def receive(connection):
     size = second & 127
     if size == 126:
         size = struct.unpack("!H", exact(2))[0]
-    if size == 127:
+    elif size == 127:
         size = struct.unpack("!Q", exact(8))[0]
     if not second & 128:
         raise AssertionError("client frames must be masked")
@@ -132,9 +241,34 @@ class MockServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     block_on_close = False
 
-    def __init__(self, scripts):
+    def __init__(self, scripts, venue="binance"):
         super().__init__(("127.0.0.1", 0), Handler)
+        self.venue = venue
         self.scripts = scripts
+        self.aggregates = copy.deepcopy(AGGREGATES)
+        self.okx_trades = copy.deepcopy(OKX_TRADES)
+        self.okx_candles = copy.deepcopy(OKX_CANDLES)
+        self.okx_unconfirmed = set()
+        self.instrument = {
+            "instId": OKX_SWAP,
+            "instType": "SWAP",
+            "state": "live",
+            "ctType": "linear",
+            "ctValCcy": "TEST",
+            "ctVal": "0.01",
+            "ctMult": "1",
+        }
+        self.bybit_bars = copy.deepcopy(BYBIT_BARS)
+        self.bybit_ascending = False
+        self.agg_window_error = False
+        self.queries = []
+        self.subscriptions = []
+        self.ws_paths = []
+        self.exchange_info_bytes = 0
+        self.pings = []
+        self.okx_time_lookup_skip = 0
+        self.refuse_once = None
+        self.usdm_unknown_symbol = False
         self.connections = 0
         self.trades = copy.deepcopy(TRADES)
         self.bars = copy.deepcopy(BARS)
@@ -168,12 +302,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(parsed.query)
         with self.server.lock:
             self.server.requests.append(parsed.path)
+            self.server.queries.append((parsed.path, query))
             self.server.request_times.append((parsed.path, time.monotonic()))
             self.server.auth_headers.extend(
-                name for name in ("Authorization", "X-MBX-APIKEY") if self.headers.get(name)
+                name
+                for name in ("Authorization", "X-MBX-APIKEY", "OK-ACCESS-KEY", "X-BAPI-API-KEY")
+                if self.headers.get(name)
             )
-        if parsed.path == "/stream":
-            self.websocket(query)
+        if self.headers.get("Upgrade", "").lower() == "websocket":
+            self.websocket(parsed.path, query)
             return
         with self.server.lock:
             if self.server.fail_status:
@@ -182,6 +319,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if self.server.rate_once:
                 self.server.rate_once = False
                 self.respond(429, {}, retry=True)
+                return
+            if self.server.refuse_once:
+                status, value = self.server.refuse_once
+                self.server.refuse_once = None
+                self.respond(status, value)
+                return
+            if self.server.venue != "binance":
+                status, rows = getattr(self, "rest_" + self.server.venue)(parsed.path, query)
+                self.respond(status, rows)
                 return
             if parsed.path == "/api/v3/exchangeInfo":
                 rows = {
@@ -276,6 +422,151 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
         self.respond(200, rows)
 
+    def rest_usdm(self, path, query):
+        server = self.server
+        if path == "/fapi/v1/exchangeInfo":
+            # The real document lists every contract and exceeds the 1 MiB parser bound.
+            document = {
+                "timezone": "UTC",
+                "assets": [
+                    {"asset": "PAD" + str(index), "note": "x" * 96} for index in range(12000)
+                ],
+                "rateLimits": [
+                    {
+                        "rateLimitType": "REQUEST_WEIGHT",
+                        "interval": "MINUTE",
+                        "intervalNum": 1,
+                        "limit": 2400,
+                    }
+                ],
+                "symbols": [{"symbol": "TESTUSDT", "contractType": "PERPETUAL"}],
+            }
+            server.exchange_info_bytes = len(json.dumps(document, separators=(",", ":")))
+            return 200, document
+        if path == "/fapi/v1/aggTrades":
+            if "fromId" in query:
+                start = int(query["fromId"][0])
+                if server.agg_window_error and start > 499:
+                    return 400, {
+                        "code": -4166,
+                        "msg": "Search window is restricted to recent 2 days only.",
+                    }
+                identifiers = [key for key in sorted(server.aggregates) if key >= start]
+            else:
+                begin, end = int(query["startTime"][0]), int(query["endTime"][0])
+                identifiers = [
+                    key
+                    for key in sorted(server.aggregates)
+                    if begin <= server.aggregates[key][0] <= end
+                ]
+            rows = []
+            for identifier in identifiers[: int(query["limit"][0])]:
+                matched, price, quantity, net, first, last = server.aggregates[identifier]
+                rows.append(
+                    {
+                        "a": identifier,
+                        "p": price,
+                        "q": quantity,
+                        "nq": net,
+                        "f": first,
+                        "l": last,
+                        "T": matched,
+                        "m": True,
+                    }
+                )
+            return 200, rows
+        if path == "/fapi/v1/klines":
+            if server.usdm_unknown_symbol:
+                return 400, {"code": -1121, "msg": "Invalid symbol."}
+            if "startTime" not in query:
+                return 200, []
+            start, end = int(query["startTime"][0]), int(query["endTime"][0])
+            rows = []
+            for minute in sorted(server.bars):
+                if start <= minute <= end:
+                    opening, high, low, close, volume, _first, _last, count = server.bars[minute]
+                    rows.append(
+                        [
+                            minute,
+                            opening,
+                            high,
+                            low,
+                            close,
+                            volume,
+                            minute + 59999,
+                            "0",
+                            count,
+                            "0",
+                            "0",
+                            "0",
+                        ]
+                    )
+            return 200, rows[: int(query["limit"][0])]
+        return 404, {}
+
+    def rest_okx(self, path, query):
+        server = self.server
+        if path == "/api/v5/public/instruments":
+            match = query["instId"][0] == server.instrument["instId"]
+            return 200, {"code": "0", "msg": "", "data": [server.instrument] if match else []}
+        if path == "/api/v5/market/history-trades":
+            limit = int(query["limit"][0])
+            if query.get("type") == ["2"]:
+                before_time = int(query["after"][0])
+                keys = [
+                    key
+                    for key in sorted(server.okx_trades)
+                    if server.okx_trades[key][0] < before_time
+                ]
+                # The time lookup can answer an older print first (lag, or one millisecond's order).
+                keys = keys[: len(keys) - server.okx_time_lookup_skip]
+            else:
+                upper = int(query["after"][0])
+                lower = int(query["before"][0])
+                keys = [key for key in sorted(server.okx_trades) if lower < key < upper]
+            rows = []
+            for identifier in sorted(keys, reverse=True)[:limit]:
+                matched, price, size = server.okx_trades[identifier]
+                rows.append(
+                    {
+                        "instId": OKX_SWAP,
+                        "side": "buy",
+                        "sz": size,
+                        "px": price,
+                        "source": "0",
+                        "tradeId": str(identifier),
+                        "ts": str(matched),
+                    }
+                )
+            return 200, {"code": "0", "msg": "", "data": rows}
+        if path == "/api/v5/market/history-candles":
+            upper, lower = int(query["after"][0]), int(query["before"][0])
+            rows = []
+            for minute in sorted(server.okx_candles, reverse=True):
+                if lower < minute < upper:
+                    opening, high, low, close, volume = server.okx_candles[minute]
+                    confirm = "0" if minute in server.okx_unconfirmed else "1"
+                    rows.append([str(minute), opening, high, low, close, volume, "0", "0", confirm])
+            return 200, {"code": "0", "msg": "", "data": rows[: int(query["limit"][0])]}
+        return 404, {}
+
+    def rest_bybit(self, path, query):
+        server = self.server
+        if path == "/v5/market/instruments-info":
+            row = {"symbol": "TESTUSDT", "contractType": "LinearPerpetual", "status": "Trading"}
+            return 200, {"retCode": 0, "retMsg": "OK", "result": {"list": [row]}}
+        if path == "/v5/market/kline":
+            start, end, limit = (int(query[key][0]) for key in ("start", "end", "limit"))
+            # Rows newest first; a range wider than the limit keeps only its newest rows.
+            minutes = [minute for minute in sorted(server.bybit_bars) if start <= minute <= end]
+            minutes = sorted(minutes, reverse=True)[:limit]
+            if server.bybit_ascending:
+                minutes.reverse()
+            rows = [[str(minute), *server.bybit_bars[minute]] for minute in minutes]
+            rows = [[*row, "0"] for row in rows]
+            return 200, {"retCode": 0, "retMsg": "OK", "result": {"list": rows}}
+        return 404, {}
+
     def respond(self, status, value, retry=False):
         payload = json.dumps(value, separators=(",", ":")).encode()
         self.send_response(status)
@@ -289,10 +580,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(payload)
         self.close_connection = True
 
-    def websocket(self, query):
-        assert query["streams"] in (["testusdt@trade/testusdt@kline_1m"], ["testusdt@kline_1m"])
+    def websocket(self, path, query):
         with self.server.lock:
-            self.server.streams.append(query["streams"][0])
+            self.server.ws_paths.append(self.path)
+        if self.server.venue == "binance":
+            assert path == "/stream"
+            assert query["streams"] in (["testusdt@trade/testusdt@kline_1m"], ["testusdt@kline_1m"])
+        elif self.server.venue == "usdm":
+            # Only the routed /market endpoint serves aggTrade and kline; an unrouted connection
+            # gets legacy raw prints only.
+            assert path in ("/market/stream", "/stream")
+            assert query["streams"] in (
+                ["testusdt@aggTrade/testusdt@kline_1m"],
+                ["testusdt@kline_1m"],
+            )
+        elif self.server.venue == "okx":
+            assert path == "/ws/v5/business"
+        else:
+            assert path == "/v5/public/linear"
+        if "streams" in query:
+            with self.server.lock:
+                self.server.streams.append(query["streams"][0])
         key = self.headers["Sec-WebSocket-Key"]
         accept = base64.b64encode(
             hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
@@ -306,6 +614,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             connection_index = self.server.connections
             self.server.connections += 1
             script = self.server.scripts[min(connection_index, len(self.server.scripts) - 1)]
+        if self.server.venue == "usdm" and path == "/stream":
+            script = [trade(100)]
+        if self.server.venue in ("okx", "bybit"):
+            self.subscribed(script)
+            return
         self.connection.settimeout(3)
         for action in script:
             if isinstance(action, dict):
@@ -336,6 +649,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     row = list(self.server.bars[action[1]])
                     row[4] = "0.70000000"
                     self.server.bars[action[1]] = tuple(row)
+            elif action[0] == "lag_rest":
+                # The REST row trails the WebSocket close, then catches up.
+                with self.server.lock:
+                    original = self.server.bars[action[1]]
+                    self.server.bars[action[1]] = (*original[:4], "0.70000000", *original[5:])
+
+                def restore(minute=action[1], row=original):
+                    with self.server.lock:
+                        self.server.bars[minute] = row
+
+                threading.Timer(action[2], restore).start()
             elif action[0] == "close":
                 frame(self.connection, b"", opcode=8)
                 self.close_connection = True
@@ -350,12 +674,109 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 break
         self.close_connection = True
 
+    def subscribed(self, script):
+        """OKX/Bybit: the client subscribes by message and keeps the socket alive with text pings,
+        which a reader thread answers while the script runs."""
+        lock = threading.Lock()
+        okx = self.server.venue == "okx"
+
+        def send(payload, opcode=1):
+            with lock:
+                frame(self.connection, payload, opcode)
+
+        self.connection.settimeout(3)
+        opcode, payload = receive(self.connection)
+        request = json.loads(payload)
+        assert opcode == 1 and request["op"] == "subscribe"
+        with self.server.lock:
+            self.server.subscriptions.append(request)
+        for argument in request["args"]:
+            if okx:
+                send({"event": "subscribe", "arg": argument, "connId": "mock"})
+            else:
+                send(
+                    {
+                        "success": True,
+                        "ret_msg": "",
+                        "conn_id": "mock",
+                        "req_id": "",
+                        "op": "subscribe",
+                    }
+                )
+        closed = threading.Event()
+
+        def read():
+            self.connection.settimeout(0.1)
+            while not closed.is_set():
+                try:
+                    opcode, payload = receive(self.connection)
+                except TimeoutError:
+                    continue
+                except (EOFError, ConnectionResetError, OSError):
+                    break
+                if opcode == 8:
+                    break
+                text = payload.decode()
+                with self.server.lock:
+                    self.server.pings.append(text)
+                if okx and text == "ping":
+                    send("pong")
+                elif not okx and json.loads(text) == {"op": "ping"}:
+                    send({"success": True, "ret_msg": "pong", "conn_id": "mock", "op": "ping"})
+            closed.set()
+
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
+        for action in script:
+            if isinstance(action, dict):
+                send(action)
+            elif action[0] == "pause":
+                time.sleep(action[1])
+            elif action[0] == "raw":
+                send(action[1])
+            elif action[0] == "add_okx_trade":
+                with self.server.lock:
+                    self.server.okx_trades[action[1]] = action[2]
+            elif action[0] == "set_instrument":
+                with self.server.lock:
+                    self.server.instrument = dict(self.server.instrument, **action[1])
+            elif action[0] == "okx_unconfirm":
+                # REST trails the WebSocket confirm of this minute for a moment.
+                with self.server.lock:
+                    self.server.okx_unconfirmed.add(action[1])
+                threading.Timer(
+                    action[2], self.server.okx_unconfirmed.discard, (action[1],)
+                ).start()
+            elif action[0] == "revise_okx_trade":
+                with self.server.lock:
+                    matched, price, _size = self.server.okx_trades[action[1]]
+                    self.server.okx_trades[action[1]] = (matched, price, "11")
+            elif action[0] == "close":
+                send(b"", opcode=8)
+                closed.set()
+                break
+        reader.join(timeout=15)
+        closed.set()
+        self.close_connection = True
+
+
+VENUES = {
+    "binance": ("binance", "spot", "TESTUSDT"),
+    "usdm": ("binance", "usdm", "TESTUSDT"),
+    "okx": ("okx", "swap", OKX_SWAP),
+    "bybit": ("bybit", "linear", "TESTUSDT"),
+}
+
+
+def sequence(output):
+    return [event["seq"] if event["type"] == "tick" else ("time", event["ts"]) for event in output]
+
 
 class FeedMockTests(unittest.TestCase):
     def test_public_qualification_fails_on_any_action_difference(self):
         for ticks_equal, expected in ((False, 1), (True, 0)):
             soak = Soak.__new__(Soak)
-            soak.options = SimpleNamespace(bar_minutes=21, tick_minutes=21)
+            soak.options = SimpleNamespace(bar_minutes=21, tick_minutes=21, modes="bars,ticks")
             soak.directory = self.directory / str(ticks_equal)
             soak.directory.mkdir()
             soak.results = {}
@@ -368,34 +789,35 @@ class FeedMockTests(unittest.TestCase):
 
     def test_r_b2_maps_only_tick_action_timestamps(self):
         record = {
-            "timestamp": 1791037920021,
+            "timestamp": 120021,
             "bar_index": 7,
             "order": {
                 "id": "long",
                 "action": "entry",
                 "leg": "long",
                 "contracts": 1.0,
-                "price": 84816.0,
+                "price": 10.1,
                 "reduce_only": False,
                 "entry_incarnation": 1,
             },
         }
-        batch = dict(record, timestamp=1791037920000)
+        batch = dict(record, timestamp=120000)
         self.assertEqual(action_key(record, "ticks"), action_key(batch, "ticks"))
+        self.assertEqual(action_key(record, "agg-ticks"), action_key(batch, "agg-ticks"))
         self.assertNotEqual(action_key(record, "bars"), action_key(batch, "bars"))
-        moved = dict(record, order=dict(record["order"], price=84816.5))
+        moved = dict(record, order=dict(record["order"], price=10.15))
         self.assertNotEqual(action_key(moved, "ticks"), action_key(batch, "ticks"))
 
     def test_only_actions_on_proven_bars_are_compared(self):
         record = {
-            "timestamp": 1791051480451,
+            "timestamp": 180451,
             "bar_index": 221,
             "order": {
                 "id": "S",
                 "action": "sell",
                 "leg": "entry",
                 "contracts": 1.0,
-                "price": 84980.0,
+                "price": 11.2,
                 "reduce_only": False,
                 "entry_incarnation": 15,
             },
@@ -410,8 +832,8 @@ class FeedMockTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.directory = pathlib.Path(self.temporary.name)
 
-    def server(self, scripts):
-        server = MockServer(scripts)
+    def server(self, scripts, venue="binance"):
+        server = MockServer(scripts, venue)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         self.addCleanup(server.server_close)
@@ -420,15 +842,16 @@ class FeedMockTests(unittest.TestCase):
 
     def command(self, server, mode="bars", extra=(), resume=False):
         port = server.server_address[1]
+        venue, market, symbol = VENUES[server.venue]
         arguments = [
             BINARY,
             "run",
             "--venue",
-            "binance",
+            venue,
             "--market",
-            "spot",
+            market,
             "--symbol",
-            "TESTUSDT",
+            symbol,
             "--mode",
             mode,
             "--state-dir",
@@ -541,6 +964,14 @@ class FeedMockTests(unittest.TestCase):
         )
         output, _ = self.run_feed(server, expected=21)
         self.assertEqual(len(output), 1)
+
+    def test_trailing_rest_row_is_reread_before_a_revision_stop(self):
+        server = self.server(
+            [[candle(120000), ("lag_rest", 120000, 0.45), retirement()], [candle(180000)]]
+        )
+        output, result = self.run_feed(server, extra=["--max-messages", "2"])
+        self.assertEqual([event["bar"]["ts_open"] for event in output], [120000, 180000])
+        self.assertIn("rest_overlap_trailing", result.stderr)
 
     def test_planned_24_hour_rotation_uses_overlap(self):
         server = self.server([[candle(120000)], [candle(180000)]])
@@ -857,6 +1288,613 @@ class FeedMockTests(unittest.TestCase):
         journal.write_text(journal.read_text().replace("10.10000000", "10.20000000"))
         output, _ = self.run_feed(server, resume=True, expected=21)
         self.assertEqual(output, [])
+
+    def reset_state(self):
+        import shutil
+
+        shutil.rmtree(self.directory / "state", ignore_errors=True)
+
+    def history_pages(self, server):
+        return [
+            query
+            for path, query in server.queries
+            if path == "/api/v5/market/history-trades" and query.get("type") == ["1"]
+        ]
+
+    def test_okx_swap_bars_confirm_flag_and_contract_units(self):
+        server = self.server([[okx_candle(120000, "0"), okx_candle(180000)]], "okx")
+        output, result = self.run_feed(server, extra=["--max-messages", "2"])
+        self.assertEqual([event["bar"]["ts_open"] for event in output], [120000, 180000])
+        # 60 and 50 contracts of ctVal 0.01: base volumes 0.6 and 0.5; prices stay verbatim.
+        self.assertIn('{"ts_open":120000,"o":10.1,"h":11.2,"l":9.9,"c":9.9,"v":0.6}', result.stdout)
+        self.assertIn('"v":0.5}', result.stdout)
+        self.assertEqual(
+            server.subscriptions,
+            [{"op": "subscribe", "args": [{"channel": "candle1m", "instId": OKX_SWAP}]}],
+        )
+        self.assertEqual(server.ws_paths, ["/ws/v5/business"])
+        saved = json.loads((self.directory / "state" / "cursor.json").read_text())["cursor"]
+        self.assertEqual(saved["qty_multiplier"], "0.01")
+
+    def test_okx_start_predecessor_is_proven_by_the_next_print(self):
+        server = self.server([[okx_trades(100), okx_trades(101)]], "okx")
+        server.okx_trades[98] = (119998, "10.1", "10")
+        server.okx_time_lookup_skip = 1
+        output, _ = self.run_feed(server, "ticks", ["--max-messages", "2"])
+        self.assertEqual(sequence(output), [100, 101])
+        saved = json.loads((self.directory / "state" / "cursor.json").read_text())["cursor"]
+        self.assertEqual(saved["predecessor"]["seq"], 99)
+        # No print at or after the start is in REST yet: nothing is anchored and the stop is 20.
+        self.reset_state()
+        server = self.server([[okx_trades(100)]], "okx")
+        for identifier in range(100, 106):
+            del server.okx_trades[identifier]
+        output, result = self.run_feed(server, "ticks", expected=20)
+        self.assertEqual(output, [])
+        self.assertIn("not yet available", result.stderr)
+        saved = json.loads((self.directory / "state" / "cursor.json").read_text())["cursor"]
+        self.assertIsNone(saved["predecessor"])
+
+    def test_okx_busy_and_rate_limit_codes_are_retried(self):
+        for status, code, event in (
+            (400, "50004", "rest_transient_retry"),
+            (200, "50011", "rest_rate_limited"),
+        ):
+            with self.subTest(code=code):
+                self.reset_state()
+                server = self.server([[okx_candle(120000)]], "okx")
+                server.refuse_once = (status, {"code": code, "msg": "synthetic", "data": []})
+                output, result = self.run_feed(server, extra=["--max-messages", "1"])
+                self.assertEqual(len(output), 1)
+                self.assertIn(event, result.stderr)
+
+    def test_bybit_rate_limit_and_server_error_codes_are_retried(self):
+        for code, event in ((10006, "rest_rate_limited"), (10016, "rest_transient_retry")):
+            with self.subTest(code=code):
+                self.reset_state()
+                server = self.server([[bybit_push(bybit_row(120000, True))]], "bybit")
+                server.refuse_once = (200, {"retCode": code, "retMsg": "synthetic", "result": {}})
+                output, result = self.run_feed(server, extra=["--max-messages", "1"])
+                self.assertEqual(len(output), 1)
+                self.assertIn(event, result.stderr)
+
+    def test_usdm_unknown_symbol_is_refused_at_startup(self):
+        server = self.server([[candle(120000)]], "usdm")
+        server.usdm_unknown_symbol = True
+        output, result = self.run_feed(server, expected=23)
+        self.assertEqual(output, [])
+        self.assertIn("unknown USD-M symbol", result.stderr)
+        self.assertEqual(server.connections, 0)
+
+    def test_usdm_quiet_start_minute_closes_on_the_fence(self):
+        rows = {
+            500: {"T": 180001, "p": "12.00000000", "q": "0.40000000", "f": 1010, "l": 1012},
+            501: {"T": 180050, "p": "11.00000000", "q": "0.10000000", "f": 1013, "l": 1013},
+            502: {"T": 240001, "p": "12.00000000", "q": "0.10000000", "f": 1014, "l": 1014},
+        }
+        server = self.server(
+            [
+                [
+                    candle(120000, v="0.00000000", n=0, f=-1, L=-1),
+                    aggregate(500, nq=rows[500]["q"], **rows[500]),
+                    aggregate(501, nq=rows[501]["q"], **rows[501]),
+                    candle(180000),
+                    aggregate(502, nq=rows[502]["q"], **rows[502]),
+                ]
+            ],
+            "usdm",
+        )
+        server.aggregates = {499: AGGREGATES[499]}
+        for identifier, row in rows.items():
+            server.aggregates[identifier] = (
+                row["T"],
+                row["p"],
+                row["q"],
+                row["q"],
+                row["f"],
+                row["l"],
+            )
+        output, _ = self.run_feed(server, "agg-ticks", ["--max-messages", "5"])
+        self.assertEqual(sequence(output), [("time", 180000), 500, 501, ("time", 240000), 502])
+
+    def test_websocket_closed_before_any_frame_spends_the_reconnect_budget(self):
+        server = self.server([[("close",)]])
+        result = subprocess.run(self.command(server), capture_output=True, text=True, timeout=40)
+        self.assertEqual(result.returncode, 20, result.stderr)
+        self.assertIn("reconnect attempts exhausted", result.stderr)
+        self.assertGreaterEqual(server.connections, 8)
+
+    def test_usdm_forming_kline_never_closes_a_fenced_minute(self):
+        forming = candle(120000, confirmed=False)
+        server = self.server(
+            [
+                [
+                    aggregate(500),
+                    aggregate(501),
+                    aggregate(502),
+                    forming,
+                    aggregate(503),
+                    ("pause", 0.3),
+                    ("raw", "{"),
+                ]
+            ],
+            "usdm",
+        )
+        output, _ = self.run_feed(server, "agg-ticks", expected=23)
+        self.assertEqual(sequence(output), [500, 501, 502])
+
+    def test_usdm_conflicting_duplicate_aggregate_stops_21(self):
+        for script, emitted in (
+            ([aggregate(500), aggregate(500, q="0.20000000")], [500]),
+            (
+                [
+                    aggregate(500),
+                    aggregate(501),
+                    aggregate(502),
+                    aggregate(503),
+                    aggregate(503, p="12.10000000"),
+                ],
+                [500, 501, 502],
+            ),
+        ):
+            with self.subTest(emitted=emitted):
+                self.reset_state()
+                server = self.server([script], "usdm")
+                output, result = self.run_feed(server, "agg-ticks", expected=21)
+                self.assertEqual(sequence(output), emitted)
+                self.assertIn("duplicate print conflicts", result.stderr)
+
+    def test_usdm_reconnect_changed_kline_overlap_stops_21(self):
+        server = self.server(
+            [
+                [
+                    aggregate(500),
+                    aggregate(501),
+                    aggregate(502),
+                    candle(120000),
+                    aggregate(503),
+                    ("revise_rest", 120000),
+                    retirement(),
+                ],
+                [aggregate(504)],
+            ],
+            "usdm",
+        )
+        output, result = self.run_feed(server, "agg-ticks", expected=21)
+        self.assertEqual(sequence(output), [500, 501, 502, ("time", 180000), 503])
+        self.assertIn("reconnect already-closed candle changed", result.stderr)
+
+    def test_okx_rest_page_with_a_nonunit_id_stops_20(self):
+        # The hole sits inside a heal page, past the 100 IDs the start predecessor's proof reads.
+        server = self.server([[]], "okx")
+        server.okx_trades = {99: OKX_TRADES[99]}
+        for identifier in range(100, 261):
+            server.okx_trades[identifier] = (120001 + (identifier - 100) * 100, "10", "1")
+        del server.okx_trades[230]
+
+        def push(identifier):
+            matched, price, size = server.okx_trades[identifier]
+            row = {
+                "instId": OKX_SWAP,
+                "tradeId": str(identifier),
+                "px": price,
+                "sz": size,
+                "side": "buy",
+                "ts": str(matched),
+                "source": "0",
+            }
+            return {"arg": {"channel": "trades-all", "instId": OKX_SWAP}, "data": [row]}
+
+        server.scripts = [[push(100), push(260)]]
+        output, result = self.run_feed(server, "ticks", expected=20)
+        self.assertEqual(sequence(output), [100])
+        self.assertIn("trade-id page has a missing or nonunit venue trade ID", result.stderr)
+
+    def test_usdm_rest_page_with_a_nonunit_id_stops_20(self):
+        server = self.server([[aggregate(500), aggregate(504)]], "usdm")
+        del server.aggregates[502]
+        output, result = self.run_feed(server, "agg-ticks", expected=20)
+        self.assertEqual(sequence(output), [500])
+        self.assertIn("aggregate-history page has a missing or nonunit aggregate ID", result.stderr)
+
+    def test_okx_quiet_start_waits_for_the_first_print(self):
+        quiet = {minute: ("10.1", "10.1", "10.1", "10.1", "0") for minute in (120000, 180000)}
+        quiet[240000] = ("12", "12", "12", "12", "10")
+        server = self.server(
+            [
+                [
+                    okx_candle(120000, candles=quiet),
+                    okx_candle(180000, candles=quiet),
+                    # Longer than the venue's 1.5 s predecessor wait: a blind anchor would stop 20.
+                    ("pause", 3.0),
+                    ("add_okx_trade", 100, (240001, "12", "10")),
+                    ("add_okx_trade", 101, (300001, "12", "10")),
+                    okx_trades(100, ts="240001", px="12", sz="10"),
+                    okx_candle(240000, candles=quiet),
+                    okx_trades(101, ts="300001", px="12", sz="10"),
+                ]
+            ],
+            "okx",
+        )
+        server.okx_trades = {99: OKX_TRADES[99]}
+        server.okx_candles = quiet
+        output, result = self.run_feed(server, "ticks", ["--max-messages", "4"])
+        self.assertEqual(
+            sequence(output), [("time", 180000), ("time", 240000), 100, ("time", 300000)]
+        )
+        self.assertNotIn('"code":20', result.stderr)
+
+    def test_bybit_http_403_is_a_retryable_rate_ban(self):
+        server = self.server([[bybit_push(bybit_row(120000, True))]], "bybit")
+        server.fail_status = 403
+        output, result = self.run_feed(server, expected=20)
+        self.assertEqual(output, [])
+        self.assertIn("Bybit IP rate ban", result.stderr)
+        self.assertEqual(server.auth_headers, [])
+
+    def test_okx_changed_contract_multiplier_stops_21_on_reconnect(self):
+        notice = {"event": "notice", "code": "64008", "msg": "upgrade", "connId": "mock"}
+        server = self.server(
+            [
+                # The pause lets the first connection's instrument check and its bar finish first.
+                [okx_candle(120000), ("pause", 1.0), ("set_instrument", {"ctVal": "0.1"}), notice],
+                [okx_candle(180000)],
+            ],
+            "okx",
+        )
+        output, result = self.run_feed(server, expected=21)
+        self.assertEqual([event["bar"]["ts_open"] for event in output], [120000])
+        self.assertIn("contract multiplier changed", result.stderr)
+
+    def test_okx_websocket_and_rest_lexemes_differ_but_overlap_values_match(self):
+        notice = {"event": "notice", "code": "64008", "msg": "upgrade", "connId": "mock"}
+        rendered = {120000: ("10.10", "11.20", "9.90", "9.9", "60.0")}
+        server = self.server(
+            [[okx_candle(120000, candles=rendered), notice], [okx_candle(180000)]], "okx"
+        )
+        output, result = self.run_feed(server, extra=["--max-messages", "2"])
+        self.assertEqual([event["bar"]["ts_open"] for event in output], [120000, 180000])
+        # The WebSocket lexemes are emitted verbatim; the REST overlap compares exact values.
+        self.assertIn('"o":10.10,"h":11.20,"l":9.90,"c":9.9,"v":0.6}', result.stdout)
+        self.assertGreaterEqual(server.connections, 2)
+
+    def test_okx_warmup_rereads_a_rest_row_that_trails_the_websocket_confirm(self):
+        server = self.server([[("okx_unconfirm", 180000, 0.35), okx_candle(180000)]], "okx")
+        port = server.server_address[1]
+        output = self.directory / "warmup.csv"
+        command = [
+            BINARY,
+            "warmup",
+            "--venue",
+            "okx",
+            "--market",
+            "swap",
+            "--symbol",
+            OKX_SWAP,
+            "--start",
+            "120000",
+            "--end",
+            "240000",
+            "--output",
+            str(output),
+            "--rest-url",
+            f"http://127.0.0.1:{port}",
+            "--ws-url",
+            f"ws://127.0.0.1:{port}",
+            "--allow-insecure-http",
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("rest_overlap_trailing", result.stderr)
+        self.assertEqual(len(output.read_text().splitlines()), 3)
+
+    def test_okx_unconfirmed_rest_candle_is_never_a_bar(self):
+        server = self.server([[okx_candle(180000)]], "okx")
+        server.okx_unconfirmed = {120000}
+        output, _ = self.run_feed(server, expected=20)
+        self.assertEqual(output, [])
+
+    def test_okx_ticks_fence_closes_minute_on_exact_candle(self):
+        server = self.server(
+            [
+                [
+                    okx_trades(100, 101, 102),
+                    okx_candle(120000),
+                    okx_trades(103),
+                    okx_candle(180000),
+                    okx_trades(104),
+                    okx_trades(105),
+                ]
+            ],
+            "okx",
+        )
+        output, result = self.run_feed(server, "ticks", ["--max-messages", "8"])
+        self.assertEqual(
+            sequence(output), [100, 101, 102, ("time", 180000), 103, 104, ("time", 240000), 105]
+        )
+        self.assertIn('{"type":"tick","ts":120001,"seq":100,"price":10.1,"qty":0.1}', result.stdout)
+        self.assertEqual(
+            server.subscriptions[0]["args"][1], {"channel": "trades-all", "instId": OKX_SWAP}
+        )
+
+    def test_okx_count_aggregated_push_is_rejected_on_ticks(self):
+        for payload in (okx_trades(100, count="3"), okx_trades(100, channel="trades")):
+            with self.subTest(payload=payload["arg"]["channel"]):
+                self.reset_state()
+                server = self.server([[payload]], "okx")
+                output, result = self.run_feed(server, "ticks", expected=23)
+                self.assertEqual(output, [])
+                self.assertRegex(result.stderr, "aggregated OKX trades")
+
+    def test_okx_text_ping_is_answered_and_never_data(self):
+        server = self.server([[("pause", 2.5), okx_candle(120000)]], "okx")
+        output, _ = self.run_feed(server, extra=["--max-messages", "1", "--keepalive-seconds", "1"])
+        self.assertEqual(len(output), 1)
+        self.assertGreaterEqual(server.pings.count("ping"), 2)
+
+    def test_okx_tick_gap_heals_by_trade_id_pages(self):
+        server = self.server([[]], "okx")
+        server.okx_trades = {99: OKX_TRADES[99]}
+        for offset in range(250):
+            server.okx_trades[100 + offset] = (120001 + offset * 100, "10", "1")
+        server.okx_trades[350] = (180001, "10", "1")
+        server.okx_candles = {120000: ("10", "10", "10", "10", "250")}
+
+        def push(identifier):
+            matched, price, size = server.okx_trades[identifier]
+            row = {
+                "instId": OKX_SWAP,
+                "tradeId": str(identifier),
+                "px": price,
+                "sz": size,
+                "side": "buy",
+                "ts": str(matched),
+                "source": "0",
+            }
+            return {"arg": {"channel": "trades-all", "instId": OKX_SWAP}, "data": [row]}
+
+        server.scripts = [[push(349), okx_candle(120000, candles=server.okx_candles), push(350)]]
+        output, _ = self.run_feed(server, "ticks", ["--max-messages", "251"])
+        self.assertEqual([event["seq"] for event in output[:-1]], list(range(100, 350)))
+        self.assertEqual(output[-1], {"type": "time", "ts": 180000})
+        self.assertGreaterEqual(len(self.history_pages(server)), 3)
+        self.assertTrue(all(page["limit"] == ["100"] for page in self.history_pages(server)))
+
+    def test_okx_inverse_swap_is_refused_before_streaming(self):
+        server = self.server([[okx_candle(120000)]], "okx")
+        server.instrument = dict(server.instrument, ctType="inverse", ctValCcy="USD")
+        output, result = self.run_feed(server, expected=23)
+        self.assertEqual(output, [])
+        self.assertIn("inverse OKX swaps are refused", result.stderr)
+        self.assertEqual(server.connections, 0)
+
+    def test_okx_notice_reconnects_and_changed_overlap_stops_21(self):
+        notice = {"event": "notice", "code": "64008", "msg": "upgrade", "connId": "mock"}
+        server = self.server(
+            [[okx_trades(100, 101), ("revise_okx_trade", 100), notice], [okx_trades(102)]], "okx"
+        )
+        output, result = self.run_feed(server, "ticks", expected=21)
+        self.assertEqual([event["seq"] for event in output], [100, 101])
+        self.assertIn("reconnect print overlap changed", result.stderr)
+        self.assertGreaterEqual(server.connections, 2)
+
+    def test_okx_gap_beyond_three_month_window_stops_20(self):
+        far = 120001 + 90 * 86400000
+        server = self.server([[okx_trades(100), okx_trades(105, ts=str(far))]], "okx")
+        server.okx_trades[105] = (far, "12", "10")
+        output, result = self.run_feed(server, "ticks", expected=20)
+        self.assertEqual([event["seq"] for event in output], [100])
+        self.assertIn("beyond the venue's REST history window", result.stderr)
+        # Only the start predecessor's proof read prints by ID; the gap from 101 was never read.
+        self.assertEqual(
+            [page for page in self.history_pages(server) if int(page["before"][0]) >= 100], []
+        )
+
+    def test_okx_warmup_converts_contract_volume(self):
+        server = self.server([[okx_candle(240000)]], "okx")
+        port = server.server_address[1]
+        output = self.directory / "warmup.csv"
+        command = [
+            BINARY,
+            "warmup",
+            "--venue",
+            "okx",
+            "--market",
+            "swap",
+            "--symbol",
+            OKX_SWAP,
+            "--start",
+            "120000",
+            "--end",
+            "240000",
+            "--output",
+            str(output),
+            "--rest-url",
+            f"http://127.0.0.1:{port}",
+            "--ws-url",
+            f"ws://127.0.0.1:{port}",
+            "--allow-insecure-http",
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            output.read_text().splitlines()[1:],
+            ["120000,10.1,11.2,9.9,9.9,0.6", "180000,12,12,11,11,0.5"],
+        )
+        manifest = json.loads(pathlib.Path(str(output) + ".manifest.json").read_text())
+        self.assertEqual(manifest["qty_multiplier"], "0.01")
+
+    def test_bybit_bars_two_entry_push_and_confirm_flag(self):
+        server = self.server(
+            [
+                [
+                    bybit_push(bybit_row(120000, False, close="10.5", volume="0.3")),
+                    bybit_push(
+                        bybit_row(120000, True),
+                        bybit_row(180000, False, close="11.5", volume="0.05"),
+                    ),
+                    bybit_push(bybit_row(180000, True), bybit_row(240000, False)),
+                ]
+            ],
+            "bybit",
+        )
+        output, _ = self.run_feed(server, extra=["--max-messages", "2"])
+        # The forming rows carry other closes and volumes: only the confirmed rows become bars.
+        self.assertEqual(
+            [event["bar"] for event in output],
+            [
+                {"ts_open": 120000, "o": 10.1, "h": 11.2, "l": 9.9, "c": 9.9, "v": 0.6},
+                {"ts_open": 180000, "o": 12, "h": 12, "l": 11, "c": 11, "v": 0.5},
+            ],
+        )
+        self.assertEqual(server.subscriptions, [{"op": "subscribe", "args": ["kline.1.TESTUSDT"]}])
+        self.assertEqual(server.ws_paths, ["/v5/public/linear"])
+
+    def test_bybit_tick_modes_are_refused_at_startup(self):
+        server = self.server([[]], "bybit")
+        for mode in ("ticks", "agg-ticks"):
+            with self.subTest(mode=mode):
+                output, result = self.run_feed(server, mode, expected=23)
+                self.assertEqual(output, [])
+                self.assertIn("Bybit tick mode is refused", result.stderr)
+                self.assertIn("not a contiguous cursor", result.stderr)
+        self.assertEqual(server.requests, [])
+
+    def test_bybit_reverse_order_rest_paging_heals_hole(self):
+        server = self.server([[bybit_push(bybit_row(300000, True))]], "bybit")
+        output, _ = self.run_feed(server, extra=["--max-messages", "4"])
+        self.assertEqual(
+            [event["bar"]["ts_open"] for event in output], [120000, 180000, 240000, 300000]
+        )
+        windows = [query for path, query in server.queries if path == "/v5/market/kline"]
+        self.assertTrue(windows)
+        for query in windows:
+            start, end, limit = (int(query[key][0]) for key in ("start", "end", "limit"))
+            self.assertEqual((end - start) // 60000 + 1, limit)
+        self.reset_state()
+        server = self.server([[bybit_push(bybit_row(300000, True))]], "bybit")
+        server.bybit_ascending = True
+        output, _ = self.run_feed(server, expected=20)
+        self.assertEqual(output, [])
+
+    def test_bybit_json_ping_keepalive(self):
+        server = self.server([[("pause", 2.5), bybit_push(bybit_row(120000, True))]], "bybit")
+        output, _ = self.run_feed(server, extra=["--max-messages", "1", "--keepalive-seconds", "1"])
+        self.assertEqual(len(output), 1)
+        self.assertGreaterEqual(server.pings.count('{"op":"ping"}'), 2)
+
+    def test_usdm_bars_use_the_routed_market_stream(self):
+        server = self.server([[candle(120000)]], "usdm")
+        output, _ = self.run_feed(server, extra=["--max-messages", "1"])
+        self.assertEqual(len(output), 1)
+        self.assertEqual(server.ws_paths, ["/market/stream?streams=testusdt@kline_1m"])
+        self.assertGreater(server.exchange_info_bytes, 1024 * 1024)
+
+    def test_usdm_raw_trade_event_stops_23(self):
+        server = self.server([[trade(100)]], "usdm")
+        output, result = self.run_feed(server, "agg-ticks", expected=23)
+        self.assertEqual(output, [])
+        self.assertIn("raw USD-M trades are not a supported source", result.stderr)
+
+    def test_usdm_agg_ticks_one_print_per_aggregate_with_q(self):
+        server = self.server(
+            [[aggregate(500), aggregate(501), aggregate(502), candle(120000), aggregate(503)]],
+            "usdm",
+        )
+        output, result = self.run_feed(server, "agg-ticks", ["--max-messages", "5"])
+        self.assertEqual(sequence(output), [500, 501, 502, ("time", 180000), 503])
+        self.assertIn('"seq":500,"price":10.10000000,"qty":0.10000000}', result.stdout)
+        self.assertEqual(
+            server.ws_paths, ["/market/stream?streams=testusdt@aggTrade/testusdt@kline_1m"]
+        )
+
+    def test_usdm_straddling_aggregate_closes_on_the_fence(self):
+        # Aggregate 502 is dated in minute 120000 but one of its fills belongs to the next kline.
+        server = self.server(
+            [
+                [
+                    aggregate(500),
+                    aggregate(501),
+                    aggregate(502),
+                    candle(120000, v="0.59700000"),
+                    aggregate(503),
+                    aggregate(504),
+                    candle(180000, v="0.50300000"),
+                    aggregate(505),
+                ]
+            ],
+            "usdm",
+        )
+        output, _ = self.run_feed(server, "agg-ticks", ["--max-messages", "8"])
+        self.assertEqual(
+            sequence(output), [500, 501, 502, ("time", 180000), 503, 504, ("time", 240000), 505]
+        )
+
+    def test_usdm_agg_gap_heals_by_from_id(self):
+        server = self.server([[aggregate(502), candle(120000), aggregate(503)]], "usdm")
+        output, _ = self.run_feed(server, "agg-ticks", ["--max-messages", "5"])
+        self.assertEqual(sequence(output), [500, 501, 502, ("time", 180000), 503])
+        starts = [
+            int(query["fromId"][0])
+            for path, query in server.queries
+            if path == "/fapi/v1/aggTrades" and "fromId" in query
+        ]
+        self.assertIn(500, starts)
+
+    def test_usdm_agg_gap_beyond_48_hours_stops_20(self):
+        far = 120001 + 49 * 3600000
+        server = self.server([[aggregate(500), aggregate(505, T=far)]], "usdm")
+        server.aggregates[505] = (far, "12.00000000", "0.10000000", "0.10000000", 1014, 1014)
+        output, result = self.run_feed(server, "agg-ticks", expected=20)
+        self.assertEqual([event["seq"] for event in output], [500])
+        self.assertIn("beyond the venue's REST history window", result.stderr)
+        starts = [
+            int(query["fromId"][0])
+            for path, query in server.queries
+            if path == "/fapi/v1/aggTrades" and "fromId" in query
+        ]
+        self.assertNotIn(501, starts)
+
+    def test_usdm_two_day_window_rejection_maps_to_20(self):
+        server = self.server([[aggregate(500), aggregate(503)]], "usdm")
+        server.agg_window_error = True
+        output, result = self.run_feed(server, "agg-ticks", expected=20)
+        self.assertEqual([event["seq"] for event in output], [500])
+        self.assertIn("2-day aggTrades window", result.stderr)
+
+    def test_usdm_raw_tick_mode_is_refused(self):
+        server = self.server([[]], "usdm")
+        output, result = self.run_feed(server, "ticks", expected=23)
+        self.assertEqual(output, [])
+        self.assertIn("use --mode agg-ticks", result.stderr)
+        self.assertEqual(server.requests, [])
+
+    def test_coinbase_is_deferred(self):
+        result = subprocess.run(
+            [
+                BINARY,
+                "run",
+                "--venue",
+                "coinbase",
+                "--market",
+                "spot",
+                "--symbol",
+                "BTCUSD",
+                "--mode",
+                "bars",
+                "--state-dir",
+                str(self.directory / "state"),
+                "--start",
+                "120000",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 23)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("Coinbase is deferred", result.stderr)
+        self.assertFalse((self.directory / "state").exists())
 
     def warmup(self, server):
         port = server.server_address[1]

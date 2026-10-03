@@ -21,6 +21,10 @@ RestPolicy bybit_rest() {
     // 600 requests per 5 seconds per IP; this spends well under a fifth of it.
     policy.milliseconds_per_request = 100;
     policy.throttled = [](const std::string& body) { return body.find("\"retCode\":10006") != std::string::npos; };
+    // Bybit answers HTTP 403 for its roughly ten-minute IP rate ban: a restart after the ban recovers.
+    policy.rejected = [](long status, const std::string&) {
+        if (status == 403) throw Error(20, "Bybit IP rate ban (HTTP 403); restart after the venue's ban window");
+    };
     // Server timeout and server error: the venue asks to retry.
     policy.transient = [](long, const std::string& body) {
         for (const char* code : {"10000", "10016"})

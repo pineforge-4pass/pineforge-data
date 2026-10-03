@@ -234,6 +234,8 @@ std::string HttpClient::body(const std::string& path, unsigned int weight, std::
         next_request_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.allow_insecure ? 0 : pacing);
         if (stopping || code == CURLE_ABORTED_BY_CALLBACK) throw Stopped{};
         if (response.overflow) throw Error(22, "REST response exceeds the bounded buffer");
+        // A venue's own rejection meaning comes first (Bybit's 403 is a rate ban, USD-M's 400 codes).
+        if (code == CURLE_OK && status != 200 && status != 429 && policy_.rejected) policy_.rejected(status, response.body);
         if (status == 401 || status == 403 || status == 418 || status == 451 || (status >= 300 && status < 400))
             throw Error(23, "public market-data access denied or redirected (HTTP " + std::to_string(status) + ")");
         if (status == 429 || (status == 200 && policy_.throttled && policy_.throttled(response.body))) {
@@ -249,7 +251,6 @@ std::string HttpClient::body(const std::string& path, unsigned int weight, std::
             next_request_ = std::chrono::steady_clock::now() + std::chrono::seconds(1U << attempt);
             continue;
         }
-        if (code == CURLE_OK && status != 200 && policy_.rejected) policy_.rejected(status, response.body);
         if (status == 404) throw Error(20, "public history is unavailable");
         if (code != CURLE_OK || status >= 500) {
             next_request_ = std::chrono::steady_clock::now() + std::chrono::seconds(1U << attempt);

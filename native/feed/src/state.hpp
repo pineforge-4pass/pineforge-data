@@ -3,6 +3,7 @@
 #include "core.hpp"
 #include <deque>
 #include <optional>
+#include <vector>
 
 namespace pineforge::feed {
 class Descriptor {
@@ -25,12 +26,17 @@ struct Cursor {
     std::deque<Bar> proofs;
 };
 
+// Messages are staged (verified, cursor advanced in memory), then group-committed: one journal append and
+// fsync, one cursor replacement, and only then returned for publication.
 class State {
     Config config_;
-    Cursor cursor_;
+    Cursor durable_, cursor_;
     Descriptor lock_, journal_;
     std::deque<Trade> recent_trades_;
     std::deque<Bar> recent_bars_;
+    std::vector<std::string> staged_;
+    std::string staged_bytes_;
+    bool unusable_ = false;
     std::string log_path() const;
     Json serialize(const Cursor& cursor) const;
     void persist(const Cursor& cursor) const;
@@ -39,9 +45,12 @@ class State {
 public:
     explicit State(const Config& config);
     const Cursor& cursor() const { return cursor_; }
+    const Cursor& durable() const { return durable_; }
     const Config& config() const { return config_; }
+    std::size_t staged() const { return staged_.size(); }
     void anchor(const Trade& predecessor);
-    void commit(const std::string& line, const std::optional<Bar>& proof = std::nullopt);
+    void stage(const std::string& line, const std::optional<Bar>& proof = std::nullopt);
+    std::vector<std::string> flush();
     void visit(std::uint64_t from, const std::function<void(const std::string&)>& visitor) const;
     std::optional<Trade> trade(std::uint64_t id) const;
     std::optional<Bar> bar(std::int64_t ts) const;

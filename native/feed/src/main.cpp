@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "binance.hpp"
 #include <charconv>
+#include <chrono>
 #include <csignal>
 #include <fcntl.h>
 #include <iostream>
@@ -15,6 +16,11 @@ std::uint64_t unsigned_value(const std::string& token) {
     if (parsed.ec != std::errc{} || parsed.ptr != token.data() + token.size()) throw pineforge::feed::Error(23, "invalid unsigned CLI value");
     return value;
 }
+// stdout's open file description is shared with whoever handed it to us: its flags are restored on exit.
+struct StdoutFlags {
+    int saved = -1;
+    ~StdoutFlags() { if (saved >= 0) ::fcntl(STDOUT_FILENO, F_SETFL, saved); }
+};
 void help() {
     std::cout << "pineforge-feed warmup --venue binance --market spot --symbol SYMBOL --start UTC|MS --end UTC|MS --output FILE\n"
                  "pineforge-feed run --venue binance --market spot --symbol SYMBOL --mode bars|ticks --state-dir DIR [--start UTC|MS | --resume] [--output-from INDEX]\n"
@@ -22,12 +28,13 @@ void help() {
                  "Testing/public origins: --rest-url ORIGIN --ws-url ORIGIN [--allow-insecure-http (loopback only)]\n";
 }
 }
-int main(int argc, char** argv) {
+int run(int argc, char** argv) {
     using namespace pineforge::feed;
+    StdoutFlags restore;
+    std::signal(SIGTERM, &on_signal);
+    std::signal(SIGINT, &on_signal);
+    std::signal(SIGPIPE, SIG_IGN);
     try {
-        const auto error_flags = ::fcntl(STDERR_FILENO, F_GETFL);
-        if (error_flags < 0 || ::fcntl(STDERR_FILENO, F_SETFL, error_flags | O_NONBLOCK) != 0)
-            throw Error(22, "cannot configure bounded diagnostic writes");
         if (argc == 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) { help(); return 0; }
         if (argc == 2 && std::string(argv[1]) == "--version") { check_runtime_curl(); std::cout << "pineforge-feed 0.1.0\n"; return 0; }
         if (argc < 2) throw Error(23, "choose warmup or run; see --help");
@@ -71,9 +78,6 @@ int main(int argc, char** argv) {
         check_runtime_curl();
         validate_origin(config.rest_url, false, config.allow_insecure);
         validate_origin(config.ws_url, true, config.allow_insecure);
-        std::signal(SIGTERM, &on_signal);
-        std::signal(SIGINT, &on_signal);
-        std::signal(SIGPIPE, SIG_IGN);
         if (command == "warmup") {
             if (output.empty() || config.resume || !config.state_dir.empty() || seen.count("--output-from") || seen.count("--mode"))
                 throw Error(23, "warmup requires --output and does not accept run-state options");
@@ -82,7 +86,9 @@ int main(int argc, char** argv) {
             if (config.state_dir.empty() || seen.count("--end") || !output.empty() || (!config.resume && seen.count("--output-from")))
                 throw Error(23, "run requires --state-dir; --output-from requires --resume");
             const auto flags = ::fcntl(STDOUT_FILENO, F_GETFL);
-            if (flags < 0 || ::fcntl(STDOUT_FILENO, F_SETFL, flags | O_NONBLOCK) != 0) throw Error(22, "cannot configure bounded stdout drain");
+            if (flags < 0) throw Error(22, "cannot configure bounded stdout drain");
+            restore.saved = flags;
+            if (::fcntl(STDOUT_FILENO, F_SETFL, flags | O_NONBLOCK) != 0) throw Error(22, "cannot configure bounded stdout drain");
             run_feed(config);
         }
         return 0;
@@ -95,4 +101,10 @@ int main(int argc, char** argv) {
         log("error", "stop", Json::object({{"code", Json::number("23")}, {"reason", Json::string(failure.what())}}));
         return 23;
     }
+}
+
+int main(int argc, char** argv) {
+    const int code = run(argc, argv);
+    pineforge::feed::flush_log(std::chrono::seconds(2));
+    return code;
 }

@@ -6,8 +6,12 @@
 #include <cctype>
 #include <charconv>
 #include <cstring>
+#include <ctime>
+#include <iomanip>
+#include <locale>
 #include <memory>
 #include <poll.h>
+#include <sstream>
 
 #if LIBCURL_VERSION_NUM < 0x080e01
 #error pineforge-feed requires libcurl 8.14.1 or newer
@@ -57,15 +61,15 @@ void pause_until(std::chrono::steady_clock::time_point deadline) {
     }
 }
 struct Response {
-    std::string body;
-    std::uint64_t retry_after = 1;
+    std::string body, retry_after;
     std::uint64_t used_weight = 0;
     bool overflow = false;
 };
 std::size_t body_callback(char* data, std::size_t size, std::size_t count, void* context) noexcept {
     auto* response = static_cast<Response*>(context);
     const auto bytes = size * count;
-    if (bytes > 4 * 1024 * 1024 - response->body.size()) { response->overflow = true; return 0; }
+    // The JSON parser refuses documents above 1 MiB, so a larger body is refused here.
+    if (bytes > 1024 * 1024 - response->body.size()) { response->overflow = true; return 0; }
     try { response->body.append(data, bytes); return bytes; }
     catch (...) { response->overflow = true; return 0; }
 }
@@ -73,20 +77,39 @@ std::size_t header_callback(char* data, std::size_t size, std::size_t count, voi
     const auto bytes = size * count;
     try {
         auto* response = static_cast<Response*>(context);
-        std::string line(data, bytes);
-        std::transform(line.begin(), line.end(), line.begin(), [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+        const std::string line(data, bytes);
         const auto colon = line.find(':');
         if (colon == std::string::npos) return bytes;
+        auto name = line.substr(0, colon);
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
         const auto first = line.find_first_not_of(" \t", colon + 1);
-        if (first == std::string::npos) return bytes;
-        std::uint64_t value = 0;
-        const auto result = std::from_chars(line.data() + first, line.data() + line.size(), value);
-        if (result.ec != std::errc{}) return bytes;
-        if (line.substr(0, colon) == "retry-after") response->retry_after = value;
-        if (line.substr(0, colon) == "x-mbx-used-weight-1m") response->used_weight = value;
+        const auto last = line.find_last_not_of(" \t\r\n");
+        const auto value = first == std::string::npos || last < first ? std::string() : line.substr(first, last - first + 1);
+        if (name == "retry-after") response->retry_after = value;
+        if (name == "x-mbx-used-weight-1m") {
+            std::uint64_t used = 0;
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), used);
+            if (result.ec == std::errc{} && result.ptr == value.data() + value.size()) response->used_weight = used;
+        }
     } catch (...) {}
     return bytes;
 }
+}
+
+void pause_for(std::chrono::milliseconds duration) { pause_until(std::chrono::steady_clock::now() + duration); }
+
+// Retry-After is either delta-seconds or an IMF-fixdate HTTP-date (RFC 9110, section 10.2.3).
+std::uint64_t retry_after_seconds(const std::string& value, std::int64_t now) {
+    std::uint64_t seconds = 0;
+    const auto parsed = std::from_chars(value.data(), value.data() + value.size(), seconds);
+    if (!value.empty() && parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size()) return seconds;
+    std::tm broken{};
+    std::istringstream input(value);
+    input.imbue(std::locale::classic());
+    input >> std::get_time(&broken, "%a, %d %b %Y %H:%M:%S GMT");
+    if (value.size() != 29 || input.fail()) throw Error(23, "invalid Retry-After on a public rate-limit response");
+    const auto when = static_cast<std::int64_t>(timegm(&broken));
+    return when > now ? static_cast<std::uint64_t>(when - now) : 0;
 }
 
 void check_runtime_curl() {
@@ -143,6 +166,7 @@ HttpClient::HttpClient(const Config& config) : config_(config) {
                 interval == "HOUR" ? 3600000ULL : interval == "DAY" ? 86400000ULL : 0ULL;
             if (!unit || !multiple || multiple > 10000 || !ceiling || ceiling > 1000000000)
                 throw Error(23, "unsupported public rate-limit interval or ceiling");
+            // Spend at most half of each published ceiling (about 50% headroom).
             const auto pace = (unit * multiple * 2 + ceiling - 1) / ceiling;
             if (type == "REQUEST_WEIGHT") {
                 weighted = true;
@@ -181,9 +205,11 @@ Json HttpClient::get(const std::string& path, unsigned int weight) {
         if (status == 401 || status == 403 || status == 418 || status == 451 || (status >= 300 && status < 400))
             throw Error(23, "public market-data access denied or redirected (HTTP " + std::to_string(status) + ")");
         if (status == 429) {
-            log("warn", "rest_rate_limited", Json::object({{"retry_after", Json::number(std::to_string(response.retry_after))}}));
-            if (response.retry_after > 86400) throw Error(22, "public Retry-After exceeds the bounded retry window");
-            next_request_ = std::chrono::steady_clock::now() + std::chrono::seconds(response.retry_after);
+            const auto wait = response.retry_after.empty() ? 1 : retry_after_seconds(response.retry_after,
+                std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+            log("warn", "rest_rate_limited", Json::object({{"retry_after", Json::number(std::to_string(wait))}}));
+            if (wait > 86400) throw Error(22, "public Retry-After exceeds the bounded retry window");
+            next_request_ = std::chrono::steady_clock::now() + std::chrono::seconds(wait);
             continue;
         }
         if (status == 404) throw Error(20, "public history is unavailable");
@@ -193,7 +219,8 @@ Json HttpClient::get(const std::string& path, unsigned int weight) {
         }
         if (status != 200) throw Error(23, "public market-data request rejected (HTTP " + std::to_string(status) + ")");
         if (response.used_weight) log("info", "rest_weight", Json::object({{"used_weight_1m", Json::number(std::to_string(response.used_weight))}}));
-        if (weight_limit_ && response.used_weight >= weight_limit_ - weight_limit_ / 10) {
+        // The venue's used-weight header covers every client on this IP: past half the ceiling, wait for the window.
+        if (weight_limit_ && response.used_weight >= weight_limit_ / 2) {
             const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() % 60000;
             next_request_ = std::max(next_request_, std::chrono::steady_clock::now() + std::chrono::milliseconds(60500 - elapsed));
             log("warn", "rest_shared_quota_pause");
@@ -222,6 +249,15 @@ void WebSocketPump::push(SourceMessage message) {
     queue_bytes_ += bytes;
     queue_.push_back(std::move(message));
     ready_.notify_one();
+}
+bool WebSocketPump::try_take(SourceMessage& message) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (failure_) std::rethrow_exception(failure_);
+    if (queue_.empty()) return false;
+    message = std::move(queue_.front());
+    queue_.pop_front();
+    queue_bytes_ -= message.text.size() + 32;
+    return true;
 }
 SourceMessage WebSocketPump::take() {
     std::unique_lock<std::mutex> guard(mutex_);
@@ -262,7 +298,6 @@ void WebSocketPump::run() {
                 continue;
             }
             failures = 0;
-            reconnect_.store(false);
             push({true, {}});
             log("info", "websocket_connected");
             const auto birth = std::chrono::steady_clock::now();
@@ -272,7 +307,7 @@ void WebSocketPump::run() {
             std::uint64_t frame_offset = 0;
             curl_socket_t socket = CURL_SOCKET_BAD;
             curl_easy_getinfo(handle.get(), CURLINFO_ACTIVESOCKET, &socket);
-            while (!stopped() && !reconnect_) {
+            while (!stopped()) {
                 const auto now = std::chrono::steady_clock::now();
                 if (now - birth >= std::chrono::seconds(config_.reconnect_seconds) || now - last_text > std::chrono::seconds(75) ||
                     (assembling && now - message_birth > std::chrono::seconds(30))) break;

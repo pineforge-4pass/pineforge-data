@@ -55,7 +55,7 @@ Kline binance_kline(const Json& value, bool websocket) {
 
 std::string BinanceSpot::streams() const {
     const auto symbol = lower(config_.symbol);
-    return symbol + "@trade/" + symbol + "@kline_1m";
+    return config_.mode == "ticks" ? symbol + "@trade/" + symbol + "@kline_1m" : symbol + "@kline_1m";
 }
 VenueEvent BinanceSpot::decode(const std::string& message) const {
     try {
@@ -63,16 +63,25 @@ VenueEvent BinanceSpot::decode(const std::string& message) const {
         const auto* wrapped = envelope.find("data");
         const auto& data = wrapped ? *wrapped : envelope;
         const auto* event = data.find("e");
-        if (!event) throw Error(23, "unexpected public stream control message");
-        if (event->text() == "serverShutdown") return {};
-        if (data.at("s").text() != config_.symbol) throw Error(23, "public stream symbol changed");
-        if (event->text() == "trade") return {VenueEvent::Kind::Trade, binance_trade(data, true), {}};
-        if (event->text() == "kline") {
+        if (!event || event->kind != Json::Kind::String) throw Error(23, "unexpected public stream control message");
+        const auto type = event->text();
+        const auto stream = wrapped ? envelope.at("stream").text() : std::string();
+        const auto symbol = lower(config_.symbol);
+        const bool trades = stream == symbol + "@trade", klines = stream == symbol + "@kline_1m";
+        // Subscribed data streams and data event types are strict: the documented shape, or stop.
+        if (type == "trade" || type == "kline" || trades || klines) {
+            if (wrapped && !(trades && type == "trade") && !(klines && type == "kline"))
+                throw Error(23, "unsupported public stream event; aggregate prints are not raw trades");
+            if (data.at("s").text() != config_.symbol) throw Error(23, "public stream symbol changed");
+            if (type == "trade") return {VenueEvent::Kind::Trade, binance_trade(data, true), {}};
             const auto& row = data.at("k");
             if (row.at("s").text() != config_.symbol) throw Error(23, "kline symbol changed");
             return {VenueEvent::Kind::Kline, {}, binance_kline(row, true)};
         }
-        throw Error(23, "unsupported public stream event; aggregate prints are not raw trades");
+        if (type == "serverShutdown") return {};
+        // A venue notice outside the data streams carries no market data; a new type must not stop the feed.
+        log("warn", "unknown_stream_event", Json::object({{"stream", Json::string(stream)}, {"type", Json::string(type)}}));
+        return {};
     } catch (const Error&) { throw; }
     catch (const std::exception&) { throw Error(23, "invalid Binance spot message shape"); }
 }
@@ -97,14 +106,19 @@ std::vector<Trade> BinanceSpot::history(std::uint64_t from, std::size_t limit) {
     throw Error(20, "raw history exhausted or unavailable within the venue retention window");
 }
 std::uint64_t BinanceSpot::first_trade_id(std::int64_t minute) {
-    const auto response = http_.get("/api/v3/aggTrades?symbol=" + config_.symbol + "&startTime=" + std::to_string(minute) +
-        "&endTime=" + std::to_string(minute + 59999) + "&limit=1", 4);
-    const auto& rows = array(response, 1);
-    if (rows.empty()) throw Error(20, "initial minute has no available raw-trade start fence");
-    const auto first = rows.front().at("f").integer<std::uint64_t>();
-    const auto matched = rows.front().at("T").integer<std::int64_t>();
-    if (first <= 1 || matched < minute || matched >= minute + 60000) throw Error(20, "initial raw-trade fence is unavailable or ambiguous");
-    return first;
+    // REST may lag the WebSocket print that triggered this lookup: retry like history() before stopping.
+    for (unsigned int attempt = 0; attempt < 3; ++attempt) {
+        if (attempt) pause_for(std::chrono::milliseconds(500 * attempt));
+        const auto response = http_.get("/api/v3/aggTrades?symbol=" + config_.symbol + "&startTime=" + std::to_string(minute) +
+            "&endTime=" + std::to_string(minute + 59999) + "&limit=1", 4);
+        const auto& rows = array(response, 1);
+        if (rows.empty()) continue;
+        const auto first = rows.front().at("f").integer<std::uint64_t>();
+        const auto matched = rows.front().at("T").integer<std::int64_t>();
+        if (first <= 1 || matched < minute || matched >= minute + 60000) throw Error(20, "initial raw-trade fence is unavailable or ambiguous");
+        return first;
+    }
+    throw Error(20, "initial minute has no available raw-trade start fence");
 }
 std::vector<Kline> BinanceSpot::klines(std::int64_t start, std::int64_t end) {
     if (start < 0 || start % 60000 || end <= start || end % 60000) throw Error(23, "invalid exclusive kline range");
@@ -135,12 +149,30 @@ FeedSession::FeedSession(State& state, Venue& venue, std::function<void(const st
 
 void FeedSession::emit(const std::string& line, const std::optional<Bar>& proof) {
     if (stopping) throw Stopped{};
-    state_.commit(line, proof);
-    output_(line);
+    state_.stage(line, proof);
     ++new_messages_;
-    if (state_.config().max_messages && new_messages_ >= state_.config().max_messages) throw Stopped{};
+    if (state_.config().max_messages && new_messages_ >= state_.config().max_messages) {
+        publish();
+        throw Stopped{};
+    }
+    if (state_.staged() >= 4096) publish();
+}
+void FeedSession::publish() {
+    for (const auto& line : state_.flush()) output_(line);
+}
+void FeedSession::salvage() noexcept {
+    try { publish(); }
+    catch (...) {
+        try { log("error", "verified_messages_not_committed"); } catch (...) {}
+    }
+}
+void FeedSession::ingest(const VenueEvent& event) {
+    try { stage(event); }
+    catch (const Error&) { salvage(); throw; }
+    publish();
 }
 void FeedSession::connected() {
+    publish();
     const auto& trades = state_.recent_trades();
     if (!trades.empty()) {
         const auto fetched = venue_.history(trades.front().id, trades.size());
@@ -166,9 +198,7 @@ void FeedSession::connected() {
         for (std::size_t index = 0; index < proofs.size(); ++index) {
             if (!(proofs[index] == fetched[index].bar)) throw Error(21, "reconnect already-emitted bar changed");
             if (state_.config().mode == "ticks") {
-                auto checked = fetched[index];
-                checked.confirmed = true;
-                try { verified.at(checked.bar.ts).reconcile(checked, false); }
+                try { verified.at(fetched[index].bar.ts).reconcile(fetched[index], false); }
                 catch (const std::exception&) { throw Error(21, "reconnect closed-minute count or raw proof changed"); }
             }
         }
@@ -211,7 +241,8 @@ void FeedSession::put(const Trade& trade) {
     pending_.emplace(trade.id, trade);
 }
 void FeedSession::emit_trade(const Trade& trade) {
-    if (trade.id != next_id() || trade.ts < state_.cursor().cut || trade.ts >= state_.cursor().cut + 60000 || trade.ts < state_.cursor().last_tick_ts)
+    if (trade.ts < state_.cursor().last_tick_ts) throw Error(23, "venue matched time regressed along the contiguous raw-trade chain");
+    if (trade.id != next_id() || trade.ts < state_.cursor().cut || trade.ts >= state_.cursor().cut + 60000)
         throw Error(20, "raw trade violates the complete chronological minute prefix");
     const auto buffered = pending_.find(trade.id);
     if (buffered != pending_.end() && !(buffered->second == trade))
@@ -247,30 +278,31 @@ void FeedSession::drain() {
         emit_trade(trade);
     }
 }
+// A minute whose own x=true kline was missed closes only on proof: a later x=true watermark, the contiguous
+// raw-ID chain from the proven predecessor, the first print of a later minute as the fence, and REST n plus
+// exact OHLCV. The REST row has no x=true or f..L, and none is manufactured for it.
 void FeedSession::historical_minute() {
     if (state_.cursor().cut + 60000 > watermark_) throw Error(20, "historical tick closure lacks a confirmed WebSocket watermark");
     if (!state_.cursor().predecessor) anchor(venue_.first_trade_id(state_.cursor().start));
     const auto minute = state_.cursor().cut;
-    bool fenced = false;
-    while (!fenced) {
+    std::optional<Trade> fence;
+    while (!fence) {
         const auto page = venue_.history(next_id());
         for (const auto& trade : page) {
             const auto buffered = pending_.find(trade.id);
             if (buffered != pending_.end() && !(buffered->second == trade)) throw Error(21, "historical raw overlap changed");
             if (trade.ts >= minute + 60000) {
-                if (trade.id != next_id()) throw Error(20, "historical next-minute raw fence is not contiguous");
-                put(trade);
-                fenced = true;
+                fence = trade;
                 break;
             }
             emit_trade(trade);
         }
     }
-    auto kline = venue_.klines(minute, minute + 60000).front();
-    kline.confirmed = true;
-    kline.first = static_cast<std::int64_t>(aggregate_.first);
-    kline.last = static_cast<std::int64_t>(aggregate_.last);
-    aggregate_.reconcile(kline, true);
+    if (!aggregate_.count || fence->id != next_id() || fence->id != aggregate_.last + 1)
+        throw Error(20, "historical minute lacks a contiguous raw prefix and next-minute fence");
+    put(*fence);
+    const auto kline = venue_.klines(minute, minute + 60000).front();
+    aggregate_.reconcile(kline, false);
     log("info", "historical_tick_fence_verified", Json::object({{"minute", Json::number(std::to_string(minute))},
         {"first_id", Json::number(std::to_string(aggregate_.first))}, {"last_id", Json::number(std::to_string(aggregate_.last))}}));
     emit("{\"type\":\"time\",\"ts\":" + std::to_string(minute + 60000) + "}", kline.bar);
@@ -327,7 +359,7 @@ void FeedSession::closed(const Kline& kline) {
     aggregate_ = Aggregate{};
     drain();
 }
-void FeedSession::ingest(const VenueEvent& event) {
+void FeedSession::stage(const VenueEvent& event) {
     if (event.kind == VenueEvent::Kind::Kline) { closed(event.kline); return; }
     if (event.kind != VenueEvent::Kind::Trade || state_.config().mode != "ticks" || event.trade.ts < state_.cursor().start) return;
     if (!state_.cursor().predecessor) anchor(venue_.first_trade_id(state_.cursor().start));
@@ -342,9 +374,16 @@ void run_feed(const Config& config) {
         WebSocketPump pump(config, venue.streams());
         FeedSession session(state, venue, &output_line);
         for (;;) {
-            const auto message = pump.take();
-            if (message.connected) session.connected();
-            else session.ingest(venue.decode(message.text));
+            auto message = pump.take();
+            try {
+                // Group commit: verify every source message already queued (bounded), then persist once.
+                for (std::size_t taken = 1;; ++taken) {
+                    if (message.connected) session.connected();
+                    else session.stage(venue.decode(message.text));
+                    if (taken >= 1024 || !pump.try_take(message)) break;
+                }
+            } catch (const Error&) { session.salvage(); throw; }
+            session.publish();
         }
     } catch (const Stopped&) { log("info", "stopped", state.status()); }
     catch (...) { log("error", "verified_cursor_retained", state.status()); throw; }
@@ -357,22 +396,34 @@ void warmup(const Config& config, const std::string& output) {
     if (std::filesystem::exists(output) || std::filesystem::exists(output + ".manifest.json")) throw Error(23, "warmup output already exists");
     BinanceSpot venue(config);
     std::int64_t watermark = -1;
+    std::map<std::int64_t, Bar> confirmed;
     {
         WebSocketPump pump(config, venue.streams());
         while (watermark < config.end) {
             const auto message = pump.take();
             if (message.connected) continue;
             const auto event = venue.decode(message.text);
-            if (event.kind == VenueEvent::Kind::Kline && event.kline.confirmed) watermark = std::max(watermark, event.kline.bar.ts + 60000);
+            if (event.kind != VenueEvent::Kind::Kline || !event.kline.confirmed) continue;
+            const auto& bar = event.kline.bar;
+            watermark = std::max(watermark, bar.ts + 60000);
+            if (bar.ts < config.start || bar.ts >= config.end) continue;
+            const auto [found, inserted] = confirmed.emplace(bar.ts, bar);
+            if (!inserted && !(found->second == bar)) throw Error(21, "confirmed WebSocket bar was revised during warmup");
         }
     }
     std::string csv = "timestamp,open,high,low,close,volume\n";
     auto next = config.start;
-    std::uint64_t count = 0;
+    std::uint64_t count = 0, cross_checked = 0;
     while (next < config.end) {
         for (const auto& kline : venue.klines(next, config.end)) {
             if (kline.bar.ts != next || next + 60000 > watermark) throw Error(20, "warmup does not adjoin a verified closed-minute cut");
             const auto& bar = kline.bar;
+            // The newest rows come from REST moments after the WS close: the x=true bars in hand must match.
+            const auto observed = confirmed.find(bar.ts);
+            if (observed != confirmed.end()) {
+                if (!(observed->second == bar)) throw Error(21, "warmup REST row differs from the confirmed WebSocket bar");
+                ++cross_checked;
+            }
             csv += std::to_string(bar.ts) + ',' + bar.open + ',' + bar.high + ',' + bar.low + ',' + bar.close + ',' + bar.volume + '\n';
             if (csv.size() > 16 * 1024 * 1024) throw Error(22, "warmup output exceeds 16 MiB");
             next += 60000;
@@ -385,7 +436,8 @@ void warmup(const Config& config, const std::string& output) {
         {"units", Json::object({{"price", Json::string("quote/base")}, {"volume", Json::string("base")}, {"timestamp", Json::string("unix-ms")}})},
         {"start", Json::number(std::to_string(config.start))}, {"end_exclusive", Json::number(std::to_string(config.end))},
         {"cut", Json::number(std::to_string(config.end))}, {"confirmed_ws_watermark", Json::number(std::to_string(watermark))},
-        {"bars", Json::number(std::to_string(count))}, {"sha256", Json::string(sha256(csv))}});
+        {"bars", Json::number(std::to_string(count))}, {"ws_cross_checked_bars", Json::number(std::to_string(cross_checked))},
+        {"sha256", Json::string(sha256(csv))}});
     atomic_file(output, csv);
     atomic_file(output + ".manifest.json", manifest.dump() + '\n');
     log("info", "warmup_verified", manifest);

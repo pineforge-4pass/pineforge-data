@@ -43,6 +43,11 @@ class FeedSession {
 public:
     FeedSession(State& state, Venue& venue, std::function<void(const std::string&)> output);
     void connected();
+    // stage() verifies an event and stages its messages; publish() group-commits them, then writes them
+    // out; salvage() publishes what was already verified before a stop. ingest() is all three for one event.
+    void stage(const VenueEvent& event);
+    void publish();
+    void salvage() noexcept;
     void ingest(const VenueEvent& event);
 };
 void run_feed(const Config& config);

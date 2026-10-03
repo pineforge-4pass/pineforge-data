@@ -6,7 +6,10 @@
 #include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <climits>
+#include <condition_variable>
 #include <ctime>
+#include <deque>
 #include <fcntl.h>
 #include <filesystem>
 #include <iomanip>
@@ -14,28 +17,79 @@
 #include <mutex>
 #include <poll.h>
 #include <sstream>
+#include <thread>
 #include <unistd.h>
 
 namespace pineforge::feed {
 std::atomic<bool> stopping{false};
 static_assert(std::atomic<bool>::is_always_lock_free);
 
+namespace {
+// Diagnostics go through one writer thread with ordinary blocking writes, so stderr's flags are never
+// changed and no caller waits on a slow sink. A full queue drops whole records and counts them; a
+// record is at most PIPE_BUF bytes, so a pipe write is atomic and never leaves half a line.
+struct LogSink {
+    std::mutex mutex;
+    std::condition_variable ready, idle;
+    std::deque<std::string> records;
+    std::size_t bytes = 0;
+    std::uint64_t dropped = 0;
+    bool writing = false;
+};
+LogSink& sink() {
+    static LogSink* const shared = [] {
+        auto* created = new LogSink();  // never destroyed: the writer may still be blocked at exit
+        std::thread([created] {
+            std::unique_lock<std::mutex> guard(created->mutex);
+            for (;;) {
+                created->ready.wait(guard, [created] { return !created->records.empty(); });
+                const auto record = std::move(created->records.front());
+                created->records.pop_front();
+                created->bytes -= record.size();
+                created->writing = true;
+                guard.unlock();
+                std::size_t offset = 0;
+                while (offset < record.size()) {
+                    const auto written = ::write(STDERR_FILENO, record.data() + offset, record.size() - offset);
+                    if (written < 0 && errno == EINTR) continue;
+                    if (written <= 0) break;
+                    offset += static_cast<std::size_t>(written);
+                }
+                guard.lock();
+                created->writing = false;
+                if (created->records.empty()) created->idle.notify_all();
+            }
+        }).detach();
+        return created;
+    }();
+    return *shared;
+}
+}
+
 void log(const std::string& level, const std::string& event, const Json& fields) {
-    static std::mutex mutex;
     auto record = fields;
     record.members["level"] = Json::string(level);
     record.members["event"] = Json::string(event);
     record.members["ts"] = Json::number(std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count()));
-    const auto bytes = record.dump() + '\n';
-    std::lock_guard<std::mutex> guard(mutex);
-    std::size_t offset = 0;
-    while (offset < bytes.size()) {
-        const auto written = ::write(STDERR_FILENO, bytes.data() + offset, bytes.size() - offset);
-        if (written < 0 && errno == EINTR) continue;
-        if (written <= 0) break;
-        offset += static_cast<std::size_t>(written);
-    }
+    auto& shared = sink();
+    std::lock_guard<std::mutex> guard(shared.mutex);
+    if (shared.dropped) record.members["dropped_records"] = Json::number(std::to_string(shared.dropped));
+    auto bytes = record.dump() + '\n';
+    if (bytes.size() > PIPE_BUF)
+        bytes = Json::object({{"level", record.members["level"]}, {"event", record.members["event"]},
+            {"ts", record.members["ts"]}, {"truncated", Json::boolean(true)}}).dump() + '\n';
+    if (bytes.size() > 1024 * 1024 - shared.bytes) { ++shared.dropped; return; }
+    shared.dropped = 0;
+    shared.bytes += bytes.size();
+    shared.records.push_back(std::move(bytes));
+    shared.ready.notify_one();
+}
+
+void flush_log(std::chrono::milliseconds limit) {
+    auto& shared = sink();
+    std::unique_lock<std::mutex> guard(shared.mutex);
+    shared.idle.wait_for(guard, limit, [&] { return shared.records.empty() && !shared.writing; });
 }
 
 std::string sha256(std::string_view bytes) {
@@ -229,9 +283,12 @@ void Aggregate::add(const Trade& trade) {
     last_ts = trade.ts;
     ++count;
 }
+// A WebSocket proof (require_ids) needs the kline's own x=true and venue f..L range. A REST row carries
+// neither: its caller proves closure with a later x=true watermark and a next-minute fence print.
 void Aggregate::reconcile(const Kline& kline, bool require_ids) const {
-    if (!kline.confirmed || !count || count != kline.count ||
-        (require_ids && (kline.first <= 0 || kline.last < kline.first || first != static_cast<std::uint64_t>(kline.first) ||
+    if (!count || count != kline.count ||
+        (require_ids && (!kline.confirmed || kline.first <= 0 || kline.last < kline.first ||
+                        first != static_cast<std::uint64_t>(kline.first) ||
                         last != static_cast<std::uint64_t>(kline.last) || last - first + 1 != count)))
         throw Error(20, "closed-minute trade coverage is not proven");
     if (!(Decimal(open) == Decimal(kline.bar.open)) || !(Decimal(high) == Decimal(kline.bar.high)) ||
@@ -250,5 +307,4 @@ Bar normalized_bar(const Json& event) {
     bar.validate();
     return bar;
 }
-Json string_field(const std::string& value) { return Json::string(value); }
 }

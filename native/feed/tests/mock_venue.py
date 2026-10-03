@@ -3,10 +3,12 @@
 
 import base64
 import copy
+import email.utils
 import fcntl
 import hashlib
 import http.server
 import json
+import os
 import pathlib
 import signal
 import struct
@@ -137,12 +139,15 @@ class MockServer(http.server.ThreadingHTTPServer):
         self.trades = copy.deepcopy(TRADES)
         self.bars = copy.deepcopy(BARS)
         self.requests = []
+        self.request_times = []
+        self.agg_empty = 0
         self.pongs = []
         self.fail_status = 0
         self.rate_once = False
         self.retry_after = 0
         self.rate_limits = None
         self.auth_headers = []
+        self.streams = []
         self.lock = threading.Lock()
         self.errors = []
 
@@ -163,6 +168,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(parsed.query)
         with self.server.lock:
             self.server.requests.append(parsed.path)
+            self.server.request_times.append((parsed.path, time.monotonic()))
             self.server.auth_headers.extend(
                 name for name in ("Authorization", "X-MBX-APIKEY") if self.headers.get(name)
             )
@@ -222,6 +228,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     for identifier in sorted(self.server.trades)
                     if start <= self.server.trades[identifier][0] <= end
                 ]
+                if self.server.agg_empty:
+                    self.server.agg_empty -= 1
+                    matching = []
                 rows = (
                     []
                     if not matching
@@ -274,13 +283,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Connection", "close")
         if retry:
-            self.send_header("Retry-After", str(self.server.retry_after))
+            value = self.server.retry_after
+            self.send_header("Retry-After", value() if callable(value) else str(value))
         self.end_headers()
         self.wfile.write(payload)
         self.close_connection = True
 
     def websocket(self, query):
-        assert query["streams"] == ["testusdt@trade/testusdt@kline_1m"]
+        assert query["streams"] in (["testusdt@trade/testusdt@kline_1m"], ["testusdt@kline_1m"])
+        with self.server.lock:
+            self.server.streams.append(query["streams"][0])
         key = self.headers["Sec-WebSocket-Key"]
         accept = base64.b64encode(
             hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
@@ -314,6 +326,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 frame(self.connection, action[1], opcode=2)
             elif action[0] == "raw":
                 frame(self.connection, action[1])
+            elif action[0] == "revise_trade":
+                with self.server.lock:
+                    row = list(self.server.trades[action[1]])
+                    row[2] = "0.10000001"
+                    self.server.trades[action[1]] = tuple(row)
             elif action[0] == "revise_rest":
                 with self.server.lock:
                     row = list(self.server.bars[action[1]])
@@ -428,6 +445,7 @@ class FeedMockTests(unittest.TestCase):
         server = self.server([[candle(240000)]])
         output, _ = self.run_feed(server, extra=["--max-messages", "3"])
         self.assertEqual([event["bar"]["ts_open"] for event in output], [120000, 180000, 240000])
+        self.assertEqual(server.streams, ["testusdt@kline_1m"])
 
     def test_unhealable_bar_hole_stops_20(self):
         server = self.server([[candle(240000)]])
@@ -440,6 +458,7 @@ class FeedMockTests(unittest.TestCase):
             [[trade(102), trade(100), trade(101), trade(103), candle(120000), candle(180000)]]
         )
         output, result = self.run_feed(server, "ticks", ["--max-messages", "7"])
+        self.assertEqual(server.streams, ["testusdt@trade/testusdt@kline_1m"])
         self.assertEqual(
             [event["seq"] for event in output if event["type"] == "tick"], [100, 101, 102, 103, 104]
         )
@@ -511,7 +530,19 @@ class FeedMockTests(unittest.TestCase):
         self.assertGreaterEqual(server.connections, 2)
 
     def test_protocol_invalid_symbol_and_binary_stop_23(self):
-        for payload in [trade(100, s="OTHERUSDT"), ("binary", b"not-a-text-event"), ("raw", "{")]:
+        missing_count = candle(120000)
+        del missing_count["data"]["k"]["n"]
+        unknown_on_data_stream = trade(100, e="tradeV2")
+        for payload in [
+            trade(100, s="OTHERUSDT"),
+            ("binary", b"not-a-text-event"),
+            ("raw", "{"),
+            trade(100, q="-0.10000000"),
+            trade(100, p="1e3"),
+            missing_count,
+            unknown_on_data_stream,
+            {"stream": "!notice", "data": {"E": 1}},
+        ]:
             with self.subTest(payload=payload):
                 server = self.server([[payload]])
                 state = self.directory / "state"
@@ -522,17 +553,26 @@ class FeedMockTests(unittest.TestCase):
                 self.run_feed(server, "ticks", expected=23)
 
     def test_rest_access_failure_stops_23_no_key_sent(self):
-        server = self.server([[candle(240000)]])
-        server.fail_status = 451
-        output, _ = self.run_feed(server, expected=23)
-        self.assertEqual(output, [])
-        self.assertTrue(
-            all(
-                path in {"/stream", "/api/v3/klines", "/api/v3/exchangeInfo"}
-                for path in server.requests
-            )
-        )
-        self.assertEqual(server.auth_headers, [])
+        for status in (451, 418, 403):
+            with self.subTest(status=status):
+                state = self.directory / "state"
+                if state.exists():
+                    import shutil
+
+                    shutil.rmtree(state)
+                server = self.server([[candle(240000)]])
+                server.fail_status = status
+                output, result = self.run_feed(server, expected=23)
+                self.assertEqual(output, [])
+                self.assertIn(f"HTTP {status}", result.stderr)
+                self.assertEqual(server.requests.count("/api/v3/exchangeInfo"), 1)
+                self.assertTrue(
+                    all(
+                        path in {"/stream", "/api/v3/klines", "/api/v3/exchangeInfo"}
+                        for path in server.requests
+                    )
+                )
+                self.assertEqual(server.auth_headers, [])
 
     def test_missing_rate_limit_metadata_is_refused(self):
         server = self.server([[candle(120000)]])
@@ -546,6 +586,130 @@ class FeedMockTests(unittest.TestCase):
         server.retry_after = 86401
         output, _ = self.run_feed(server, expected=22)
         self.assertEqual(output, [])
+
+    def test_reconnect_changed_raw_overlap_stops_21(self):
+        server = self.server(
+            [[trade(100), trade(101), ("revise_trade", 100), retirement()], [trade(102)]]
+        )
+        output, result = self.run_feed(server, "ticks", expected=21)
+        self.assertEqual([event["seq"] for event in output], [100, 101])
+        self.assertIn("reconnect raw overlap changed", result.stderr)
+        self.assertGreaterEqual(server.connections, 2)
+
+    def test_multi_page_raw_hole_heals_contiguously(self):
+        server = self.server([[]])
+        server.trades = {99: TRADES[99]}
+        for offset in range(2100):
+            server.trades[100 + offset] = (120001 + offset * 20, "10.00000000", "0.00000001")
+        server.bars = {
+            120000: (
+                "10.00000000",
+                "10.00000000",
+                "10.00000000",
+                "10.00000000",
+                "0.00002100",
+                100,
+                2199,
+                2100,
+            )
+        }
+        last = {
+            "stream": "testusdt@trade",
+            "data": {
+                "e": "trade",
+                "E": 162000,
+                "s": "TESTUSDT",
+                "t": 2199,
+                "p": "10.00000000",
+                "q": "0.00000001",
+                "T": 161981,
+                "m": False,
+            },
+        }
+        closing = candle(
+            120000,
+            o="10.00000000",
+            h="10.00000000",
+            l="10.00000000",
+            c="10.00000000",
+            v="0.00002100",
+            f=100,
+            L=2199,
+            n=2100,
+        )
+        server.scripts = [[last, closing]]
+        output, _ = self.run_feed(server, "ticks", ["--max-messages", "2101"])
+        self.assertEqual([event["seq"] for event in output[:-1]], list(range(100, 2200)))
+        self.assertEqual(output[-1], {"type": "time", "ts": 180000})
+        self.assertGreaterEqual(server.requests.count("/api/v3/historicalTrades"), 4)
+
+    def test_matched_time_regression_stops_23(self):
+        server = self.server([[trade(100), trade(101, T=120000)]])
+        server.trades[101] = (120000, "11.20000000", "0.20000000")
+        output, result = self.run_feed(server, "ticks", expected=23)
+        self.assertEqual([event["seq"] for event in output], [100])
+        self.assertIn("matched time regressed", result.stderr)
+
+    def test_unknown_non_data_event_warns_and_continues(self):
+        notice = {"stream": "!venueNotice", "data": {"e": "venueNotice", "E": 1}}
+        server = self.server([[notice, candle(120000)]])
+        output, result = self.run_feed(server, extra=["--max-messages", "1"])
+        self.assertEqual(len(output), 1)
+        warnings = [json.loads(record) for record in result.stderr.splitlines()]
+        self.assertIn(
+            {"stream": "!venueNotice", "type": "venueNotice"},
+            [
+                {key: record.get(key) for key in ("stream", "type")}
+                for record in warnings
+                if record["event"] == "unknown_stream_event" and record["level"] == "warn"
+            ],
+        )
+
+    def test_initial_fence_retries_lagging_rest(self):
+        server = self.server([[trade(100), trade(101), trade(102), candle(120000)]])
+        server.agg_empty = 1
+        output, _ = self.run_feed(server, "ticks", ["--max-messages", "4"])
+        self.assertEqual([event["type"] for event in output], ["tick", "tick", "tick", "time"])
+        self.assertEqual(server.requests.count("/api/v3/aggTrades"), 2)
+
+    def test_stdio_flags_restored_and_full_stderr_never_cuts_a_record(self):
+        server = self.server([[candle(120000)]])
+        read_error, write_error = os.pipe()
+        read_output, write_output = os.pipe()
+        try:
+            if hasattr(fcntl, "F_SETPIPE_SZ"):
+                fcntl.fcntl(write_error, fcntl.F_SETPIPE_SZ, 4096)
+            flags = fcntl.fcntl(write_error, fcntl.F_GETFL)
+            fcntl.fcntl(write_error, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            filler = b'{"filler":true}\n'
+            try:
+                while True:
+                    os.write(write_error, filler)
+            except BlockingIOError:
+                pass
+            fcntl.fcntl(write_error, fcntl.F_SETFL, flags)
+            process = subprocess.Popen(
+                self.command(server, extra=["--max-messages", "1"]),
+                stdout=write_output,
+                stderr=write_error,
+            )
+            started = time.monotonic()
+            self.assertEqual(process.wait(timeout=10), 0)
+            self.assertLess(time.monotonic() - started, 8)
+            self.assertFalse(fcntl.fcntl(write_output, fcntl.F_GETFL) & os.O_NONBLOCK)
+            self.assertFalse(fcntl.fcntl(write_error, fcntl.F_GETFL) & os.O_NONBLOCK)
+            os.close(write_error)
+            os.close(write_output)
+            write_error = write_output = -1
+            with os.fdopen(read_error, "rb") as errors, os.fdopen(read_output, "rb") as output:
+                read_error = read_output = -1
+                for line in errors.read().split(b"\n")[:-1]:
+                    self.assertIsInstance(json.loads(line), dict)
+                self.assertEqual(len(output.read().splitlines()), 1)
+        finally:
+            for descriptor in (read_error, write_error, read_output, write_output):
+                if descriptor >= 0:
+                    os.close(descriptor)
 
     def test_aggregate_trade_is_never_substituted_for_raw_prints(self):
         message = trade(100)
@@ -604,6 +768,27 @@ class FeedMockTests(unittest.TestCase):
             process.stdout.close()
             process.stderr.close()
 
+    def test_retry_after_seconds_and_http_date_are_honoured(self):
+        for retry_after in (2, lambda: email.utils.formatdate(time.time() + 4, usegmt=True)):
+            with self.subTest(retry_after=retry_after):
+                server = self.server([[candle(120000)]])
+                server.rate_once = True
+                server.retry_after = retry_after
+                state = self.directory / "state"
+                if state.exists():
+                    import shutil
+
+                    shutil.rmtree(state)
+                output, result = self.run_feed(server, extra=["--max-messages", "1"])
+                self.assertEqual(len(output), 1)
+                self.assertIn("rest_rate_limited", result.stderr)
+                limited, retried = [
+                    moment
+                    for path, moment in server.request_times
+                    if path == "/api/v3/exchangeInfo"
+                ]
+                self.assertGreaterEqual(retried - limited, 1.9)
+
     def test_429_retry_after_preserves_prefix(self):
         server = self.server([[candle(240000)]])
         server.rate_once = True
@@ -653,6 +838,45 @@ class FeedMockTests(unittest.TestCase):
         journal.write_text(journal.read_text().replace("10.10000000", "10.20000000"))
         output, _ = self.run_feed(server, resume=True, expected=21)
         self.assertEqual(output, [])
+
+    def warmup(self, server):
+        port = server.server_address[1]
+        output = self.directory / "warmup.csv"
+        command = [
+            BINARY,
+            "warmup",
+            "--venue",
+            "binance",
+            "--market",
+            "spot",
+            "--symbol",
+            "TESTUSDT",
+            "--start",
+            "120000",
+            "--end",
+            "240000",
+            "--output",
+            str(output),
+            "--rest-url",
+            f"http://127.0.0.1:{port}",
+            "--ws-url",
+            f"ws://127.0.0.1:{port}",
+            "--allow-insecure-http",
+        ]
+        return output, subprocess.run(command, capture_output=True, text=True, timeout=8)
+
+    def test_warmup_rest_rows_must_equal_confirmed_ws_bars(self):
+        output, result = self.warmup(self.server([[candle(180000, v="0.70000000")]]))
+        self.assertEqual(result.returncode, 21, result.stderr)
+        self.assertFalse(output.exists())
+        output, result = self.warmup(self.server([[candle(180000)]]))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(pathlib.Path(str(output) + ".manifest.json").read_text())[
+                "ws_cross_checked_bars"
+            ],
+            1,
+        )
 
     def test_warmup_exclusive_cut_manifest_and_tokens(self):
         server = self.server([[candle(240000)]])

@@ -2,6 +2,7 @@
 #pragma once
 #include "json.hpp"
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <stdexcept>
@@ -19,6 +20,7 @@ struct Error : std::runtime_error {
 struct Stopped {};
 extern std::atomic<bool> stopping;
 void log(const std::string& level, const std::string& event, const Json& fields = Json::object({}));
+void flush_log(std::chrono::milliseconds limit);
 std::string sha256(std::string_view bytes);
 std::string random_epoch();
 std::int64_t timestamp(const std::string& token);
@@ -71,7 +73,6 @@ struct Aggregate {
 };
 Trade normalized_trade(const Json& event);
 Bar normalized_bar(const Json& event);
-Json string_field(const std::string& value);
 
 struct Config {
     std::string venue = "binance", market = "spot", symbol, mode = "bars", state_dir;

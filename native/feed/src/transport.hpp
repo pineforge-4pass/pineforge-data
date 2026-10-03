@@ -11,11 +11,13 @@
 namespace pineforge::feed {
 void check_runtime_curl();
 void validate_origin(const std::string& origin, bool websocket, bool allow_insecure);
+void pause_for(std::chrono::milliseconds duration);
+std::uint64_t retry_after_seconds(const std::string& value, std::int64_t now);
 
 class HttpClient {
     Config config_;
     std::chrono::steady_clock::time_point next_request_{};
-    std::uint64_t weight_limit_ = 0, milliseconds_per_weight_ = 100, milliseconds_per_request_ = 0;
+    std::uint64_t weight_limit_ = 0, milliseconds_per_weight_ = 0, milliseconds_per_request_ = 0;
 public:
     explicit HttpClient(const Config& config);
     Json get(const std::string& path, unsigned int weight);
@@ -27,7 +29,7 @@ struct SourceMessage {
 class WebSocketPump {
     Config config_;
     std::string url_;
-    std::atomic<bool> stopped_{false}, reconnect_{false};
+    std::atomic<bool> stopped_{false};
     std::mutex mutex_;
     std::condition_variable ready_;
     std::deque<SourceMessage> queue_;
@@ -43,6 +45,6 @@ public:
     WebSocketPump(const WebSocketPump&) = delete;
     WebSocketPump& operator=(const WebSocketPump&) = delete;
     SourceMessage take();
-    void reconnect() { reconnect_.store(true); }
+    bool try_take(SourceMessage& message);
 };
 }

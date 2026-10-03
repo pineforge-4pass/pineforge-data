@@ -53,7 +53,9 @@ struct SyntheticVenue final : Venue {
     };
     std::string streams() const override { return "test@trade/test@kline_1m"; }
     VenueEvent decode(const std::string&) const override { throw Error(23, "not used by deterministic unit venue"); }
+    std::size_t pages = 0;
     std::vector<Trade> history(std::uint64_t from, std::size_t limit) override {
+        ++pages;
         std::vector<Trade> result;
         for (std::size_t offset = 0; offset < limit; ++offset) {
             const auto found = trades.find(from + offset);
@@ -64,11 +66,15 @@ struct SyntheticVenue final : Venue {
         return result;
     }
     std::uint64_t first_trade_id(std::int64_t minute) override { return static_cast<std::uint64_t>(bars.at(minute).first); }
+    // REST rows carry no x=true and no f..L, exactly like the venue's klines endpoint.
     std::vector<Kline> klines(std::int64_t start, std::int64_t end) override {
         std::vector<Kline> result;
         for (auto minute = start; minute < end; minute += 60000) {
             if (!bars.count(minute)) throw Error(20, "synthetic missing minute");
-            result.push_back(bars.at(minute));
+            auto row = bars.at(minute);
+            row.first = row.last = -1;
+            row.confirmed = false;
+            result.push_back(row);
         }
         return result;
     }
@@ -256,10 +262,14 @@ int main() {
         {
             State state(options);
             SyntheticVenue venue;
-            FeedSession session(state, venue, [](const auto&) {});
+            std::vector<std::string> output;
+            FeedSession session(state, venue, [&](const auto& line) { output.push_back(line); });
             std::filesystem::create_directory(temporary.path + "/cursor.json.tmp");
             expect(22, [&] { session.ingest(venue.close(120000)); });
-            assert(state.cursor().message_index == 0);
+            assert(output.empty());
+            assert(state.durable().message_index == 0);
+            expect(22, [&] { session.publish(); });
+            assert(output.empty());
         }
         std::filesystem::remove(temporary.path + "/cursor.json.tmp");
         options.resume = true;
@@ -280,6 +290,101 @@ int main() {
         expect(22, [&] { state.visit(0, [](const auto&) { std::this_thread::sleep_for(std::chrono::milliseconds(1100)); }); });
         passed("replay_time_budget_stops_without_mutating_cursor");
     }
+    {
+        Temporary temporary;
+        SyntheticVenue venue;
+        State state(config(temporary, "ticks"));
+        std::vector<std::string> output;
+        FeedSession session(state, venue, [&](const auto& line) { output.push_back(line); });
+        session.connected();
+        session.ingest(venue.tick(100));
+        session.ingest(venue.tick(101));
+        assert(output.size() == 2);
+        venue.trades.at(100).qty = "0.10000001";
+        expect(21, [&] { session.connected(); });
+        assert(output.size() == 2 && state.durable().message_index == 2);
+        passed("reconnect_raw_overlap_change_stops_without_output");
+    }
+    {
+        Temporary temporary;
+        SyntheticVenue venue;
+        venue.trades.erase(venue.trades.find(101), venue.trades.end());
+        for (std::uint64_t id = 100; id < 2600; ++id)
+            venue.trades[id] = {id, 120001 + static_cast<std::int64_t>(id - 100) * 20, "10.00000000", "0.00000001"};
+        venue.trades[2600] = {2600, 180001, "10.00000000", "0.00000001"};
+        venue.bars.at(120000) = {{120000, "10.00000000", "10.00000000", "10.00000000", "10.00000000", "0.00002500"}, 100, 2599, 2500, true};
+        State state(config(temporary, "ticks"));
+        std::vector<std::string> output;
+        FeedSession session(state, venue, [&](const auto& line) { output.push_back(line); });
+        session.ingest(venue.tick(2599));
+        session.ingest(venue.close(120000));
+        assert(output.size() == 2501 && venue.pages >= 4);
+        for (std::size_t index = 0; index < 2500; ++index)
+            assert(parse_json(output[index]).at("seq").integer<std::uint64_t>() == 100 + index);
+        assert(parse_json(output.back()).at("type").text() == "time");
+        passed("multi_page_raw_healing_stays_contiguous");
+    }
+    {
+        Temporary temporary;
+        SyntheticVenue venue;
+        venue.trades.at(101).ts = 120000;
+        State state(config(temporary, "ticks"));
+        std::vector<std::string> output;
+        FeedSession session(state, venue, [&](const auto& line) { output.push_back(line); });
+        session.ingest(venue.tick(100));
+        expect(23, [&] { session.ingest(venue.tick(101)); });
+        assert(output.size() == 1 && state.durable().seq == 100);
+        passed("matched_time_regression_stops_23");
+    }
+    {
+        Temporary temporary;
+        SyntheticVenue venue;
+        ++venue.bars.at(120000).count;
+        State state(config(temporary, "ticks"));
+        std::vector<std::string> output;
+        FeedSession session(state, venue, [&](const auto& line) { output.push_back(line); });
+        expect(20, [&] { session.ingest(venue.close(180000)); });
+        assert(state.durable().cut == 120000);
+        for (const auto& line : output) assert(parse_json(line).at("type").text() == "tick");
+        venue.bars.at(120000).count = 3;
+        venue.trades.erase(103);
+        Temporary second;
+        State fresh(config(second, "ticks"));
+        FeedSession fenced(fresh, venue, [](const auto&) {});
+        expect(20, [&] { fenced.ingest(venue.close(180000)); });
+        assert(fresh.durable().cut == 120000);
+        passed("historical_closure_needs_rest_count_and_next_minute_fence");
+    }
+    {
+        Temporary temporary;
+        State state(config(temporary, "bars"));
+        const Bar bar{120000, "10.10000000", "11.20000000", "9.90000000", "9.90000000", "0.60000000"};
+        state.stage(bar.wire(), bar);
+        assert(state.staged() == 1 && state.cursor().message_index == 1 && state.durable().message_index == 0);
+        assert(std::filesystem::file_size(temporary.path + "/events.jsonl") == 0);
+        std::size_t seen = 0;
+        state.visit(0, [&](const auto&) { ++seen; });
+        assert(seen == 1 && state.bar(120000));
+        const auto lines = state.flush();
+        assert(lines.size() == 1 && state.staged() == 0 && state.durable().message_index == 1);
+        assert(std::filesystem::file_size(temporary.path + "/events.jsonl") == lines.front().size() + 1);
+        passed("group_commit_stages_then_persists_before_publication");
+    }
+    {
+        Temporary temporary;
+        { std::ofstream empty(temporary.path + "/events.jsonl"); }
+        { State state(config(temporary, "bars")); assert(state.durable().message_index == 0); }
+        Temporary second;
+        { std::ofstream used(second.path + "/events.jsonl"); used << "x\n"; }
+        expect(23, [&] { State state(config(second, "bars")); });
+        passed("crashed_initialization_without_cursor_is_reinitialized");
+    }
+    assert(retry_after_seconds("120", 0) == 120);
+    assert(retry_after_seconds("Wed, 21 Oct 2015 07:28:00 GMT", 1445412475) == 5);
+    assert(retry_after_seconds("Wed, 21 Oct 2015 07:28:00 GMT", 1445412490) == 0);
+    for (const auto* invalid : {"", "soon", "-1", "1.5", "Wed, 21 Oct 2015 07:28:00 UTC", "21 Oct 2015 07:28:00 GMT"})
+        expect(23, [&] { retry_after_seconds(invalid, 0); });
+    passed("retry_after_delta_seconds_and_http_date");
     assert(timestamp("1970-01-01T00:02:00Z") == 120000);
     expect(23, [] { timestamp("2026-02-30T00:00:00Z"); });
     passed("strict_utc_start_and_exclusive_cut");

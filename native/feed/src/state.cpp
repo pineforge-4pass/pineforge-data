@@ -6,6 +6,7 @@
 #include <fstream>
 #include <fcntl.h>
 #include <limits>
+#include <utility>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -88,15 +89,19 @@ State::State(const Config& config) : config_(config) {
         if (journal_.get() < 0 || ::fsync(journal_.get()) != 0) throw Error(22, "cannot sync rolled-back journal tail");
     } else {
         if (config_.start < 0 || config_.start % 60000) throw Error(23, "new streams require a minute-aligned --start");
-        if (std::filesystem::exists(config_.state_dir + "/cursor.json") || std::filesystem::exists(log_path()))
+        // An empty journal without a cursor is an initialization that crashed before its first cursor
+        // write: nothing was committed or published, so a fresh start may take the directory over.
+        if (std::filesystem::exists(config_.state_dir + "/cursor.json") ||
+            (std::filesystem::exists(log_path()) && std::filesystem::file_size(log_path()) != 0))
             throw Error(23, "state already exists; use --resume or an explicitly new state directory");
         cursor_.epoch = random_epoch();
         cursor_.start = cursor_.cut = config_.start;
         cursor_.prefix_hash = sha256("");
         cursor_.overlap_hash = sha256("");
-        journal_.reset(::open(log_path().c_str(), O_WRONLY | O_APPEND | O_CREAT | O_EXCL | O_CLOEXEC, 0600));
+        journal_.reset(::open(log_path().c_str(), O_WRONLY | O_APPEND | O_CREAT | O_TRUNC | O_CLOEXEC, 0600));
         if (journal_.get() < 0 || ::fsync(journal_.get()) != 0) throw Error(22, "cannot initialize durable journal");
         persist(cursor_);
+        durable_ = cursor_;
     }
     if (journal_.get() < 0) throw Error(22, "cannot open durable journal");
     if (config_.output_from > cursor_.message_index) throw Error(22, "output cursor exceeds the retained verified prefix");
@@ -144,6 +149,7 @@ void State::recover() {
         for (const auto& proof : proofs.items) cursor_.proofs.push_back(normalized_bar(proof));
         if (!std::filesystem::exists(log_path()) || std::filesystem::file_size(log_path()) < cursor_.log_bytes)
             throw Error(21, "durable journal is shorter than its verified cursor");
+        durable_ = cursor_;
         Cursor reconstructed;
         reconstructed.start = reconstructed.cut = cursor_.start;
         reconstructed.predecessor = cursor_.predecessor;
@@ -171,12 +177,12 @@ void State::recover() {
 
 void State::anchor(const Trade& predecessor) {
     predecessor.validate();
-    if (cursor_.predecessor || cursor_.message_index || predecessor.ts >= cursor_.start)
+    if (cursor_.predecessor || cursor_.message_index || !staged_.empty() || predecessor.ts >= cursor_.start)
         throw Error(20, "initial raw-trade predecessor does not prove the start fence");
     auto next = cursor_;
     next.predecessor = predecessor;
     persist(next);
-    cursor_ = std::move(next);
+    durable_ = cursor_ = std::move(next);
 }
 
 void State::remember(const Json& event) {
@@ -189,7 +195,7 @@ void State::remember(const Json& event) {
     }
 }
 
-void State::commit(const std::string& line, const std::optional<Bar>& proof) {
+void State::stage(const std::string& line, const std::optional<Bar>& proof) {
     if (line.size() > 4095 || line.find('\n') != std::string::npos) throw Error(23, "normalized message exceeds the atomic output bound");
     auto next = cursor_;
     const auto event = parse_json(line);
@@ -207,11 +213,25 @@ void State::commit(const std::string& line, const std::optional<Bar>& proof) {
     ++next.message_index;
     next.prefix_hash = sha256(cursor_.prefix_hash + line + '\n');
     next.overlap_hash = sha256(line + '\n');
-    write_all(journal_.get(), line + '\n');
-    if (::fsync(journal_.get()) != 0) throw Error(22, "cannot sync normalized message");
-    persist(next);
+    staged_bytes_ += line;
+    staged_bytes_ += '\n';
+    staged_.push_back(line);
     cursor_ = std::move(next);
     remember(event);
+}
+
+std::vector<std::string> State::flush() {
+    if (staged_.empty()) return {};
+    // A failed append or cursor write leaves an uncommitted tail that only resume may truncate.
+    if (unusable_) throw Error(22, "durable journal is unusable after a failed commit");
+    unusable_ = true;
+    write_all(journal_.get(), staged_bytes_);
+    if (::fsync(journal_.get()) != 0) throw Error(22, "cannot sync normalized messages");
+    persist(cursor_);
+    unusable_ = false;
+    durable_ = cursor_;
+    staged_bytes_.clear();
+    return std::exchange(staged_, {});
 }
 
 void State::visit(std::uint64_t from, const std::function<void(const std::string&)>& visitor) const {
@@ -221,16 +241,20 @@ void State::visit(std::uint64_t from, const std::function<void(const std::string
     std::uint64_t index = 0, bytes = 0;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(config_.max_replay_seconds);
     std::string line;
-    while (bytes < cursor_.log_bytes) {
+    while (bytes < durable_.log_bytes) {
         if (stopping) throw Stopped{};
         if (std::chrono::steady_clock::now() >= deadline) throw Error(22, "retained prefix replay time budget exhausted");
-        if (!std::getline(input, line) || line.size() > 4095 || bytes + line.size() + 1 > cursor_.log_bytes)
+        if (!std::getline(input, line) || line.size() > 4095 || bytes + line.size() + 1 > durable_.log_bytes)
             throw Error(21, "truncated or oversized verified message");
         bytes += line.size() + 1;
         if (index >= from) visitor(line);
         ++index;
     }
-    if (bytes != cursor_.log_bytes || index != cursor_.message_index) throw Error(21, "verified message partition changed");
+    if (bytes != durable_.log_bytes || index != durable_.message_index) throw Error(21, "verified message partition changed");
+    for (const auto& staged : staged_) {
+        if (index >= from) visitor(staged);
+        ++index;
+    }
 }
 
 std::optional<Trade> State::trade(std::uint64_t id) const {
@@ -253,8 +277,8 @@ std::optional<Bar> State::bar(std::int64_t ts) const {
     return found;
 }
 Json State::status() const {
-    return Json::object({{"epoch", Json::string(cursor_.epoch)}, {"message_index", number(cursor_.message_index)},
-        {"emitted_seq", number(cursor_.seq)}, {"verified_cut", signed_number(cursor_.cut)},
-        {"prefix_hash", Json::string(cursor_.prefix_hash)}, {"cursor", Json::string(config_.state_dir + "/cursor.json")}});
+    return Json::object({{"epoch", Json::string(durable_.epoch)}, {"message_index", number(durable_.message_index)},
+        {"emitted_seq", number(durable_.seq)}, {"verified_cut", signed_number(durable_.cut)},
+        {"prefix_hash", Json::string(durable_.prefix_hash)}, {"cursor", Json::string(config_.state_dir + "/cursor.json")}});
 }
 }

@@ -62,8 +62,8 @@ Kline binance_kline(const Json& value, bool websocket) {
     }
     return kline;
 }
-// USD-M `q` includes RPI (retail price improvement) executions and `nq` excludes them; the kline volume
-// counts every execution, so `q` is the quantity that reconciles with the confirmed candle.
+// USD-M `q` is the aggregate's full executed quantity, RPI (retail price improvement) executions
+// included; `nq` excludes those and would drop real executions from the print stream.
 Trade usdm_aggregate(const Json& value) {
     Trade trade{value.at("a").integer<std::uint64_t>(), value.at("T").integer<std::int64_t>(), value.at("p").text(), value.at("q").text()};
     const auto first = value.at("f").integer<std::uint64_t>(), last = value.at("l").integer<std::uint64_t>();

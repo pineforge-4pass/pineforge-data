@@ -202,9 +202,10 @@ unrouted origin no longer serves `aggTrade` or `kline` streams, and a raw
 print and never expands `f..l` into imaginary raw trades. **Aggregate prints
 are not raw trades**: one print is the sum of same-price, same-side executions,
 so a strategy sees fewer, larger intrabar prints than in raw tick mode. The
-print quantity is `q`, which includes RPI (retail price improvement)
-executions; `nq` excludes them and would not reconcile with the kline volume,
-which counts every execution. USD-M `exchangeInfo` exceeds the 1 MiB JSON
+print quantity is `q`, the aggregate's full executed quantity including RPI
+(retail price improvement) executions; `nq` excludes those and would drop real
+executions from the print stream. (Every aggregate seen live had `q = nq`.)
+USD-M `exchangeInfo` exceeds the 1 MiB JSON
 bound, so only its top-level `rateLimits` member is extracted (4 MiB body cap)
 and parsed; requests then spend at most half of the published weight ceiling.
 

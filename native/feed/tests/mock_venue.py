@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Synthetic public Binance shapes; standard-library HTTP/WS fault injection."""
+
 import base64
 import copy
 import fcntl
@@ -8,18 +9,17 @@ import http.server
 import json
 import pathlib
 import signal
-import socket
 import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-import urllib.parse
 import unittest
+import urllib.parse
 from types import SimpleNamespace
-from public_e2e import Soak
 
+from public_e2e import Soak
 
 BINARY = str(pathlib.Path(sys.argv[1]).resolve())
 sys.argv = [sys.argv[0]]
@@ -41,21 +41,47 @@ BARS = {
 
 def trade(identifier, **changes):
     matched, price, quantity = TRADES[identifier]
-    data = {"e": "trade", "E": matched + 999, "s": "TESTUSDT", "t": identifier,
-            "p": price, "q": quantity, "T": matched, "m": False, "M": True}
+    data = {
+        "e": "trade",
+        "E": matched + 999,
+        "s": "TESTUSDT",
+        "t": identifier,
+        "p": price,
+        "q": quantity,
+        "T": matched,
+        "m": False,
+        "M": True,
+    }
     data.update(changes)
     return {"stream": "testusdt@trade", "data": data}
 
 
 def candle(minute, confirmed=True, **changes):
     opening, high, low, close, volume, first, last, count = BARS[minute]
-    row = {"t": minute, "T": minute + 59999, "s": "TESTUSDT", "i": "1m", "f": first,
-           "L": last, "o": opening, "h": high, "l": low, "c": close, "v": volume,
-           "n": count, "x": confirmed, "q": "0.00000000", "V": "0.00000000",
-           "Q": "0.00000000", "B": "0"}
+    row = {
+        "t": minute,
+        "T": minute + 59999,
+        "s": "TESTUSDT",
+        "i": "1m",
+        "f": first,
+        "L": last,
+        "o": opening,
+        "h": high,
+        "l": low,
+        "c": close,
+        "v": volume,
+        "n": count,
+        "x": confirmed,
+        "q": "0.00000000",
+        "V": "0.00000000",
+        "Q": "0.00000000",
+        "B": "0",
+    }
     row.update(changes)
-    return {"stream": "testusdt@kline_1m", "data": {"e": "kline", "E": minute + 60000,
-                                                   "s": "TESTUSDT", "k": row}}
+    return {
+        "stream": "testusdt@kline_1m",
+        "data": {"e": "kline", "E": minute + 60000, "s": "TESTUSDT", "k": row},
+    }
 
 
 def retirement():
@@ -86,6 +112,7 @@ def receive(connection):
                 raise EOFError
             result.extend(chunk)
         return bytes(result)
+
     first, second = exact(2)
     size = second & 127
     if size == 126:
@@ -136,7 +163,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(parsed.query)
         with self.server.lock:
             self.server.requests.append(parsed.path)
-            self.server.auth_headers.extend(name for name in ("Authorization", "X-MBX-APIKEY") if self.headers.get(name))
+            self.server.auth_headers.extend(
+                name for name in ("Authorization", "X-MBX-APIKEY") if self.headers.get(name)
+            )
         if parsed.path == "/stream":
             self.websocket(query)
             return
@@ -149,9 +178,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.respond(429, {}, retry=True)
                 return
             if parsed.path == "/api/v3/exchangeInfo":
-                rows = {"rateLimits": [{"rateLimitType": "REQUEST_WEIGHT", "interval": "MINUTE", "intervalNum": 1, "limit": 6000},
-                                       {"rateLimitType": "RAW_REQUESTS", "interval": "MINUTE", "intervalNum": 5, "limit": 61000}],
-                        "symbols": [{"symbol": "TESTUSDT", "baseAsset": "TEST", "quoteAsset": "USDT"}]}
+                rows = {
+                    "rateLimits": [
+                        {
+                            "rateLimitType": "REQUEST_WEIGHT",
+                            "interval": "MINUTE",
+                            "intervalNum": 1,
+                            "limit": 6000,
+                        },
+                        {
+                            "rateLimitType": "RAW_REQUESTS",
+                            "interval": "MINUTE",
+                            "intervalNum": 5,
+                            "limit": 61000,
+                        },
+                    ],
+                    "symbols": [{"symbol": "TESTUSDT", "baseAsset": "TEST", "quoteAsset": "USDT"}],
+                }
                 if self.server.rate_limits is not None:
                     rows["rateLimits"] = self.server.rate_limits
             elif parsed.path == "/api/v3/historicalTrades":
@@ -161,25 +204,64 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 for identifier in sorted(self.server.trades):
                     if identifier >= start and len(rows) < limit:
                         matched, price, quantity = self.server.trades[identifier]
-                        rows.append({"id": identifier, "price": price, "qty": quantity,
-                                     "quoteQty": "0.00000000", "time": matched,
-                                     "isBuyerMaker": False, "isBestMatch": True})
+                        rows.append(
+                            {
+                                "id": identifier,
+                                "price": price,
+                                "qty": quantity,
+                                "quoteQty": "0.00000000",
+                                "time": matched,
+                                "isBuyerMaker": False,
+                                "isBestMatch": True,
+                            }
+                        )
             elif parsed.path == "/api/v3/aggTrades":
                 start, end = int(query["startTime"][0]), int(query["endTime"][0])
-                matching = [identifier for identifier in sorted(self.server.trades)
-                            if start <= self.server.trades[identifier][0] <= end]
-                rows = [] if not matching else [{"a": 42, "f": matching[0], "l": matching[0],
-                                                "T": self.server.trades[matching[0]][0],
-                                                "p": "10.10000000", "q": "0.10000000",
-                                                "m": False, "M": True}]
+                matching = [
+                    identifier
+                    for identifier in sorted(self.server.trades)
+                    if start <= self.server.trades[identifier][0] <= end
+                ]
+                rows = (
+                    []
+                    if not matching
+                    else [
+                        {
+                            "a": 42,
+                            "f": matching[0],
+                            "l": matching[0],
+                            "T": self.server.trades[matching[0]][0],
+                            "p": "10.10000000",
+                            "q": "0.10000000",
+                            "m": False,
+                            "M": True,
+                        }
+                    ]
+                )
             elif parsed.path == "/api/v3/klines":
                 start, end = int(query["startTime"][0]), int(query["endTime"][0])
                 rows = []
                 for minute in sorted(self.server.bars):
                     if start <= minute <= end and len(rows) < 1000:
-                        opening, high, low, close, volume, first, last, count = self.server.bars[minute]
-                        rows.append([minute, opening, high, low, close, volume, minute + 59999,
-                                     "0.00000000", count, "0.00000000", "0.00000000", "0"])
+                        opening, high, low, close, volume, _first, _last, count = self.server.bars[
+                            minute
+                        ]
+                        rows.append(
+                            [
+                                minute,
+                                opening,
+                                high,
+                                low,
+                                close,
+                                volume,
+                                minute + 59999,
+                                "0.00000000",
+                                count,
+                                "0.00000000",
+                                "0.00000000",
+                                "0",
+                            ]
+                        )
             else:
                 self.respond(404, {})
                 return
@@ -200,7 +282,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def websocket(self, query):
         assert query["streams"] == ["testusdt@trade/testusdt@kline_1m"]
         key = self.headers["Sec-WebSocket-Key"]
-        accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        accept = base64.b64encode(
+            hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+        ).decode()
         self.send_response(101)
         self.send_header("Upgrade", "websocket")
         self.send_header("Connection", "Upgrade")
@@ -243,7 +327,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         while True:
             try:
                 receive(self.connection)
-            except socket.timeout:
+            except TimeoutError:
                 continue
             except (EOFError, ConnectionResetError):
                 break
@@ -254,15 +338,23 @@ class FeedMockTests(unittest.TestCase):
     def test_public_qualification_requires_explicit_tick_ohlc_exception(self):
         for allow, expected in ((False, 1), (True, 0)):
             soak = Soak.__new__(Soak)
-            soak.options = SimpleNamespace(allow_tick_ohlc_difference=allow, bar_minutes=46, tick_minutes=21)
+            soak.options = SimpleNamespace(
+                allow_tick_ohlc_difference=allow, bar_minutes=46, tick_minutes=21
+            )
             soak.directory = self.directory / str(allow)
             soak.directory.mkdir()
             soak.results = {}
             soak.receiver = SimpleNamespace(shutdown=lambda: None)
             soak.warmup = lambda: None
-            soak.live = lambda mode, minutes: soak.results.update({mode: {"batch_actions_equal": mode == "bars"}})
+            soak.live = lambda mode, minutes, soak=soak: soak.results.update(
+                {mode: {"batch_actions_equal": mode == "bars"}}
+            )
             self.assertEqual(soak.run(), expected)
-            self.assertFalse(json.loads((soak.directory / "summary.json").read_text())["ticks"]["batch_actions_equal"])
+            self.assertFalse(
+                json.loads((soak.directory / "summary.json").read_text())["ticks"][
+                    "batch_actions_equal"
+                ]
+            )
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="pineforge-feed-mock-")
@@ -279,15 +371,32 @@ class FeedMockTests(unittest.TestCase):
 
     def command(self, server, mode="bars", extra=(), resume=False):
         port = server.server_address[1]
-        arguments = [BINARY, "run", "--venue", "binance", "--market", "spot", "--symbol", "TESTUSDT",
-                     "--mode", mode, "--state-dir", str(self.directory / "state"),
-                     "--rest-url", f"http://127.0.0.1:{port}", "--ws-url", f"ws://127.0.0.1:{port}",
-                     "--allow-insecure-http"]
+        arguments = [
+            BINARY,
+            "run",
+            "--venue",
+            "binance",
+            "--market",
+            "spot",
+            "--symbol",
+            "TESTUSDT",
+            "--mode",
+            mode,
+            "--state-dir",
+            str(self.directory / "state"),
+            "--rest-url",
+            f"http://127.0.0.1:{port}",
+            "--ws-url",
+            f"ws://127.0.0.1:{port}",
+            "--allow-insecure-http",
+        ]
         arguments += ["--resume"] if resume else ["--start", "120000"]
         return arguments + list(extra)
 
     def run_feed(self, server, mode="bars", extra=(), expected=0, resume=False):
-        result = subprocess.run(self.command(server, mode, extra, resume), capture_output=True, text=True, timeout=12)
+        result = subprocess.run(
+            self.command(server, mode, extra, resume), capture_output=True, text=True, timeout=12
+        )
         self.assertEqual(result.returncode, expected, result.stderr)
         self.assertFalse(server.errors, server.errors)
         for record in result.stderr.splitlines():
@@ -296,7 +405,10 @@ class FeedMockTests(unittest.TestCase):
         cursor = self.directory / "state" / "cursor.json"
         if cursor.exists():
             saved = json.loads(cursor.read_text())["cursor"]
-            self.assertEqual(saved["message_index"], len((cursor.parent / "events.jsonl").read_text().splitlines()))
+            self.assertEqual(
+                saved["message_index"],
+                len((cursor.parent / "events.jsonl").read_text().splitlines()),
+            )
         return output, result
 
     def test_bars_hole_is_healed_behind_closed_watermark(self):
@@ -311,10 +423,16 @@ class FeedMockTests(unittest.TestCase):
         self.assertEqual([event["bar"]["ts_open"] for event in output], [120000])
 
     def test_raw_hole_and_reordering_are_healed_not_resequenced(self):
-        server = self.server([[trade(102), trade(100), trade(101), trade(103), candle(120000), candle(180000)]])
+        server = self.server(
+            [[trade(102), trade(100), trade(101), trade(103), candle(120000), candle(180000)]]
+        )
         output, result = self.run_feed(server, "ticks", ["--max-messages", "7"])
-        self.assertEqual([event["seq"] for event in output if event["type"] == "tick"], [100, 101, 102, 103, 104])
-        self.assertEqual([event["ts"] for event in output if event["type"] == "time"], [180000, 240000])
+        self.assertEqual(
+            [event["seq"] for event in output if event["type"] == "tick"], [100, 101, 102, 103, 104]
+        )
+        self.assertEqual(
+            [event["ts"] for event in output if event["type"] == "time"], [180000, 240000]
+        )
         self.assertIn('"price":10.10000000', result.stdout)
         self.assertEqual(output[0]["ts"], 120001)
 
@@ -355,7 +473,7 @@ class FeedMockTests(unittest.TestCase):
         self.assertEqual([event["type"] for event in output], ["tick", "tick", "tick", "time"])
 
     def test_ping_payload_is_echoed_and_fragmented_text_works(self):
-        server = self.server([[('ping', b"synthetic-ping"), ("fragment", candle(120000))]])
+        server = self.server([[("ping", b"synthetic-ping"), ("fragment", candle(120000))]])
         output, _ = self.run_feed(server, extra=["--max-messages", "1"])
         self.assertEqual(len(output), 1)
         self.assertEqual(server.pongs, [b"synthetic-ping"])
@@ -367,7 +485,9 @@ class FeedMockTests(unittest.TestCase):
         self.assertGreaterEqual(server.connections, 2)
 
     def test_reconnect_changed_rest_overlap_stops_21(self):
-        server = self.server([[candle(120000), ("revise_rest", 120000), retirement()], [candle(180000)]])
+        server = self.server(
+            [[candle(120000), ("revise_rest", 120000), retirement()], [candle(180000)]]
+        )
         output, _ = self.run_feed(server, expected=21)
         self.assertEqual(len(output), 1)
 
@@ -384,6 +504,7 @@ class FeedMockTests(unittest.TestCase):
                 state = self.directory / "state"
                 if state.exists():
                     import shutil
+
                     shutil.rmtree(state)
                 self.run_feed(server, "ticks", expected=23)
 
@@ -392,7 +513,12 @@ class FeedMockTests(unittest.TestCase):
         server.fail_status = 451
         output, _ = self.run_feed(server, expected=23)
         self.assertEqual(output, [])
-        self.assertTrue(all(path in {"/stream", "/api/v3/klines", "/api/v3/exchangeInfo"} for path in server.requests))
+        self.assertTrue(
+            all(
+                path in {"/stream", "/api/v3/klines", "/api/v3/exchangeInfo"}
+                for path in server.requests
+            )
+        )
         self.assertEqual(server.auth_headers, [])
 
     def test_missing_rate_limit_metadata_is_refused(self):
@@ -424,7 +550,9 @@ class FeedMockTests(unittest.TestCase):
             message["data"]["k"]["T"] = minute + 59999
             messages.append(message)
         server = self.server([messages])
-        process = subprocess.Popen(self.command(server), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = subprocess.Popen(
+            self.command(server), stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
         try:
             if hasattr(fcntl, "F_SETPIPE_SZ"):
                 fcntl.fcntl(process.stdout.fileno(), fcntl.F_SETPIPE_SZ, 4096)
@@ -438,12 +566,18 @@ class FeedMockTests(unittest.TestCase):
                     if current_index != previous_index:
                         previous_index = current_index
                         stable_since = time.monotonic()
-                    elif 30 <= current_index < len(messages) and time.monotonic() - stable_since >= 0.4:
+                    elif (
+                        30 <= current_index < len(messages)
+                        and time.monotonic() - stable_since >= 0.4
+                    ):
                         break
                 self.assertIsNone(process.poll())
                 time.sleep(0.02)
             else:
-                self.fail(f"unread stdout did not stall before source exhaustion; committed={previous_index}")
+                self.fail(
+                    "unread stdout did not stall before source exhaustion; "
+                    f"committed={previous_index}"
+                )
             self.assertIsNone(process.poll())
             started = time.monotonic()
             process.send_signal(signal.SIGTERM)
@@ -469,6 +603,7 @@ class FeedMockTests(unittest.TestCase):
         output, _ = self.run_feed(server, extra=["--max-log-bytes", "4"], expected=22)
         self.assertEqual(output, [])
         import shutil
+
         shutil.rmtree(self.directory / "state")
         server = self.server([[trade(100)]])
         output, _ = self.run_feed(server, "ticks", ["--max-queue-bytes", "64"], expected=22)
@@ -476,7 +611,9 @@ class FeedMockTests(unittest.TestCase):
 
     def test_sigterm_then_resume_tail_has_no_gap_or_duplicate(self):
         server = self.server([[candle(120000)], [candle(120000), candle(240000)]])
-        process = subprocess.Popen(self.command(server), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        process = subprocess.Popen(
+            self.command(server), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
         cursor = self.directory / "state" / "cursor.json"
         deadline = time.monotonic() + 8
         while time.monotonic() < deadline:
@@ -491,7 +628,9 @@ class FeedMockTests(unittest.TestCase):
         stdout, stderr = process.communicate(timeout=5)
         self.assertEqual(process.returncode, 0, stderr)
         self.assertEqual(len(stdout.splitlines()), 1)
-        output, _ = self.run_feed(server, extra=["--output-from", "1", "--max-messages", "2"], resume=True)
+        output, _ = self.run_feed(
+            server, extra=["--output-from", "1", "--max-messages", "2"], resume=True
+        )
         self.assertEqual([event["bar"]["ts_open"] for event in output], [180000, 240000])
 
     def test_changed_committed_journal_is_refused(self):
@@ -506,10 +645,27 @@ class FeedMockTests(unittest.TestCase):
         server = self.server([[candle(240000)]])
         port = server.server_address[1]
         output = self.directory / "warmup.csv"
-        command = [BINARY, "warmup", "--venue", "binance", "--market", "spot", "--symbol", "TESTUSDT",
-                   "--start", "120000", "--end", "240000", "--output", str(output),
-                   "--rest-url", f"http://127.0.0.1:{port}", "--ws-url", f"ws://127.0.0.1:{port}",
-                   "--allow-insecure-http"]
+        command = [
+            BINARY,
+            "warmup",
+            "--venue",
+            "binance",
+            "--market",
+            "spot",
+            "--symbol",
+            "TESTUSDT",
+            "--start",
+            "120000",
+            "--end",
+            "240000",
+            "--output",
+            str(output),
+            "--rest-url",
+            f"http://127.0.0.1:{port}",
+            "--ws-url",
+            f"ws://127.0.0.1:{port}",
+            "--allow-insecure-http",
+        ]
         result = subprocess.run(command, capture_output=True, text=True, timeout=8)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "")

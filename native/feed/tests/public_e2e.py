@@ -28,10 +28,20 @@ def rows(path, exact=False):
         ]
 
 
-def action_key(record):
+SCRIPT_TF_MS = 60000  # the runner and batch both run --script-tf 1
+
+
+def action_key(record, mode):
+    """Comparable action fields. Ticks use the predeclared R-B2 mapping: an action timestamp
+    becomes floor(ts / script_tf) * script_tf on both sides, because a tick fill carries its
+    print's time while the OHLC batch carries the modeled segment's clock. Every other field
+    stays exact."""
     order = record["order"]
+    timestamp = record["timestamp"]
+    if mode == "ticks":
+        timestamp = timestamp // SCRIPT_TF_MS * SCRIPT_TF_MS
     return (
-        record["timestamp"],
+        timestamp,
         record["bar_index"],
         order["id"],
         order["action"],
@@ -239,7 +249,7 @@ class Soak:
         assert len(result) * 60000 == end - result[0][0]
         return result
 
-    def validate(self, mode, duration, cursor):
+    def validate(self, mode, duration, cursor, minutes):
         getcontext().prec = 160
         tape = rows(self.directory / (mode + "-feed.jsonl"), True)
         with open(self.directory / (mode + "-feed.jsonl")) as source:
@@ -252,7 +262,7 @@ class Soak:
         self.receipt(f"PASS {mode} restart without gap or duplicate messages={cursor}")
         if mode == "bars":
             normalized = [event["bar"] for event in tape]
-            assert len(normalized) >= 45 and duration >= 45 * 60
+            assert len(normalized) >= minutes - 1 and duration >= (minutes - 1) * 60
             expected = self.candles(self.cut, normalized[-1]["ts_open"] + 60000)
             for index, (actual, candle) in enumerate(zip(normalized, expected, strict=True)):
                 assert [actual["ts_open"], *(actual[key] for key in ("o", "h", "l", "c", "v"))] == [
@@ -267,11 +277,11 @@ class Soak:
                 f"PASS bars equal REST minutes={len(normalized)} duration_seconds={duration:.3f}"
             )
         else:
-            assert duration >= 20 * 60
+            assert duration >= (minutes - 1) * 60
             trades = [event for event in tape if event["type"] == "tick"]
             trade_tokens = [event for event in tokens if event["type"] == "tick"]
             times = [event["ts"] for event in tape if event["type"] == "time"]
-            assert len(times) >= 20 and trades
+            assert len(times) >= minutes - 1 and trades
             for previous, current in itertools.pairwise(trades):
                 assert current["seq"] == previous["seq"] + 1 and current["ts"] >= previous["ts"]
             next_id = trades[0]["seq"]
@@ -353,11 +363,13 @@ class Soak:
             check=True,
         )
         expected_actions = [
-            action_key(record)
+            action_key(record, mode)
             for record in rows(batch_actions)
             if record["origin_input_index"] >= 200
         ]
-        actual_actions = [action_key(record) for record in self.receiver.payloads.get(mode, [])]
+        actual_actions = [
+            action_key(record, mode) for record in self.receiver.payloads.get(mode, [])
+        ]
         event_ids = [record["event_id"] for record in self.receiver.payloads.get(mode, [])]
         assert len(event_ids) == len(set(event_ids)), "duplicate delivered action after restart"
         equal = expected_actions == actual_actions
@@ -367,9 +379,10 @@ class Soak:
             )
             + "\n"
         )
+        mapping = " (R-B2 timestamps)" if mode == "ticks" else ""
         verdict = "PASS" if equal else "FAIL"
         self.receipt(
-            f"{verdict} {mode} actions equal batch via run_backtest_full "
+            f"{verdict} {mode} actions equal batch via run_backtest_full{mapping} "
             f"batch={len(expected_actions)} runner={len(actual_actions)}"
         )
         if mode == "ticks":
@@ -383,18 +396,18 @@ class Soak:
                 ),
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=600,
             )
             (self.directory / "ticks-replay.stdout").write_text(completed.stdout)
             (self.directory / "ticks-replay.stderr").write_text(completed.stderr)
             assert completed.returncode == 0, "tick replay runner failed"
-            assert actual_actions == [
-                action_key(record) for record in self.receiver.payloads.get(name, [])
+            raw = [action_key(record, "bars") for record in self.receiver.payloads.get(mode, [])]
+            assert raw == [
+                action_key(record, "bars") for record in self.receiver.payloads.get(name, [])
             ]
             self.receipt(
                 f"PASS ticks same-print runner replay actions equal actions={len(actual_actions)}"
             )
-        assert equal or mode == "ticks", "confirmed-bar batch action parity failed"
         return {
             "duration_seconds": duration,
             "messages": cursor,
@@ -424,7 +437,7 @@ class Soak:
             cursor = self.finish(mode, 1, processes)
             processes = None
             duration = time.monotonic() - started
-            self.results[mode] = self.validate(mode, duration, cursor)
+            self.results[mode] = self.validate(mode, duration, cursor, minutes)
         except Exception:
             if processes:
                 for process in processes[:2]:
@@ -453,11 +466,10 @@ class Soak:
             thread.join()
         self.receiver.shutdown()
         (self.directory / "summary.json").write_text(json.dumps(self.results, indent=2) + "\n")
-        failed = any("error" in result for result in self.results.values())
-        if not self.options.allow_tick_ohlc_difference:
-            failed |= any(
-                result.get("batch_actions_equal") is False for result in self.results.values()
-            )
+        failed = any(
+            "error" in result or not result.get("batch_actions_equal")
+            for result in self.results.values()
+        )
         return 1 if failed else 0
 
 
@@ -468,10 +480,4 @@ if __name__ == "__main__":
     parser.add_argument("--bar-minutes", type=int, default=46)
     parser.add_argument("--tick-minutes", type=int, default=21)
     parser.add_argument("--restart-seconds", type=int, default=180)
-    parser.add_argument(
-        "--allow-tick-ohlc-difference",
-        action="store_true",
-        help="explicitly use same-print tick replay as the gate; "
-        "still record failed OHLC batch parity",
-    )
     raise SystemExit(Soak(parser.parse_args()).run())

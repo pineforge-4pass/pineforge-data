@@ -19,7 +19,7 @@ import unittest
 import urllib.parse
 from types import SimpleNamespace
 
-from public_e2e import Soak
+from public_e2e import Soak, action_key
 
 BINARY = str(pathlib.Path(sys.argv[1]).resolve())
 sys.argv = [sys.argv[0]]
@@ -335,26 +335,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 class FeedMockTests(unittest.TestCase):
-    def test_public_qualification_requires_explicit_tick_ohlc_exception(self):
-        for allow, expected in ((False, 1), (True, 0)):
+    def test_public_qualification_fails_on_any_action_difference(self):
+        for ticks_equal, expected in ((False, 1), (True, 0)):
             soak = Soak.__new__(Soak)
-            soak.options = SimpleNamespace(
-                allow_tick_ohlc_difference=allow, bar_minutes=46, tick_minutes=21
-            )
-            soak.directory = self.directory / str(allow)
+            soak.options = SimpleNamespace(bar_minutes=21, tick_minutes=21)
+            soak.directory = self.directory / str(ticks_equal)
             soak.directory.mkdir()
             soak.results = {}
             soak.receiver = SimpleNamespace(shutdown=lambda: None)
             soak.warmup = lambda: None
-            soak.live = lambda mode, minutes, soak=soak: soak.results.update(
-                {mode: {"batch_actions_equal": mode == "bars"}}
+            soak.live = lambda mode, minutes, equal=ticks_equal, soak=soak: soak.results.update(
+                {mode: {"batch_actions_equal": mode == "bars" or equal}}
             )
             self.assertEqual(soak.run(), expected)
-            self.assertFalse(
-                json.loads((soak.directory / "summary.json").read_text())["ticks"][
-                    "batch_actions_equal"
-                ]
-            )
+
+    def test_r_b2_maps_only_tick_action_timestamps(self):
+        record = {
+            "timestamp": 1791037920021,
+            "bar_index": 7,
+            "order": {
+                "id": "long",
+                "action": "entry",
+                "leg": "long",
+                "contracts": 1.0,
+                "price": 84816.0,
+                "reduce_only": False,
+                "entry_incarnation": 1,
+            },
+        }
+        batch = dict(record, timestamp=1791037920000)
+        self.assertEqual(action_key(record, "ticks"), action_key(batch, "ticks"))
+        self.assertNotEqual(action_key(record, "bars"), action_key(batch, "bars"))
+        moved = dict(record, order=dict(record["order"], price=84816.5))
+        self.assertNotEqual(action_key(moved, "ticks"), action_key(batch, "ticks"))
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="pineforge-feed-mock-")

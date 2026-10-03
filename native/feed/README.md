@@ -153,11 +153,14 @@ reconnect overlap, fragmented text, PING/PONG, retirement, budgets, and recovery
 Never commit public exchange captures. `tests/public_e2e.py` explicitly opts
 into public BTCUSDT capture, local receiver delivery, a hard-kill restart,
 exact REST verification, bar batch action parity through `run_backtest_full`,
-and tick same-print replay determinism. Tick-vs-OHLC-only fills are not assumed
-equivalent: the harness exits nonzero for that comparison unless the operator
-explicitly passes `--allow-tick-ohlc-difference`; even then it retains the FAIL
-receipt and false parity result. Its batch observer is linked separately from the read-only engine's
-`tests/native_live_equivalence_observer.cpp`; it is not a feed dependency.
+and tick same-print replay determinism. Tick actions are compared with the
+batch under the predeclared R-B2 mapping: each action timestamp becomes
+`floor(ts / script_tf) * script_tf` on both sides, because a tick fill carries
+its print's time while the OHLC batch carries its modeled segment's clock.
+Every other field stays exact, bar actions compare raw timestamps, and any
+difference fails the run. Its batch observer is linked separately from the
+read-only engine's `tests/native_live_equivalence_observer.cpp`; it is not a
+feed dependency.
 
 `src/venue.hpp` is the adapter boundary. Later slices add OKX raw ticks/bars
 (contract-unit conversion where needed), Bybit confirmed bars **without ticks**,

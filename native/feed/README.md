@@ -11,7 +11,7 @@ subcommand yet.
 | `--venue` `--market` | Example `--symbol` | `bars` (confirmed 1m) | Ticks |
 |---|---|---|---|
 | `binance spot` | `BTCUSDT` | `kline_1m`, `x=true` | `ticks`: raw `trade`, ID+1, healed by `historicalTrades` |
-| `binance usdm` | `BTCUSDT` | routed `/market` `kline_1m`, `x=true` | `agg-ticks` only: aggregate prints, healed by `aggTrades` within 48 h |
+| `binance usdm` | `BTCUSDT` | routed `/market` `kline_1m`, `x=true` | `agg-ticks` only: aggregate prints, healed by `aggTrades` within 48 h; the bars built from them can differ from Binance klines at minute edges (use `bars` for kline-exact bars) |
 | `okx spot` | `BTC-USDT` | `candle1m`, confirm `"1"` | `ticks`: `trades-all`, ID+1, healed by `history-trades` within 3 months |
 | `okx swap` | `BTC-USDT-SWAP` | `candle1m`, confirm `"1"`, base volume | `ticks`: `trades-all`, base quantities |
 | `bybit spot`, `bybit linear` | `BTCUSDT` | `kline.1`, `confirm=true` | refused |
@@ -94,8 +94,12 @@ trailing zeros. Fixed-point string arithmetic reconciles OHLCV; no price or
 quantity enters a binary float. Bounds are 96 token characters, 32 fractional
 digits, and 128 arithmetic digits. Invalid/zero tick quantities fail closed.
 Overlap, duplicate and revision checks compare exact decimal **values**, not
-lexemes: OKX renders one candle price as `84850.0` on its WebSocket and as
-`84850` over REST, which is not a revision; any change of value still is.
+lexemes: OKX can render one candle price as `100.0` on its WebSocket and as
+`100` over REST, which is not a revision; any change of value still is.
+A message carries the token of the source that delivered it, so a bar healed
+from REST can differ in bytes from the same bar received on the WebSocket, and
+two feeds of one instrument can differ in bytes. The values are equal, a
+journal replay is byte-identical, and the feed never canonicalises a token.
 
 ### Units
 
@@ -104,7 +108,7 @@ volume is in **base** units. OKX swap `sz` and candle `vol` are contracts: the
 feed multiplies them exactly (decimal arithmetic, never float) by the
 instrument's `ctVal` x `ctMult` from the public instruments endpoint, which must
 be a live linear swap with `ctValCcy` equal to the base currency. For
-`BTC-USDT-SWAP`, 1.64 contracts are emitted as `0.0164`. A converted quantity is
+`BTC-USDT-SWAP`, 2.75 contracts are emitted as `0.0275`. A converted quantity is
 the canonical product (no trailing fractional zeros); every other token is the
 venue's own. The multiplier is bound into the cursor and the warmup manifest;
 a resume with a changed multiplier stops with 21.
@@ -149,7 +153,10 @@ and `n` count raw trades, not aggregates), so a minute `M` closes with
    at or after the start (REST can trail the newest prints, and prints of one
    millisecond need not come back in ID order); USD-M takes the first
    aggregate at or after the start within the next hour and the one before it.
-   Until both sides are visible nothing is anchored and the feed stops with 20;
+   Nothing is anchored, and no minute closes, until both sides are visible. A
+   quiet start waits for the first print (one REST read per closed minute);
+   once a WebSocket print exists, REST must show it within about 15 seconds,
+   or the feed stops with 20;
 2. the fence: the next print in that chain has a matched time at or after
    `M + 60000`, so no further print of `M` can exist (matched time never goes
    backwards along the chain; if it does, the feed stops with 23);
@@ -158,11 +165,10 @@ and `n` count raw trades, not aggregates), so a minute `M` closes with
    its per-row confirm `"1"`);
 4. for OKX raw prints, exact OHLC and volume equality between the minute's
    prints and that candle. USD-M aggregate prints skip this step: an aggregate
-   is dated by its trade time and never split, and one can hold a fill that
-   Binance's kline counts in the next minute (observed live: one 0.003 BTC fill
-   moved between two consecutive klines while every aggregate equalled
-   `aggTrades`), so the kline is not their exact sum. Their completeness rests
-   on conditions 1 and 2, and the kline only marks the minute closed.
+   is dated by its first fill and never split, and one can hold a fill that
+   Binance's kline counts in the next minute, so the kline is not their exact
+   sum (see "Binance USD-M"). Their completeness rests on conditions 1 and 2,
+   and the kline only marks the minute closed.
 
 A candle without the fence never closes a minute, and the fence without the
 candle waits. A quiet OKX minute closes on the same fence when its candle shows
@@ -183,7 +189,9 @@ the healed prefix. Ticks never come from the aggregated `trades` channel: a
 push on it, or any print carrying `count`, stops with 23. The feed sends text
 `ping` every `--keepalive-seconds` (default 20, at most 25: OKX closes a
 connection after 30 seconds without traffic) and treats `pong` as control,
-never data; a `notice` event (service upgrade) reconnects with overlap.
+never data; a `notice` event (service upgrade) reconnects with overlap. Every
+connection re-reads the instrument: a changed `ctVal x ctMult` stops with 21,
+since quantities already emitted were converted with the old one.
 
 ### Bybit
 
@@ -192,7 +200,9 @@ A push can carry the minute that just closed (`confirm=true`) and the next
 forming one; only the confirmed row is a bar. REST klines arrive newest first
 and a range wider than `limit` keeps only its newest rows, so each request asks
 for exactly the rows it can hold and the reversed rows must be contiguous. The
-feed sends `{"op":"ping"}` every `--keepalive-seconds`.
+feed sends `{"op":"ping"}` every `--keepalive-seconds`. Bybit answers HTTP 403
+for its IP rate ban (about ten minutes); the feed stops with 20 there, so a
+supervised restart retries after the ban.
 
 ### Binance USD-M
 
@@ -209,6 +219,24 @@ USD-M `exchangeInfo` exceeds the 1 MiB JSON
 bound, so only its top-level `rateLimits` member is extracted (4 MiB body cap)
 and parsed; requests then spend at most half of the published weight ceiling.
 
+**Bars built from `agg-ticks` are not Binance klines.** An aggregate is dated
+by its first fill and never split, so one of its fills can belong to the next
+minute's kline. The runner builds its bars from the prints, so at those minute
+edges its bars, and the fills and indicators that depend on them, can differ
+from Binance klines, from a backtest on klines, and from `--mode bars`. Use
+`--mode bars` when bars must equal Binance klines. In 120 consecutive
+BTCUSDT minutes (2026-10-03, every aggregate re-read from `aggTrades`), 6
+minutes (5%) differed, always in pairs where one fill moves into the next
+minute: that minute's open is off by one tick (0.10) and both volumes by the
+fill (0.002-0.011 BTC); close, high and low never differed, and no print lay
+outside its own minute's kline range. In one live run, a short entry signalled
+at a minute's close filled at the next minute's first print, 84,662.40; that
+minute's kline opened at 84,662.50, the price of the fill that moved, so a
+backtest on klines fills one tick away. A backtest on the bars built from the
+same prints equals the runner. The matching backtest for an `agg-ticks`
+deployment is therefore a backtest on prints-built 1m bars; slice 3 of the feed
+adds the export of those bars.
+
 The subscribed data streams are strict: another event type on them, a
 malformed trade or kline, or an unknown shape stops with 23 (on every venue). An event outside
 the data streams with an unknown type (a new venue notice) is logged as a
@@ -221,7 +249,7 @@ data, so a silent data stream still reconnects. Reconnect occurs on
 `serverShutdown` or an OKX `notice`, transport loss/75 seconds without data, or
 at 23h55 (before the 24-hour Binance limit). The reader buffers during REST healing. Every new
 connection re-fetches up to 1000 raw prints and 32 closed-bar proofs, requires
-exact token/ID/time overlap, then continues the same stream epoch and sequence.
+exact value/ID/time overlap, then continues the same stream epoch and sequence.
 A venue's REST row for the minute that just closed can trail its WebSocket
 close by a second or more (observed on USD-M at a restart): a disagreement must
 survive three spaced re-reads (about 7 seconds) before it stops with 21, and
@@ -342,9 +370,9 @@ each bounded by `--max-replay-seconds`.
 75 seconds without any data message forces a reconnect, and each reconnect
 costs an overlap check (on Binance spot a weight-27 `historicalTrades` page and
 `klines` call). On Binance spot a minute without a print cannot be fenced, so
-tick mode stops with 20 there, and again on every resume. OKX and USD-M close a
-quiet minute on the next-print fence and its zero-volume candle, but the
-runner then sees a `time` event with no print in that minute. Use bars mode for
+tick mode stops with 20 there, and again on every resume. OKX closes a quiet
+minute on the next-print fence and its zero-volume candle, USD-M on the fence
+alone; the runner then sees a `time` event with no print in that minute. Use bars mode for
 symbols that can go quiet for a minute.
 
 ### Restart policy
@@ -369,7 +397,11 @@ Never commit public exchange captures. `tests/public_e2e.py --venue V --market
 M --symbol S --modes bars,ticks|agg-ticks` explicitly opts into a public
 capture of one venue, local receiver delivery, a hard-kill restart, exact REST
 verification (OKX candle values; lexemes elsewhere), bar batch action parity
-through `run_backtest_full`, and tick same-print replay determinism. Tick actions are compared with the
+through `run_backtest_full`, and tick same-print replay determinism. For tick
+modes the batch replays 1m bars built from the feed's own prints (the tape),
+not venue candles; for `agg-ticks` the receipt also reports how many minutes
+differ from Binance klines (`kline_differs`) and how a batch over those klines
+compares with the runner. Tick actions are compared with the
 batch under the predeclared R-B2 mapping: each action timestamp becomes
 `floor(ts / script_tf) * script_tf` on both sides, because a tick fill carries
 its print's time while the OHLC batch carries its modeled segment's clock.

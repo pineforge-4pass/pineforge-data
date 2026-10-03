@@ -24,8 +24,8 @@ struct Connection {
 };
 // How a tick minute is proven complete before its `time` event.
 // KlineIdRange: the closed kline names the minute's raw-ID range and count (Binance spot).
-// NextPrintFence: the contiguous ID chain reaches a print of a later minute, and the minute's confirmed
-// candle reconciles exactly with the prints (OKX trades-all, Binance USD-M aggregate prints).
+// NextPrintFence: the contiguous ID chain reaches a print of a later minute and the venue has closed the
+// minute (OKX trades-all, Binance USD-M aggregate prints); raw prints must also equal that candle exactly.
 enum class TickProof { KlineIdRange, NextPrintFence };
 
 class Venue {

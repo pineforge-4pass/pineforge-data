@@ -544,6 +544,8 @@ class Soak:
             f"batch={len(expected_actions)} runner={len(actual_actions)} "
             f"after_last_proven_minute={trailing}"
         )
+        if mode != "bars" and not self.venue.candle_is_print_sum:
+            self.kline_batch(mode, normalized, actual_actions, len(differing))
         if mode != "bars":
             name = mode + "-replay"
             completed = subprocess.run(
@@ -573,6 +575,34 @@ class Soak:
             "actions_after_last_proven_minute": trailing,
             "batch_actions_equal": equal,
         }
+
+    def kline_batch(self, mode, normalized, actual_actions, kline_differs):
+        """Information, not a gate: the same strategy over Binance klines instead of the bars built
+        from the prints. Aggregates can straddle a minute edge, so fills there can differ."""
+        candles = self.venue.candles(self.cut, normalized[-1]["ts_open"] + 60000)
+        combined = self.directory / (mode + "-kline-combined.csv")
+        with open(combined, "w") as output:
+            output.write((self.directory / "warmup.csv").read_text())
+            for candle in candles:
+                output.write(",".join([str(candle[0]), *candle[1]]) + "\n")
+        actions = self.directory / (mode + "-kline-batch-actions.jsonl")
+        subprocess.run(
+            [self.options.batch_probe, self.options.observed_strategy, str(combined), str(actions)],
+            check=True,
+        )
+        expected = [
+            action_key(record, mode)
+            for record in rows(actions)
+            if record["origin_input_index"] >= 200
+        ]
+        differ = sum(
+            1 for left, right in zip(expected, actual_actions, strict=False) if left != right
+        )
+        differ += abs(len(expected) - len(actual_actions))
+        self.receipt(
+            f"INFO {mode} batch over Binance klines: actions={len(expected)} "
+            f"differ_from_runner={differ} kline_differs={kline_differs}"
+        )
 
     def live(self, mode, minutes):
         processes = None

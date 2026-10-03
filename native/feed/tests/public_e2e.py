@@ -38,7 +38,7 @@ def action_key(record, mode):
     stays exact."""
     order = record["order"]
     timestamp = record["timestamp"]
-    if mode == "ticks":
+    if mode != "bars":
         timestamp = timestamp // SCRIPT_TF_MS * SCRIPT_TF_MS
     return (
         timestamp,
@@ -59,6 +59,138 @@ def proven_actions(records, mode, window):
     actions in the runner, and those have no batch counterpart."""
     inside = [action_key(record, mode) for record in records if record["bar_index"] < window]
     return inside, len(records) - len(inside)
+
+
+AGENT = {"User-Agent": "pineforge-feed-qualification/0.1"}
+
+
+def canonical(value):
+    """The feed's contract-to-base token: fixed point, no exponent, no trailing fractional zeros."""
+    return format(value.normalize(), "f")
+
+
+# (venue, market) -> public REST origin, the feed's tick mode (none for Bybit), runner label
+PROFILES = {
+    ("binance", "spot"): ("https://api.binance.com", "ticks", "BINANCE:{}"),
+    ("binance", "usdm"): ("https://fapi.binance.com", "agg-ticks", "BINANCE:{}.P"),
+    ("okx", "spot"): ("https://www.okx.com", "ticks", "OKX:{}"),
+    ("okx", "swap"): ("https://www.okx.com", "ticks", "OKX:{}"),
+    ("bybit", "spot"): ("https://api.bybit.com", None, "BYBIT:{}"),
+    ("bybit", "linear"): ("https://api.bybit.com", None, "BYBIT:{}.P"),
+}
+
+
+class Venue:
+    """Public REST truth for one venue and market, in the feed's normalized units."""
+
+    def __init__(self, venue, market, symbol):
+        self.venue, self.market, self.symbol = venue, market, symbol
+        self.rest, self.tick_mode, label = PROFILES[(venue, market)]
+        self.label = label.format(symbol)
+        self.lock = threading.Lock()
+        self.multiplier = Decimal(1)
+        if venue == "okx" and market == "swap":
+            row = self.fetch("/api/v5/public/instruments", {"instType": "SWAP", "instId": symbol})[
+                "data"
+            ][0]
+            assert row["ctType"] == "linear"
+            self.multiplier = Decimal(row["ctVal"]) * Decimal(row["ctMult"])
+
+    def fetch(self, path, query, weight=2):
+        with self.lock:
+            time.sleep(weight / 10)
+            url = self.rest + path + "?" + urllib.parse.urlencode(query)
+            request = urllib.request.Request(url, headers=AGENT)
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.loads(response.read(), parse_float=Decimal)
+
+    def quantity(self, token):
+        return token if self.multiplier == 1 else canonical(Decimal(token) * self.multiplier)
+
+    def candles(self, start, end):
+        """Closed 1m candles in [start, end): ts, the five tokens and the raw-trade count when the
+        feed's tick proof uses it (Binance spot only)."""
+        result = []
+        while start < end:
+            if self.venue == "okx":
+                page = self.fetch(
+                    "/api/v5/market/history-candles",
+                    {
+                        "instId": self.symbol,
+                        "bar": "1m",
+                        "after": min(end, start + 100 * 60000),
+                        "before": start - 1,
+                        "limit": 100,
+                    },
+                )["data"][::-1]
+                assert all(row[8] == "1" for row in page), "unconfirmed REST candle"
+                page = [(int(row[0]), [*row[1:5], self.quantity(row[5])], None) for row in page]
+            elif self.venue == "bybit":
+                count = min(1000, (end - start) // 60000)
+                page = self.fetch(
+                    "/v5/market/kline",
+                    {
+                        "category": self.market,
+                        "symbol": self.symbol,
+                        "interval": 1,
+                        "start": start,
+                        "end": start + (count - 1) * 60000,
+                        "limit": count,
+                    },
+                )["result"]["list"][::-1]
+                page = [(int(row[0]), row[1:6], None) for row in page]
+            else:
+                path = "/fapi/v1/klines" if self.market == "usdm" else "/api/v3/klines"
+                page = self.fetch(
+                    path,
+                    {
+                        "symbol": self.symbol,
+                        "interval": "1m",
+                        "startTime": start,
+                        "endTime": end - 1,
+                        "limit": 1000,
+                    },
+                    5,
+                )
+                spot = self.market == "spot"
+                page = [(row[0], row[1:6], row[8] if spot else None) for row in page]
+            assert page and page[0][0] == start, "REST minute missing"
+            result += page
+            start = page[-1][0] + 60000
+        assert [row[0] for row in result] == list(range(result[0][0], end, 60000))
+        return result
+
+    def prints(self, first):
+        """One REST page of contiguous prints from `first`: id, ts and the price/qty tokens."""
+        if self.venue == "okx":
+            page = self.fetch(
+                "/api/v5/market/history-trades",
+                {
+                    "instId": self.symbol,
+                    "type": 1,
+                    "after": first + 100,
+                    "before": first - 1,
+                    "limit": 100,
+                },
+            )["data"][::-1]
+            page = [
+                (int(row["tradeId"]), int(row["ts"]), row["px"], self.quantity(row["sz"]))
+                for row in page
+            ]
+        elif self.market == "usdm":
+            page = self.fetch(
+                "/fapi/v1/aggTrades", {"symbol": self.symbol, "fromId": first, "limit": 1000}, 20
+            )
+            page = [(row["a"], row["T"], row["p"], row["q"]) for row in page]
+        else:
+            page = self.fetch(
+                "/api/v3/historicalTrades",
+                {"symbol": self.symbol, "fromId": first, "limit": 1000},
+                25,
+            )
+            page = [(row["id"], row["time"], row["price"], row["qty"]) for row in page]
+        assert page and page[0][0] == first, "REST print page missing"
+        return page
 
 
 class Receiver(http.server.ThreadingHTTPServer):
@@ -94,6 +226,7 @@ class ReceiverHandler(http.server.BaseHTTPRequestHandler):
 class Soak:
     def __init__(self, options):
         self.options = options
+        self.venue = Venue(options.venue, options.market, options.symbol)
         self.directory = pathlib.Path(options.directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=False)
         self.receiver = Receiver(self.directory)
@@ -118,13 +251,13 @@ class Soak:
             "--feed",
             source,
             "--mode",
-            mode,
+            "bars" if mode == "bars" else "ticks",
             "--script-tf",
             "1",
             "--ledger",
             str(ledger),
             "--symbol",
-            "BINANCE:BTCUSDT",
+            self.venue.label,
             "--name",
             "public-rsi-qualification",
             "--webhook-url",
@@ -140,11 +273,11 @@ class Soak:
             self.options.feed,
             "warmup",
             "--venue",
-            "binance",
+            self.venue.venue,
             "--market",
-            "spot",
+            self.venue.market,
             "--symbol",
-            "BTCUSDT",
+            self.venue.symbol,
             "--start",
             str(self.cut - 200 * 60000),
             "--end",
@@ -167,11 +300,11 @@ class Soak:
             self.options.feed,
             "run",
             "--venue",
-            "binance",
+            self.venue.venue,
             "--market",
-            "spot",
+            self.venue.market,
             "--symbol",
-            "BTCUSDT",
+            self.venue.symbol,
             "--mode",
             mode,
             "--state-dir",
@@ -232,31 +365,6 @@ class Soak:
         summary = json.loads((self.directory / f"{mode}-runner-{generation}.stdout").read_text())
         return summary["inputs_committed"]
 
-    def fetch(self, path, query, weight=2):
-        time.sleep(weight / 10)
-        url = "https://api.binance.com" + path + "?" + urllib.parse.urlencode(query)
-        with urllib.request.urlopen(url, timeout=30) as response:
-            return json.loads(response.read(), parse_float=Decimal)
-
-    def candles(self, start, end):
-        result = []
-        while start < end:
-            page = self.fetch(
-                "/api/v3/klines",
-                {
-                    "symbol": "BTCUSDT",
-                    "interval": "1m",
-                    "startTime": start,
-                    "endTime": end - 1,
-                    "limit": 1000,
-                },
-            )
-            assert page and page[0][0] == start, "REST minute missing"
-            result += page
-            start = page[-1][0] + 60000
-        assert len(result) * 60000 == end - result[0][0]
-        return result
-
     def validate(self, mode, duration, cursor, minutes):
         getcontext().prec = 160
         tape = rows(self.directory / (mode + "-feed.jsonl"), True)
@@ -271,16 +379,19 @@ class Soak:
         if mode == "bars":
             normalized = [event["bar"] for event in tape]
             assert len(normalized) >= minutes - 1 and duration >= (minutes - 1) * 60
-            expected = self.candles(self.cut, normalized[-1]["ts_open"] + 60000)
+            expected = self.venue.candles(self.cut, normalized[-1]["ts_open"] + 60000)
             for index, (actual, candle) in enumerate(zip(normalized, expected, strict=True)):
                 assert [actual["ts_open"], *(actual[key] for key in ("o", "h", "l", "c", "v"))] == [
                     candle[0],
-                    *(Decimal(candle[index]) for index in range(1, 6)),
+                    *(Decimal(token) for token in candle[1]),
                 ], "bar REST mismatch"
                 assert tape[index]["type"] == "bar"
-                assert [tokens[index]["bar"][key] for key in ("o", "h", "l", "c", "v")] == candle[
-                    1:6
-                ], "bar decimal tokens changed"
+                # OKX renders one candle number differently on its WebSocket ("84850.0") and REST
+                # ("84850"); values are compared exactly above, lexemes only where they agree.
+                if self.venue.venue != "okx":
+                    assert [
+                        tokens[index]["bar"][key] for key in ("o", "h", "l", "c", "v")
+                    ] == candle[1], "bar decimal tokens changed"
             self.receipt(
                 f"PASS bars equal REST minutes={len(normalized)} duration_seconds={duration:.3f}"
             )
@@ -295,29 +406,23 @@ class Soak:
             next_id = trades[0]["seq"]
             trade_offset = 0
             while trade_offset < len(trades):
-                page = self.fetch(
-                    "/api/v3/historicalTrades",
-                    {"symbol": "BTCUSDT", "fromId": next_id, "limit": 1000},
-                    25,
-                )
-                assert page and page[0]["id"] == next_id
-                for raw in page:
+                for identifier, matched, price, quantity in self.venue.prints(next_id):
                     if trade_offset == len(trades):
                         break
                     tick = trades[trade_offset]
                     assert [tick["seq"], tick["ts"], tick["price"], tick["qty"]] == [
-                        raw["id"],
-                        raw["time"],
-                        Decimal(raw["price"]),
-                        Decimal(raw["qty"]),
-                    ], "raw REST mismatch"
+                        identifier,
+                        matched,
+                        Decimal(price),
+                        Decimal(quantity),
+                    ], "print REST mismatch"
                     assert [trade_tokens[trade_offset][key] for key in ("price", "qty")] == [
-                        raw["price"],
-                        raw["qty"],
-                    ], "raw decimal tokens changed"
+                        price,
+                        quantity,
+                    ], "print decimal tokens changed"
                     trade_offset += 1
                     next_id += 1
-            expected = self.candles(self.cut, times[-1])
+            expected = self.venue.candles(self.cut, times[-1])
             normalized = []
             minute_trades = []
             minute = self.cut
@@ -327,9 +432,10 @@ class Soak:
                     minute_trades.append(event)
                 else:
                     assert event["type"] == "time" and event["ts"] == minute + 60000
-                    raw = expected[len(normalized)]
+                    candle = expected[len(normalized)]
                     prices = [tick["price"] for tick in minute_trades]
-                    assert prices and len(prices) == raw[8]
+                    assert prices, "a proven minute without prints"
+                    assert candle[2] is None or len(prices) == candle[2], "time count mismatch"
                     values = [
                         prices[0],
                         max(prices),
@@ -337,9 +443,7 @@ class Soak:
                         prices[-1],
                         sum(tick["qty"] for tick in minute_trades),
                     ]
-                    assert values == [Decimal(raw[index]) for index in range(1, 6)], (
-                        "time OHLCV mismatch"
-                    )
+                    assert values == [Decimal(token) for token in candle[1]], "time OHLCV mismatch"
                     normalized.append(
                         dict(
                             zip(
@@ -350,7 +454,7 @@ class Soak:
                     minute += 60000
                     minute_trades = []
             self.receipt(
-                f"PASS ticks contiguous and time events equal REST ticks={len(trades)} "
+                f"PASS {mode} contiguous and time events equal REST ticks={len(trades)} "
                 f"minutes={len(times)} duration_seconds={duration:.3f}"
             )
         combined = self.directory / (mode + "-combined.csv")
@@ -387,34 +491,34 @@ class Soak:
             )
             + "\n"
         )
-        mapping = " (R-B2 timestamps)" if mode == "ticks" else ""
+        mapping = " (R-B2 timestamps)" if mode != "bars" else ""
         verdict = "PASS" if equal else "FAIL"
         self.receipt(
             f"{verdict} {mode} actions equal batch via run_backtest_full{mapping} "
             f"batch={len(expected_actions)} runner={len(actual_actions)} "
             f"after_last_proven_minute={trailing}"
         )
-        if mode == "ticks":
-            name = "ticks-replay"
+        if mode != "bars":
+            name = mode + "-replay"
             completed = subprocess.run(
                 self.runner_command(
                     mode,
                     name,
-                    self.directory / "ticks-replay.sqlite3",
-                    str(self.directory / "ticks-feed.jsonl"),
+                    self.directory / (name + ".sqlite3"),
+                    str(self.directory / (mode + "-feed.jsonl")),
                 ),
                 capture_output=True,
                 text=True,
                 timeout=600,
             )
-            (self.directory / "ticks-replay.stdout").write_text(completed.stdout)
-            (self.directory / "ticks-replay.stderr").write_text(completed.stderr)
+            (self.directory / (name + ".stdout")).write_text(completed.stdout)
+            (self.directory / (name + ".stderr")).write_text(completed.stderr)
             assert completed.returncode == 0, "tick replay runner failed"
             raw = [action_key(record, "bars") for record in self.receiver.payloads.get(mode, [])]
             assert raw == [
                 action_key(record, "bars") for record in self.receiver.payloads.get(name, [])
             ]
-            self.receipt(f"PASS ticks same-print runner replay actions equal actions={len(raw)}")
+            self.receipt(f"PASS {mode} same-print runner replay actions equal actions={len(raw)}")
         return {
             "duration_seconds": duration,
             "messages": cursor,
@@ -429,7 +533,10 @@ class Soak:
         try:
             started = time.monotonic()
             processes = self.generation(mode, 0, 0)
-            self.receipt(f"START {mode} public BTCUSDT cut={self.cut} minimum_minutes={minutes}")
+            self.receipt(
+                f"START {mode} public {self.venue.venue} {self.venue.market} {self.venue.symbol} "
+                f"cut={self.cut} minimum_minutes={minutes}"
+            )
             time.sleep(self.options.restart_seconds)
             assert processes[0].poll() is None and processes[1].poll() is None, (
                 "process stopped before restart"
@@ -465,8 +572,14 @@ class Soak:
     def run(self):
         self.warmup()
         threads = [
-            threading.Thread(target=self.live, args=("bars", self.options.bar_minutes)),
-            threading.Thread(target=self.live, args=("ticks", self.options.tick_minutes)),
+            threading.Thread(
+                target=self.live,
+                args=(
+                    mode,
+                    self.options.bar_minutes if mode == "bars" else self.options.tick_minutes,
+                ),
+            )
+            for mode in self.options.modes.split(",")
         ]
         for thread in threads:
             thread.start()
@@ -485,6 +598,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     for argument in ("feed", "runner", "strategy", "observed-strategy", "batch-probe", "directory"):
         parser.add_argument("--" + argument, required=True)
+    parser.add_argument("--venue", default="binance")
+    parser.add_argument("--market", default="spot")
+    parser.add_argument("--symbol", default="BTCUSDT")
+    parser.add_argument(
+        "--modes", default="bars,ticks", help="bars, ticks or agg-ticks, comma-separated"
+    )
     parser.add_argument("--bar-minutes", type=int, default=46)
     parser.add_argument("--tick-minutes", type=int, default=21)
     parser.add_argument("--restart-seconds", type=int, default=180)

@@ -62,14 +62,16 @@ void pause_until(std::chrono::steady_clock::time_point deadline) {
 }
 struct Response {
     std::string body, retry_after;
+    std::size_t limit = 1024 * 1024;
     std::uint64_t used_weight = 0;
     bool overflow = false;
 };
 std::size_t body_callback(char* data, std::size_t size, std::size_t count, void* context) noexcept {
     auto* response = static_cast<Response*>(context);
     const auto bytes = size * count;
-    // The JSON parser refuses documents above 1 MiB, so a larger body is refused here.
-    if (bytes > 1024 * 1024 - response->body.size()) { response->overflow = true; return 0; }
+    // The JSON parser refuses documents above 1 MiB, so a larger body is refused here unless the caller
+    // extracts one bounded member from it.
+    if (bytes > response->limit - response->body.size()) { response->overflow = true; return 0; }
     try { response->body.append(data, bytes); return bytes; }
     catch (...) { response->overflow = true; return 0; }
 }
@@ -93,6 +95,18 @@ std::size_t header_callback(char* data, std::size_t size, std::size_t count, voi
         }
     } catch (...) {}
     return bytes;
+}
+// A venue frame on a CONNECT_ONLY handle: control-size text, retried while the socket would block.
+bool send_text(CURL* handle, curl_socket_t socket, const std::string& text) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    for (;;) {
+        std::size_t sent = 0;
+        const auto result = curl_ws_send(handle, text.data(), text.size(), &sent, 0, CURLWS_TEXT);
+        if (result == CURLE_OK && sent == text.size()) return true;
+        if (result != CURLE_AGAIN || sent || std::chrono::steady_clock::now() >= deadline) return false;
+        pollfd descriptor{socket, POLLOUT, 0};
+        ::poll(&descriptor, 1, 100);
+    }
 }
 }
 
@@ -148,12 +162,24 @@ void validate_origin(const std::string& origin, bool websocket, bool allow_insec
         !field(CURLUPART_QUERY).empty() || field(CURLUPART_PATH) != "/") throw Error(23, "endpoint must be a credential-free origin without a path or query");
 }
 
-HttpClient::HttpClient(const Config& config) : config_(config) {
+RestPolicy binance_spot_rest(const std::string& symbol) {
+    RestPolicy policy;
+    policy.endpoints = {"/api/v3/exchangeInfo", "/api/v3/historicalTrades", "/api/v3/aggTrades", "/api/v3/klines"};
+    policy.limits_path = "/api/v3/exchangeInfo?symbol=" + symbol;
+    policy.limits_weight = 20;
+    return policy;
+}
+
+HttpClient::HttpClient(const Config& config, RestPolicy policy) : config_(config), policy_(std::move(policy)) {
     check_runtime_curl();
     validate_origin(config_.rest_url, false, config_.allow_insecure);
+    milliseconds_per_request_ = policy_.milliseconds_per_request;
+    if (policy_.endpoints.empty()) throw Error(23, "public REST allowlist is empty");
+    if (policy_.limits_path.empty()) return;
     try {
-        const auto metadata = get("/api/v3/exchangeInfo?symbol=" + config_.symbol, 20);
-        const auto& limits = metadata.at("rateLimits");
+        // The USD-M document exceeds the parser bound: only its top-level rateLimits member is parsed.
+        const auto document = body(policy_.limits_path, policy_.limits_weight, policy_.limits_bytes);
+        const auto limits = parse_json(json_member(document, "rateLimits"));
         if (limits.kind != Json::Kind::Array || limits.items.size() > 64) throw Error(23, "invalid public rate-limit metadata");
         bool weighted = false;
         for (const auto& limit : limits.items) {
@@ -181,15 +207,21 @@ HttpClient::HttpClient(const Config& config) : config_(config) {
     catch (const std::exception&) { throw Error(23, "invalid public exchange rate-limit metadata"); }
 }
 Json HttpClient::get(const std::string& path, unsigned int weight) {
+    const auto text = body(path, weight);
+    try { return parse_json(text); }
+    catch (const std::exception&) { throw Error(23, "public market-data response is invalid JSON"); }
+}
+std::string HttpClient::body(const std::string& path, unsigned int weight, std::size_t limit) {
     const auto endpoint = path.substr(0, path.find('?'));
-    if (endpoint != "/api/v3/exchangeInfo" && endpoint != "/api/v3/historicalTrades" &&
-        endpoint != "/api/v3/aggTrades" && endpoint != "/api/v3/klines")
+    if (std::find(policy_.endpoints.begin(), policy_.endpoints.end(), endpoint) == policy_.endpoints.end())
         throw Error(23, "REST request is outside the public market-data allowlist");
+    if (!limit || limit > 4 * 1024 * 1024) throw Error(22, "REST body bound exceeds 4 MiB");
     for (unsigned int attempt = 0; attempt < 4; ++attempt) {
         pause_until(next_request_);
         Progress state;
         auto handle = handle_for(config_.rest_url + path, false, config_.allow_insecure, &state);
         Response response;
+        response.limit = limit;
         option(handle.get(), CURLOPT_WRITEFUNCTION, &body_callback);
         option(handle.get(), CURLOPT_WRITEDATA, &response);
         option(handle.get(), CURLOPT_HEADERFUNCTION, &header_callback);
@@ -204,7 +236,7 @@ Json HttpClient::get(const std::string& path, unsigned int weight) {
         if (response.overflow) throw Error(22, "REST response exceeds the bounded buffer");
         if (status == 401 || status == 403 || status == 418 || status == 451 || (status >= 300 && status < 400))
             throw Error(23, "public market-data access denied or redirected (HTTP " + std::to_string(status) + ")");
-        if (status == 429) {
+        if (status == 429 || (status == 200 && policy_.throttled && policy_.throttled(response.body))) {
             const auto wait = response.retry_after.empty() ? 1 : retry_after_seconds(response.retry_after,
                 std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
             log("warn", "rest_rate_limited", Json::object({{"retry_after", Json::number(std::to_string(wait))}}));
@@ -212,6 +244,7 @@ Json HttpClient::get(const std::string& path, unsigned int weight) {
             next_request_ = std::chrono::steady_clock::now() + std::chrono::seconds(wait);
             continue;
         }
+        if (code == CURLE_OK && status != 200 && policy_.rejected) policy_.rejected(status, response.body);
         if (status == 404) throw Error(20, "public history is unavailable");
         if (code != CURLE_OK || status >= 500) {
             next_request_ = std::chrono::steady_clock::now() + std::chrono::seconds(1U << attempt);
@@ -225,16 +258,18 @@ Json HttpClient::get(const std::string& path, unsigned int weight) {
             next_request_ = std::max(next_request_, std::chrono::steady_clock::now() + std::chrono::milliseconds(60500 - elapsed));
             log("warn", "rest_shared_quota_pause");
         }
-        try { return parse_json(response.body); }
-        catch (const std::exception&) { throw Error(23, "public market-data response is invalid JSON"); }
+        return std::move(response.body);
     }
     throw Error(20, "public history retries exhausted; verified prefix retained");
 }
 
 bool WebSocketPump::stopped() const { return stopped_.load() || stopping.load(); }
-WebSocketPump::WebSocketPump(const Config& config, const std::string& streams) : config_(config), url_(config.ws_url + "/stream?streams=" + streams) {
+WebSocketPump::WebSocketPump(const Config& config, Connection connection)
+    : config_(config), connection_(std::move(connection)), url_(config.ws_url + connection_.path) {
     check_runtime_curl();
     validate_origin(config_.ws_url, true, config_.allow_insecure);
+    if (connection_.path.empty() || connection_.path.front() != '/' || !connection_.classify)
+        throw Error(23, "invalid venue WebSocket connection");
     worker_ = std::thread([this] { run(); });
 }
 WebSocketPump::~WebSocketPump() {
@@ -298,19 +333,28 @@ void WebSocketPump::run() {
                 continue;
             }
             failures = 0;
+            curl_socket_t socket = CURL_SOCKET_BAD;
+            curl_easy_getinfo(handle.get(), CURLINFO_ACTIVESOCKET, &socket);
+            // The marker precedes every message of this connection: the session verifies its REST
+            // overlap while the subscribed data is buffered behind it.
             push({true, {}});
-            log("info", "websocket_connected");
+            bool subscribed = true;
+            for (const auto& request : connection_.subscribe) subscribed = subscribed && send_text(handle.get(), socket, request);
+            log(subscribed ? "info" : "warn", subscribed ? "websocket_connected" : "websocket_subscribe_failed");
             const auto birth = std::chrono::steady_clock::now();
-            auto last_text = birth, message_birth = birth;
+            auto last_data = birth, message_birth = birth, last_ping = birth;
             std::string message;
             bool assembling = false;
             std::uint64_t frame_offset = 0;
-            curl_socket_t socket = CURL_SOCKET_BAD;
-            curl_easy_getinfo(handle.get(), CURLINFO_ACTIVESOCKET, &socket);
-            while (!stopped()) {
+            while (subscribed && !stopped()) {
                 const auto now = std::chrono::steady_clock::now();
-                if (now - birth >= std::chrono::seconds(config_.reconnect_seconds) || now - last_text > std::chrono::seconds(75) ||
+                // Keepalive replies are control messages: they cannot hide a silent data stream.
+                if (now - birth >= std::chrono::seconds(config_.reconnect_seconds) || now - last_data > std::chrono::seconds(75) ||
                     (assembling && now - message_birth > std::chrono::seconds(30))) break;
+                if (!connection_.ping.empty() && now - last_ping >= std::chrono::seconds(config_.keepalive_seconds)) {
+                    if (!send_text(handle.get(), socket, connection_.ping)) break;
+                    last_ping = now;
+                }
                 std::array<char, 16384> buffer{};
                 std::size_t received = 0;
                 const curl_ws_frame* metadata = nullptr;
@@ -329,22 +373,16 @@ void WebSocketPump::run() {
                     throw Error(22, "WebSocket message exceeds 1 MiB");
                 message.append(buffer.data(), received);
                 frame_offset += received;
-                last_text = now;
                 if (metadata->bytesleft) continue;
                 frame_offset = 0;
                 if (metadata->flags & CURLWS_CONT) continue;
-                bool retiring = false;
-                try {
-                    const auto envelope = parse_json(message);
-                    const auto* wrapped = envelope.find("data");
-                    const auto& data = wrapped ? *wrapped : envelope;
-                    const auto* event = data.find("e");
-                    retiring = event && event->kind == Json::Kind::String && event->text() == "serverShutdown";
-                } catch (const std::exception&) { throw Error(23, "invalid public WebSocket JSON"); }
+                const auto kind = connection_.classify(message);
+                assembling = false;
+                if (kind == Frame::Control) { message.clear(); continue; }
+                last_data = now;
                 push({false, std::move(message)});
                 message.clear();
-                assembling = false;
-                if (retiring) { log("info", "source_retiring_reconnect"); break; }
+                if (kind == Frame::Retire) { log("info", "source_retiring_reconnect"); break; }
             }
             if (!stopped()) {
                 log("warn", "websocket_reconnect");

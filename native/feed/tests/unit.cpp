@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "binance.hpp"
+#include "bybit.hpp"
+#include "okx.hpp"
+#include "session.hpp"
 #include <cassert>
 #include <cstdlib>
 #include <filesystem>
@@ -34,6 +37,7 @@ Config config(const Temporary& temporary, const std::string& mode) {
     value.mode = mode;
     value.start = 120000;
     value.state_dir = temporary.path;
+    value.allow_insecure = true;  // loopback pacing: REST re-read pauses are 100 ms, not 1 s
     return value;
 }
 struct SyntheticVenue final : Venue {
@@ -51,8 +55,9 @@ struct SyntheticVenue final : Venue {
         {180000, {{180000, "12.00000000", "12.00000000", "11.00000000", "11.00000000", "0.50000000"}, 103, 104, 2, true}},
         {240000, {{240000, "12.00000000", "12.00000000", "12.00000000", "12.00000000", "0.10000000"}, 105, 105, 1, true}}
     };
-    std::string streams() const override { return "test@trade/test@kline_1m"; }
-    VenueEvent decode(const std::string&) const override { throw Error(23, "not used by deterministic unit venue"); }
+    Connection connection() const override { return {"/stream?streams=test@trade/test@kline_1m", {}, {}, &binance_frame}; }
+    std::vector<VenueEvent> decode(const std::string&) const override { throw Error(23, "not used by deterministic unit venue"); }
+    std::string kline_source() const override { return "/synthetic"; }
     std::size_t pages = 0;
     std::vector<Trade> history(std::uint64_t from, std::size_t limit) override {
         ++pages;
@@ -81,6 +86,65 @@ struct SyntheticVenue final : Venue {
     VenueEvent tick(std::uint64_t id) const { return {VenueEvent::Kind::Trade, trades.at(id), {}}; }
     VenueEvent close(std::int64_t minute) const { return {VenueEvent::Kind::Kline, {}, bars.at(minute)}; }
 };
+// A next-print-fence venue (OKX trades-all, USD-M aggregates): candles carry no ID range and no count.
+struct FenceVenue final : Venue {
+    std::map<std::uint64_t, Trade> trades{
+        {99, {99, 119999, "10.10000000", "0.10000000"}},
+        {100, {100, 120001, "10.10000000", "0.10000000"}},
+        {101, {101, 120050, "11.20000000", "0.20000000"}},
+        {102, {102, 179999, "9.90000000", "0.30000000"}},
+        {103, {103, 180001, "12.00000000", "0.40000000"}},
+        {104, {104, 180050, "11.00000000", "0.10000000"}},
+        {105, {105, 240001, "12.00000000", "0.10000000"}},
+        {106, {106, 360001, "12.50000000", "0.10000000"}}
+    };
+    std::map<std::int64_t, Kline> candles{
+        {120000, {{120000, "10.10000000", "11.20000000", "9.90000000", "9.90000000", "0.60000000"}, -1, -1, 0, true}},
+        {180000, {{180000, "12.00000000", "12.00000000", "11.00000000", "11.00000000", "0.50000000"}, -1, -1, 0, true}},
+        {240000, {{240000, "12.00000000", "12.00000000", "12.00000000", "12.00000000", "0.10000000"}, -1, -1, 0, true}},
+        {300000, {{300000, "12.00000000", "12.00000000", "12.00000000", "12.00000000", "0.00000000"}, -1, -1, 0, true}},
+        {360000, {{360000, "12.50000000", "12.50000000", "12.50000000", "12.50000000", "0.10000000"}, -1, -1, 0, true}}
+    };
+    std::int64_t retention = 0;
+    std::size_t pages = 0, candle_requests = 0;
+    Connection connection() const override { return {"/synthetic", {}, {}, &binance_frame}; }
+    std::vector<VenueEvent> decode(const std::string&) const override { throw Error(23, "not used by deterministic unit venue"); }
+    std::vector<Trade> history(std::uint64_t from, std::size_t limit) override {
+        ++pages;
+        std::vector<Trade> result;
+        for (auto found = trades.find(from); found != trades.end() && result.size() < limit && found->first == from + result.size(); ++found)
+            result.push_back(found->second);
+        return result;
+    }
+    Trade predecessor(std::int64_t minute) override {
+        std::optional<Trade> last;
+        for (const auto& [id, trade] : trades) if (trade.ts < minute) last = trade;
+        if (!last) throw Error(20, "synthetic venue has no predecessor");
+        return *last;
+    }
+    std::vector<Kline> klines(std::int64_t start, std::int64_t end) override {
+        ++candle_requests;
+        std::vector<Kline> result;
+        for (auto minute = start; minute < end; minute += 60000) {
+            if (!candles.count(minute)) throw Error(20, "synthetic missing minute");
+            result.push_back(candles.at(minute));
+        }
+        return result;
+    }
+    TickProof tick_proof() const override { return TickProof::NextPrintFence; }
+    std::int64_t retention_ms() const override { return retention; }
+    std::string kline_source() const override { return "/synthetic"; }
+    VenueEvent tick(std::uint64_t id) const { return {VenueEvent::Kind::Trade, trades.at(id), {}}; }
+    VenueEvent close(std::int64_t minute) const { return {VenueEvent::Kind::Kline, {}, candles.at(minute)}; }
+};
+std::vector<std::string> kinds(const std::vector<std::string>& lines) {
+    std::vector<std::string> result;
+    for (const auto& line : lines) {
+        const auto event = parse_json(line);
+        result.push_back(event.at("type").text() == "tick" ? event.at("seq").value : "time:" + event.at("ts").value);
+    }
+    return result;
+}
 }
 
 int main() {
@@ -93,6 +157,10 @@ int main() {
     Trade exact{9007199254740993ULL, 120001, "123.45000000", "0.00000001"};
     assert(normalized_trade(parse_json(exact.wire())) == exact);
     expect(23, [] { Trade{1, 1, "1", "0"}.validate(); });
+    // Equality is by exact value: one venue number rendered two ways is not a revision; any change is.
+    assert((Bar{120000, "84850.0", "84850.1", "84826.5", "84826.5", "18.30"} == Bar{120000, "84850", "84850.1", "84826.5", "84826.5", "18.3"}));
+    assert(!(Bar{120000, "84850.0", "84850.1", "84826.5", "84826.5", "18.30"} == Bar{120000, "84850.01", "84850.1", "84826.5", "84826.5", "18.3"}));
+    assert((Trade{7, 120001, "10.10", "0.5"} == Trade{7, 120001, "10.1", "0.50"}) && !(Trade{7, 120001, "10.1", "0.5"} == Trade{7, 120001, "10.1", "0.51"}));
     passed("decimal_tokens_and_uint64_identity");
 
     const auto raw = parse_json(R"({"e":"trade","E":999999,"s":"TESTUSDT","t":100,"p":"10.10000000","q":"0.10000000","T":120001,"m":false})");
@@ -378,6 +446,233 @@ int main() {
         { std::ofstream used(second.path + "/events.jsonl"); used << "x\n"; }
         expect(23, [&] { State state(config(second, "bars")); });
         passed("crashed_initialization_without_cursor_is_reinitialized");
+    }
+
+    {
+        assert(Decimal("1.64").multiply(Decimal("0.01")).str() == "0.0164");
+        assert(Decimal("2").multiply(Decimal("0.01")).str() == "0.02");
+        assert(Decimal("100").multiply(Decimal("0.01")).str() == "1");
+        assert(Decimal("0.5").multiply(Decimal("0")).str() == "0");
+        assert(Decimal("12.30").str() == "12.3" && Decimal("0.00012").str() == "0.00012");
+        assert(scaled_quantity("1.640", "1") == "1.640");
+        assert(scaled_quantity("1.64", "0.01") == "0.0164");
+        // Contract conversion distributes exactly over the candle volume: no float, no rounding.
+        assert(Decimal(scaled_quantity("0.07", "0.01")).add(Decimal(scaled_quantity("186.80", "0.01"))) ==
+               Decimal(scaled_quantity("186.87", "0.01")));
+        expect(23, [] { Decimal("0." + std::string(20, '1')).multiply(Decimal("0." + std::string(20, '1'))); });
+        passed("decimal_multiply_exact_contract_units");
+    }
+    {
+        const std::string document = R"({"timezone":"UTC","note":"x]}\"","rateLimits":[{"limit":2400,"s":"[{"}],"symbols":[{"symbol":"A"}]})";
+        assert(json_member(document, "rateLimits") == R"([{"limit":2400,"s":"[{"}])");
+        assert(json_member(document, "note") == R"("x]}\"")");
+        assert(json_member(document, "symbols") == R"([{"symbol":"A"}])");
+        expect(23, [&] { json_member(document, "missing"); });
+        expect(23, [] { json_member("[1]", "rateLimits"); });
+        passed("json_member_extracts_one_member_beyond_the_parser_bound");
+    }
+    {
+        auto row = parse_json(R"({"instId":"TEST-USDT-SWAP","tradeId":"100","px":"10.1","sz":"1.64","side":"buy","ts":"120001","source":"0"})");
+        const auto swap = okx_trade(row, "TEST-USDT-SWAP", "0.01");
+        assert(swap.id == 100 && swap.ts == 120001 && swap.price == "10.1" && swap.qty == "0.0164");
+        assert(okx_trade(row, "TEST-USDT-SWAP", "1").qty == "1.64");
+        expect(23, [&] { okx_trade(row, "OTHER-USDT-SWAP", "0.01"); });
+        auto aggregated = row;
+        aggregated.members["count"] = Json::string("3");
+        expect(23, [&] { okx_trade(aggregated, "TEST-USDT-SWAP", "0.01"); });
+        auto padded = row;
+        padded.members["tradeId"] = Json::string("0100");
+        expect(23, [&] { okx_trade(padded, "TEST-USDT-SWAP", "0.01"); });
+        const auto candle = okx_candle(parse_json(R"(["120000","10.1","11.2","9.9","9.9","60","0.6","6.06","1"])"), "0.01");
+        assert(candle.confirmed && candle.bar.volume == "0.6" && candle.bar.ts == 120000 && candle.count == 0 && candle.first == -1);
+        assert(!okx_candle(parse_json(R"(["120000","10.1","11.2","9.9","9.9","60","0.6","6.06","0"])"), "0.01").confirmed);
+        expect(23, [] { okx_candle(parse_json(R"(["120000","10.1","11.2","9.9","9.9","60","0.6","6.06","true"])"), "1"); });
+        expect(23, [] { okx_candle(parse_json(R"(["120000","10.1","11.2","9.9","9.9","60","0.6","1"])"), "1"); });
+        auto instrument = parse_json(R"({"instId":"TEST-USDT-SWAP","instType":"SWAP","state":"live","ctType":"linear","ctValCcy":"TEST","ctVal":"0.01","ctMult":"1"})");
+        assert(okx_multiplier(instrument, "swap", "TEST-USDT-SWAP") == "0.01");
+        auto inverse = instrument;
+        inverse.members["ctType"] = Json::string("inverse");
+        expect(23, [&] { okx_multiplier(inverse, "swap", "TEST-USDT-SWAP"); });
+        auto quoted = instrument;
+        quoted.members["ctValCcy"] = Json::string("USD");
+        expect(23, [&] { okx_multiplier(quoted, "swap", "TEST-USDT-SWAP"); });
+        auto suspended = instrument;
+        suspended.members["state"] = Json::string("suspend");
+        expect(23, [&] { okx_multiplier(suspended, "swap", "TEST-USDT-SWAP"); });
+        assert(okx_multiplier(parse_json(R"({"instId":"TEST-USDT","instType":"SPOT","state":"live"})"), "spot", "TEST-USDT") == "1");
+        assert(okx_frame("pong") == Frame::Control);
+        assert(okx_frame(R"({"event":"subscribe","arg":{"channel":"candle1m","instId":"TEST-USDT"},"connId":"a"})") == Frame::Control);
+        assert(okx_frame(R"({"event":"notice","code":"64008","msg":"upgrade","connId":"a"})") == Frame::Retire);
+        assert(okx_frame(R"({"arg":{"channel":"candle1m","instId":"TEST-USDT"},"data":[]})") == Frame::Data);
+        expect(23, [] { okx_frame(R"({"event":"error","code":"60012","msg":"bad"})"); });
+        expect(23, [] { okx_frame("ping-not-json"); });
+        passed("okx_trades_all_candle_confirm_count_contract_units_and_frames");
+    }
+    {
+        const auto closing = bybit_kline(parse_json(R"({"start":120000,"end":179999,"interval":"1","open":"10.1","close":"9.9","high":"11.2","low":"9.9","volume":"0.6","turnover":"6","confirm":true,"timestamp":180001})"));
+        assert(closing.confirmed && closing.bar.ts == 120000 && closing.bar.volume == "0.6");
+        assert(!bybit_kline(parse_json(R"({"start":180000,"end":239999,"interval":"1","open":"9.9","close":"9.9","high":"9.9","low":"9.9","volume":"0.1","turnover":"1","confirm":false,"timestamp":180001})")).confirmed);
+        expect(23, [] { bybit_kline(parse_json(R"({"start":120000,"end":179999,"interval":"1","open":"1","close":"1","high":"1","low":"1","volume":"1","turnover":"1","confirm":"true","timestamp":1})")); });
+        expect(23, [] { bybit_kline(parse_json(R"({"start":120000,"end":239999,"interval":"1","open":"1","close":"1","high":"1","low":"1","volume":"1","turnover":"1","confirm":true,"timestamp":1})")); });
+        const auto newest_first = parse_json(R"([["180000","12","12","11","11","0.5","6"],["120000","10.1","11.2","9.9","9.9","0.6","6"]])");
+        const auto ascending = bybit_rows(newest_first, 120000, 2);
+        assert(ascending.size() == 2 && ascending.front().bar.ts == 120000 && ascending.back().bar.ts == 180000);
+        expect(20, [] { bybit_rows(parse_json(R"([["120000","10.1","11.2","9.9","9.9","0.6","6"],["180000","12","12","11","11","0.5","6"]])"), 120000, 2); });
+        expect(20, [&] { bybit_rows(newest_first, 120000, 3); });
+        assert(bybit_frame(R"({"success":true,"ret_msg":"pong","conn_id":"a","op":"ping"})") == Frame::Control);
+        assert(bybit_frame(R"({"success":true,"ret_msg":"","conn_id":"a","op":"subscribe"})") == Frame::Control);
+        assert(bybit_frame(R"({"topic":"kline.1.TESTUSDT","data":[],"ts":1,"type":"snapshot"})") == Frame::Data);
+        expect(23, [] { bybit_frame(R"({"success":false,"ret_msg":"bad","op":"subscribe"})"); });
+        passed("bybit_confirm_flag_two_entry_push_and_reverse_order_rest_rows");
+    }
+    {
+        Config options;
+        options.symbol = "TESTUSDT";
+        assert(usdm_connection(options).path == "/market/stream?streams=testusdt@kline_1m");
+        options.mode = "agg-ticks";
+        assert(usdm_connection(options).path == "/market/stream?streams=testusdt@aggTrade/testusdt@kline_1m");
+        const auto aggregate = usdm_aggregate(parse_json(R"({"e":"aggTrade","E":1,"s":"TESTUSDT","a":500,"p":"10.1","q":"0.5","nq":"0.4","f":1000,"l":1004,"T":120001,"m":true,"st":1})"));
+        assert(aggregate.id == 500 && aggregate.ts == 120001 && aggregate.qty == "0.5");
+        expect(23, [] { usdm_aggregate(parse_json(R"({"a":500,"p":"10.1","q":"0.5","f":1004,"l":1000,"T":120001})")); });
+        assert(usdm_kline_weight(32) == 1 && usdm_kline_weight(100) == 2 && usdm_kline_weight(1000) == 5);
+        assert(binance_frame(R"({"stream":"!x","data":{"e":"serverShutdown"}})") == Frame::Retire);
+        passed("usdm_routed_stream_aggregate_q_and_kline_weights");
+    }
+    {
+        Temporary temporary;
+        FenceVenue venue;
+        State state(config(temporary, "ticks"));
+        std::vector<std::string> output;
+        FenceSession session(state, venue, [&](const auto& line) { output.push_back(line); });
+        session.connected();
+        for (const std::uint64_t id : {100, 101, 102}) session.ingest(venue.tick(id));
+        // The fence alone does not close the minute: its confirmed candle must reconcile first.
+        session.ingest(venue.tick(103));
+        assert(kinds(output) == std::vector<std::string>({"100", "101", "102"}));
+        session.ingest(venue.close(120000));
+        assert(kinds(output) == std::vector<std::string>({"100", "101", "102", "time:180000", "103"}));
+        // The confirmed candle alone does not close the minute either: it waits for the next print.
+        session.ingest(venue.close(180000));
+        assert(output.size() == 5);
+        session.ingest(venue.tick(104));
+        assert(output.size() == 6);
+        session.ingest(venue.tick(105));
+        assert(kinds(output) == std::vector<std::string>({"100", "101", "102", "time:180000", "103", "104", "time:240000", "105"}));
+        session.ingest(venue.close(180000));
+        auto revised = venue.close(180000);
+        revised.kline.bar.volume = "0.60000000";
+        expect(21, [&] { session.ingest(revised); });
+        passed("fence_time_needs_contiguous_ids_next_minute_print_and_exact_candle");
+    }
+    {
+        Temporary temporary;
+        FenceVenue venue;
+        State state(config(temporary, "ticks"));
+        std::vector<std::string> output;
+        FenceSession session(state, venue, [&](const auto& line) { output.push_back(line); });
+        for (const std::uint64_t id : {100, 101, 102, 103}) session.ingest(venue.tick(id));
+        auto revised = venue.close(120000);
+        revised.kline.bar.high = "11.30000000";
+        expect(21, [&] { session.ingest(revised); });
+        assert(kinds(output) == std::vector<std::string>({"100", "101", "102"}) && state.durable().cut == 120000);
+        passed("fence_exact_ohlcv_mismatch_stops_21_without_time");
+    }
+    {
+        Temporary temporary;
+        FenceVenue venue;
+        State state(config(temporary, "ticks"));
+        std::vector<std::string> output;
+        FenceSession session(state, venue, [&](const auto& line) { output.push_back(line); });
+        session.ingest(venue.tick(103));
+        assert(kinds(output) == std::vector<std::string>({"100", "101", "102"}) && venue.pages == 1);
+        session.ingest(venue.close(120000));
+        session.ingest(venue.close(180000));
+        session.ingest(venue.close(240000));
+        session.ingest(venue.close(300000));
+        session.ingest(venue.tick(106));
+        assert(kinds(output) == std::vector<std::string>({"100", "101", "102", "time:180000", "103", "104", "time:240000", "105",
+                                                          "time:300000", "time:360000", "106"}));
+        passed("fence_gap_heals_by_id_pages_and_quiet_minute_closes_on_zero_volume_candle");
+    }
+    {
+        Temporary temporary;
+        FenceVenue venue;
+        venue.candles.at(300000).bar.volume = "0.10000000";
+        State state(config(temporary, "ticks"));
+        FenceSession session(state, venue, [](const auto&) {});
+        for (const std::int64_t minute : {120000, 180000, 240000}) session.ingest(venue.close(minute));
+        expect(21, [&] { session.ingest(venue.close(300000)); });
+        assert(state.durable().cut == 300000);
+        passed("fence_quiet_minute_with_candle_volume_stops_21");
+    }
+    {
+        Temporary temporary;
+        FenceVenue venue;
+        State state(config(temporary, "ticks"));
+        std::vector<std::string> output;
+        FenceSession session(state, venue, [&](const auto& line) { output.push_back(line); });
+        for (const std::uint64_t id : {100, 101, 102, 103}) session.ingest(venue.tick(id));
+        assert(output.size() == 3 && venue.candle_requests == 0);
+        session.ingest(venue.close(180000));
+        assert(kinds(output) == std::vector<std::string>({"100", "101", "102", "time:180000", "103"}) && venue.candle_requests == 1);
+        passed("fence_rest_candle_only_behind_a_later_confirmed_websocket_candle");
+    }
+    {
+        Temporary temporary;
+        FenceVenue venue;
+        venue.retention = 60000;
+        State state(config(temporary, "ticks"));
+        std::vector<std::string> output;
+        FenceSession session(state, venue, [&](const auto& line) { output.push_back(line); });
+        session.ingest(venue.tick(100));
+        const auto before = venue.pages;
+        expect(20, [&] { session.ingest(venue.tick(105)); });
+        assert(venue.pages == before && kinds(output) == std::vector<std::string>({"100"}));
+        venue.retention = 0;
+        Temporary second;
+        State healing(config(second, "ticks"));
+        FenceSession healed(healing, venue, [](const auto&) {});
+        healed.ingest(venue.tick(100));
+        healed.ingest(venue.tick(102));
+        assert(healing.durable().seq == 102);
+        passed("fence_gap_beyond_the_venue_history_window_stops_20_without_rest");
+    }
+    {
+        Temporary temporary;
+        FenceVenue venue;
+        State state(config(temporary, "ticks"));
+        std::vector<std::string> output;
+        FenceSession session(state, venue, [&](const auto& line) { output.push_back(line); });
+        session.ingest(venue.tick(100));
+        session.ingest(venue.tick(101));
+        venue.trades.at(100).qty = "0.10000001";
+        expect(21, [&] { session.connected(); });
+        assert(output.size() == 2 && state.durable().message_index == 2);
+        venue.trades.at(100).qty = "0.10000000";
+        venue.trades.at(102).ts = 120040;
+        expect(23, [&] { session.ingest(venue.tick(102)); });
+        passed("fence_reconnect_overlap_change_21_and_time_regression_23");
+    }
+    {
+        Temporary temporary;
+        FenceVenue venue;
+        venue.trades = {{99, {99, 119999, "10.10000000", "0.10000000"}}, {100, {100, 180001, "12.00000000", "0.50000000"}}};
+        venue.candles.at(120000).bar = {120000, "10.10000000", "10.10000000", "10.10000000", "10.10000000", "0"};
+        auto options = config(temporary, "ticks");
+        {
+            State state(options);
+            std::vector<std::string> output;
+            FenceSession session(state, venue, [&](const auto& line) { output.push_back(line); });
+            session.ingest(venue.close(120000));
+            assert(output.empty());
+            session.ingest(venue.tick(100));
+            assert(kinds(output) == std::vector<std::string>({"time:180000", "100"}));
+        }
+        options.resume = true;
+        options.start = -1;
+        State resumed(options);
+        assert(resumed.cursor().message_index == 2 && resumed.cursor().seq == 100 && resumed.cursor().cut == 180000);
+        passed("fence_quiet_first_minute_closes_on_the_anchored_predecessor_and_resumes");
     }
     assert(retry_after_seconds("120", 0) == 120);
     assert(retry_after_seconds("Wed, 21 Oct 2015 07:28:00 GMT", 1445412475) == 5);

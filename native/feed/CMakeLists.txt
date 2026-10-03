@@ -45,7 +45,8 @@ if(PINEFORGE_FEED_SANITIZER)
   add_link_options(-fsanitize=${PINEFORGE_FEED_SANITIZER})
 endif()
 
-add_library(pineforge_feed_core STATIC src/core.cpp src/state.cpp src/transport.cpp src/binance.cpp)
+add_library(pineforge_feed_core STATIC src/core.cpp src/state.cpp src/transport.cpp src/binance.cpp src/okx.cpp
+  src/bybit.cpp src/session.cpp)
 target_include_directories(pineforge_feed_core PUBLIC src vendor)
 target_link_libraries(pineforge_feed_core PUBLIC CURL::libcurl OpenSSL::Crypto Threads::Threads)
 target_compile_options(pineforge_feed_core PRIVATE -Wall -Wextra -Wpedantic -Werror)

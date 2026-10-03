@@ -230,12 +230,12 @@ minutes (5%) differed, always in pairs where one fill moves into the next
 minute: that minute's open is off by one tick (0.10) and both volumes by the
 fill (0.002-0.011 BTC); close, high and low never differed, and no print lay
 outside its own minute's kline range. In one live run, a short entry signalled
-at a minute's close filled at the next minute's first print, 84,662.40; that
-minute's kline opened at 84,662.50, the price of the fill that moved, so a
-backtest on klines fills one tick away. A backtest on the bars built from the
-same prints equals the runner. The matching backtest for an `agg-ticks`
-deployment is therefore a backtest on prints-built 1m bars; slice 3 of the feed
-adds the export of those bars.
+at a minute's close filled at the next minute's first print, one tick (0.10)
+below that minute's kline open: the kline opened at the price of the fill that
+the aggregate dated in the previous minute, so a backtest on klines fills one
+tick away. A backtest on the bars built from the same prints equals the runner.
+The matching backtest for an `agg-ticks` deployment is therefore a backtest on
+prints-built 1m bars; a later feed release adds the export of those bars.
 
 The subscribed data streams are strict: another event type on them, a
 malformed trade or kline, or an unknown shape stops with 23 (on every venue). An event outside

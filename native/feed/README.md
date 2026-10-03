@@ -156,10 +156,16 @@ and `n` count raw trades, not aggregates), so a minute `M` closes with
 3. the minute's closed candle: a confirmed WebSocket candle, or, only behind a
    later confirmed WebSocket candle, the REST candle (OKX additionally requires
    its per-row confirm `"1"`);
-4. exact OHLC and volume equality between the minute's prints and that candle.
+4. for OKX raw prints, exact OHLC and volume equality between the minute's
+   prints and that candle. USD-M aggregate prints skip this step: an aggregate
+   is dated by its trade time and never split, and one can hold a fill that
+   Binance's kline counts in the next minute (observed live: one 0.003 BTC fill
+   moved between two consecutive klines while every aggregate equalled
+   `aggTrades`), so the kline is not their exact sum. Their completeness rests
+   on conditions 1 and 2, and the kline only marks the minute closed.
 
 A candle without the fence never closes a minute, and the fence without the
-candle waits. A quiet minute closes on the same fence when its candle shows
+candle waits. A quiet OKX minute closes on the same fence when its candle shows
 zero volume; nonzero volume there stops with 21. Prints of later minutes stay
 buffered until the proof. Holes heal by ID through REST: OKX `history-trades`
 pages of 100 with exclusive `after`/`before` trade-ID bounds, USD-M `aggTrades`

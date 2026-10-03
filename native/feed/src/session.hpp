@@ -49,10 +49,11 @@ public:
 };
 
 // Ticks proven by a next-print fence (OKX trades-all, Binance USD-M aggregate prints). A minute closes
-// only when the contiguous ID chain from the proven predecessor reaches a print of a later minute, and
-// the minute's confirmed candle (from the WebSocket, or from REST behind a later confirmed WebSocket
-// candle) equals those prints exactly in OHLC and volume. A quiet minute closes on the same fence when its
-// confirmed candle shows zero volume. Prints beyond the closed minute stay buffered until that proof.
+// only when the contiguous ID chain from the proven predecessor reaches a print of a later minute and the
+// venue has closed the minute (a confirmed WebSocket candle, or a REST candle behind a later confirmed
+// one). For raw prints (OKX) that candle must also equal the prints exactly in OHLC and volume, and a
+// quiet minute needs a zero-volume candle; aggregate prints (USD-M) can straddle a minute boundary, so
+// their candle is not compared. Prints beyond the closed minute stay buffered until that proof.
 class FenceSession final : public Session {
     Aggregate aggregate_;
     std::map<std::uint64_t, Trade> pending_;

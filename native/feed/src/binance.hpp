@@ -40,6 +40,8 @@ public:
     std::vector<Kline> klines(std::int64_t start, std::int64_t end) override;
     TickProof tick_proof() const override { return TickProof::NextPrintFence; }
     std::int64_t retention_ms() const override { return 48LL * 3600000; }
+    // Observed live: an aggregate dated in one minute held a fill the next minute's kline counts.
+    bool candle_is_print_sum() const override { return false; }
     std::string kline_source() const override { return "/fapi/v1/klines"; }
 };
 }

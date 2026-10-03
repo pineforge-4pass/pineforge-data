@@ -1648,6 +1648,28 @@ class FeedMockTests(unittest.TestCase):
             server.ws_paths, ["/market/stream?streams=testusdt@aggTrade/testusdt@kline_1m"]
         )
 
+    def test_usdm_straddling_aggregate_closes_on_the_fence(self):
+        # Aggregate 502 is dated in minute 120000 but one of its fills belongs to the next kline.
+        server = self.server(
+            [
+                [
+                    aggregate(500),
+                    aggregate(501),
+                    aggregate(502),
+                    candle(120000, v="0.59700000"),
+                    aggregate(503),
+                    aggregate(504),
+                    candle(180000, v="0.50300000"),
+                    aggregate(505),
+                ]
+            ],
+            "usdm",
+        )
+        output, _ = self.run_feed(server, "agg-ticks", ["--max-messages", "8"])
+        self.assertEqual(
+            sequence(output), [500, 501, 502, ("time", 180000), 503, 504, ("time", 240000), 505]
+        )
+
     def test_usdm_agg_gap_heals_by_from_id(self):
         server = self.server([[aggregate(502), candle(120000), aggregate(503)]], "usdm")
         output, _ = self.run_feed(server, "agg-ticks", ["--max-messages", "5"])

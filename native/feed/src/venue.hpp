@@ -49,6 +49,9 @@ public:
     virtual TickProof tick_proof() const { return TickProof::KlineIdRange; }
     // Documented REST print history window in milliseconds; 0 when none is documented.
     virtual std::int64_t retention_ms() const { return 0; }
+    // Whether a closed candle is the exact sum of the venue's prints. Raw prints are; aggregate prints are
+    // not, because one aggregate can straddle a minute boundary and is never split.
+    virtual bool candle_is_print_sum() const { return true; }
     // Base units per venue quantity unit (contract value times multiplier), "1" for base quantities.
     virtual std::string qty_multiplier() const { return "1"; }
     virtual std::string kline_source() const = 0;

@@ -434,7 +434,8 @@ bool FenceSession::close_minute() {
         log("info", "historical_candle_verified", Json::object({{"minute", Json::number(std::to_string(minute))}}));
     }
     const auto candle = found->second;
-    reconcile_fenced(aggregate_, candle);
+    // Aggregate prints close on the fence and the venue's closed candle alone: the candle is not their sum.
+    if (venue_.candle_is_print_sum()) reconcile_fenced(aggregate_, candle);
     emit(time_line(minute + 60000), candle.bar);
     aggregate_ = Aggregate{};
     candles_.erase(candles_.begin(), candles_.upper_bound(minute));
@@ -451,7 +452,8 @@ void FenceSession::candle(const Kline& kline) {
                 if (!(proof == kline.bar)) throw Error(21, "already-closed minute's confirmed candle was revised");
                 return;
             }
-        // Older than the retained proofs: rebuild that minute from the journal.
+        // Older than the retained proofs: rebuild that minute from the journal, where the candle is a sum.
+        if (!venue_.candle_is_print_sum()) return;
         Aggregate rebuilt;
         state_.visit(0, [&](const std::string& line) {
             const auto event = parse_json(line);

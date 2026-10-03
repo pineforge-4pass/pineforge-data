@@ -88,6 +88,8 @@ class Venue:
         self.rest, self.tick_mode, label = PROFILES[(venue, market)]
         self.label = label.format(symbol)
         self.lock = threading.Lock()
+        # USD-M aggregates can straddle a minute boundary: their kline is not their exact sum.
+        self.candle_is_print_sum = (venue, market) != ("binance", "usdm")
         self.multiplier = Decimal(1)
         if venue == "okx" and market == "swap":
             row = self.fetch("/api/v5/public/instruments", {"instType": "SWAP", "instId": symbol})[
@@ -444,6 +446,7 @@ class Soak:
 
             def compare_minutes():
                 expected = self.venue.candles(self.cut, times[-1])
+                differing.clear()
                 normalized = []
                 minute_trades = []
                 minute = self.cut
@@ -456,12 +459,13 @@ class Soak:
                         candle = expected[len(normalized)]
                         prices = [tick["price"] for tick in minute_trades]
                         if not prices:
-                            # A quiet minute closes on the next-print fence (OKX, USD-M) only with a
+                            # A quiet minute closes on the next-print fence (OKX, USD-M) with a
                             # zero-volume candle; the batch then sees that flat candle.
-                            assert candle[2] is None and Decimal(candle[1][4]) == 0, (
-                                "a proven minute without prints"
-                            )
-                            values = [Decimal(token) for token in candle[1]]
+                            assert candle[2] is None, "a proven minute without prints"
+                            assert not self.venue.candle_is_print_sum or (
+                                Decimal(candle[1][4]) == 0
+                            ), "a quiet minute with candle volume"
+                            values = [*(Decimal(token) for token in candle[1][:4]), Decimal(0)]
                         else:
                             assert candle[2] is None or len(prices) == candle[2], "count mismatch"
                             values = [
@@ -471,21 +475,34 @@ class Soak:
                                 prices[-1],
                                 sum(tick["qty"] for tick in minute_trades),
                             ]
-                        assert values == [Decimal(token) for token in candle[1]], (
-                            "time OHLCV mismatch"
-                        )
+                        if self.venue.candle_is_print_sum:
+                            assert values == [Decimal(token) for token in candle[1]], (
+                                "time OHLCV mismatch"
+                            )
+                        elif values != [Decimal(token) for token in candle[1]]:
+                            differing.append(minute)
                         keys = ("ts_open", "o", "h", "l", "c", "v")
                         normalized.append(dict(zip(keys, [minute, *values], strict=True)))
                         minute += 60000
                         minute_trades = []
                 return normalized
 
+            differing = []
             self.settled(compare_prints)
             normalized = self.settled(compare_minutes)
-            self.receipt(
-                f"PASS {mode} contiguous and time events equal REST ticks={len(trades)} "
-                f"minutes={len(times)} duration_seconds={duration:.3f}"
-            )
+            if self.venue.candle_is_print_sum:
+                self.receipt(
+                    f"PASS {mode} contiguous and time events equal REST ticks={len(trades)} "
+                    f"minutes={len(times)} duration_seconds={duration:.3f}"
+                )
+            else:
+                # Every print equals REST aggTrades and every time is fenced by the next print; the
+                # kline is reported, not required, where a straddling aggregate moves a fill.
+                self.receipt(
+                    f"PASS {mode} contiguous fenced aggregates equal REST ticks={len(trades)} "
+                    f"minutes={len(times)} kline_differs={len(differing)} "
+                    f"duration_seconds={duration:.3f}"
+                )
         combined = self.directory / (mode + "-combined.csv")
         with open(combined, "w") as output:
             output.write((self.directory / "warmup.csv").read_text())

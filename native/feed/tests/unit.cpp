@@ -106,6 +106,7 @@ struct FenceVenue final : Venue {
         {360000, {{360000, "12.50000000", "12.50000000", "12.50000000", "12.50000000", "0.10000000"}, -1, -1, 0, true}}
     };
     std::int64_t retention = 0;
+    bool print_sum = true;
     std::size_t pages = 0, candle_requests = 0;
     Connection connection() const override { return {"/synthetic", {}, {}, &binance_frame}; }
     std::vector<VenueEvent> decode(const std::string&) const override { throw Error(23, "not used by deterministic unit venue"); }
@@ -133,6 +134,7 @@ struct FenceVenue final : Venue {
     }
     TickProof tick_proof() const override { return TickProof::NextPrintFence; }
     std::int64_t retention_ms() const override { return retention; }
+    bool candle_is_print_sum() const override { return print_sum; }
     std::string kline_source() const override { return "/synthetic"; }
     VenueEvent tick(std::uint64_t id) const { return {VenueEvent::Kind::Trade, trades.at(id), {}}; }
     VenueEvent close(std::int64_t minute) const { return {VenueEvent::Kind::Kline, {}, candles.at(minute)}; }
@@ -723,6 +725,30 @@ int main() {
         expect(21, [&] { session.ingest({VenueEvent::Kind::Trade, changed, {}}); });
         assert(state.durable().seq == 100);
         passed("fence_print_at_or_before_the_start_predecessor_stops");
+    }
+    {
+        // Aggregate prints: an aggregate dated in one minute can hold a fill the next minute's candle
+        // counts, so the candle is not their sum and the fence alone closes the minute.
+        Temporary temporary;
+        FenceVenue venue;
+        venue.print_sum = false;
+        venue.candles.at(120000).bar.volume = "0.60300000";
+        venue.candles.at(180000).bar = {180000, "12.00000000", "12.00000000", "10.90000000", "11.00000000", "0.49700000"};
+        State state(config(temporary, "agg-ticks"));
+        std::vector<std::string> output;
+        FenceSession session(state, venue, [&](const auto& line) { output.push_back(line); });
+        for (const std::uint64_t id : {100, 101, 102, 103, 104}) session.ingest(venue.tick(id));
+        session.ingest(venue.close(120000));
+        session.ingest(venue.close(180000));
+        session.ingest(venue.tick(105));
+        assert(kinds(output) == std::vector<std::string>({"100", "101", "102", "time:180000", "103", "104", "time:240000", "105"}));
+        venue.print_sum = true;
+        Temporary second;
+        State strict(config(second, "ticks"));
+        FenceSession raw(strict, venue, [](const auto&) {});
+        for (const std::uint64_t id : {100, 101, 102, 103}) raw.ingest(venue.tick(id));
+        expect(21, [&] { raw.ingest(venue.close(120000)); });
+        passed("aggregate_prints_close_on_the_fence_without_candle_equality");
     }
     {
         Temporary temporary;

@@ -674,6 +674,63 @@ int main() {
         assert(resumed.cursor().message_index == 2 && resumed.cursor().seq == 100 && resumed.cursor().cut == 180000);
         passed("fence_quiet_first_minute_closes_on_the_anchored_predecessor_and_resumes");
     }
+    {
+        // A resumed fence session rebuilds the open minute from the journal before it reconciles.
+        Temporary temporary;
+        FenceVenue venue;
+        auto options = config(temporary, "ticks");
+        {
+            State state(options);
+            FenceSession session(state, venue, [](const auto&) {});
+            session.ingest(venue.tick(100));
+            session.ingest(venue.tick(101));
+        }
+        options.resume = true;
+        options.start = -1;
+        options.output_from = 2;
+        State state(options);
+        std::vector<std::string> output;
+        FenceSession session(state, venue, [&](const auto& line) { output.push_back(line); });
+        session.connected();
+        session.ingest(venue.tick(102));
+        session.ingest(venue.tick(103));
+        session.ingest(venue.close(120000));
+        assert(kinds(output) == std::vector<std::string>({"102", "time:180000", "103"}));
+        passed("fence_resume_rebuilds_the_open_minute_from_the_journal");
+    }
+    {
+        Temporary temporary;
+        auto options = config(temporary, "ticks");
+        options.qty_multiplier = "0.01";
+        { State state(options); }
+        options.resume = true;
+        options.start = -1;
+        options.qty_multiplier = "1";
+        expect(21, [&] { State changed(options); });
+        options.qty_multiplier = "0.01";
+        State same(options);
+        assert(same.cursor().message_index == 0);
+        passed("resume_refuses_a_changed_contract_multiplier");
+    }
+    {
+        Temporary temporary;
+        FenceVenue venue;
+        State state(config(temporary, "ticks"));
+        FenceSession session(state, venue, [](const auto&) {});
+        session.ingest(venue.tick(100));
+        const Trade earlier{98, 120002, "10.10000000", "0.10000000"}, changed{99, 120003, "10.10000000", "0.10000000"};
+        expect(23, [&] { session.ingest({VenueEvent::Kind::Trade, earlier, {}}); });
+        expect(21, [&] { session.ingest({VenueEvent::Kind::Trade, changed, {}}); });
+        assert(state.durable().seq == 100);
+        passed("fence_print_at_or_before_the_start_predecessor_stops");
+    }
+    {
+        Temporary temporary;
+        SyntheticVenue venue;
+        State state(config(temporary, "agg-ticks"));
+        expect(23, [&] { make_session(state, venue, [](const auto&) {}); });
+        passed("aggregate_mode_needs_a_next_print_fence_venue");
+    }
     assert(retry_after_seconds("120", 0) == 120);
     assert(retry_after_seconds("Wed, 21 Oct 2015 07:28:00 GMT", 1445412475) == 5);
     assert(retry_after_seconds("Wed, 21 Oct 2015 07:28:00 GMT", 1445412490) == 0);

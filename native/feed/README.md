@@ -144,7 +144,12 @@ and `n` count raw trades, not aggregates), so a minute `M` closes with
 
 1. a contiguous ID chain (`tradeId` or aggregate `a`, each exactly its
    predecessor plus one) from the REST-proven predecessor, the last print
-   strictly before `--start`;
+   strictly before `--start`. It is proven on both sides before it is saved:
+   OKX walks forward by trade ID from the time lookup until the next print is
+   at or after the start (REST can trail the newest prints, and prints of one
+   millisecond need not come back in ID order); USD-M takes the first
+   aggregate at or after the start within the next hour and the one before it.
+   Until both sides are visible nothing is anchored and the feed stops with 20;
 2. the fence: the next print in that chain has a matched time at or after
    `M + 60000`, so no further print of `M` can exist (matched time never goes
    backwards along the chain; if it does, the feed stops with 23);
@@ -222,7 +227,9 @@ REST routes are allowlisted per venue: Binance spot `exchangeInfo`,
 `klines`; OKX `public/instruments`, `market/history-trades`,
 `market/history-candles` (one request per 200 ms, half of 20 per 2 s); Bybit
 `market/kline`, `market/instruments-info` (one request per 100 ms, OKX `50011`
-and Bybit `10006` rate-limit bodies wait and retry like `429`). Current public weight/raw-request limits are read
+and Bybit `10006` rate-limit bodies wait and retry like `429`; OKX `50001`,
+`50004`, `50013`, `50026` and Bybit `10000`, `10016` mean "try again" and are
+retried with backoff like HTTP 5xx, within the same four attempts). Current public weight/raw-request limits are read
 from `exchangeInfo`, and requests are spaced to spend at most half of each
 published ceiling (about 50% headroom; 20 ms per weight at 6000 per minute, so
 500 ms per 1000-print page). The venue's `X-MBX-USED-WEIGHT-1M` header counts
@@ -336,7 +343,8 @@ symbols that can go quiet for a minute.
 ### Restart policy
 
 Retry budgets are short by design: about 2 minutes of failed WebSocket
-connects, or about 7 seconds of failed REST attempts, end with 20 and the
+connects (a connection the venue accepts but closes before any frame counts as
+failed), or about 7 seconds of failed REST attempts, end with 20 and the
 verified cursor retained. Run the feed under a supervisor (a systemd unit with
 `Restart=on-failure`, or a container restart policy) that restarts on 20 with
 backoff, as `--resume --output-from N` with the runner's committed count.

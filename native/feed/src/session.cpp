@@ -332,8 +332,14 @@ void FenceSession::anchor() {
 void FenceSession::put(const Trade& trade, bool healed) {
     trade.validate();
     if (trade.ts < state_.cursor().start) {
-        if (healed) throw Error(20, "a print after the proven predecessor precedes the start minute");
+        if (healed) throw Error(23, "venue matched time regressed: a print after the proven predecessor precedes the start minute");
         return;
+    }
+    // The predecessor is the last print before the start minute, and this print is at or after it.
+    const auto& predecessor = state_.cursor().predecessor;
+    if (predecessor && trade.id <= predecessor->id) {
+        if (trade.id == predecessor->id) throw Error(21, "a print changed the proven start predecessor");
+        throw Error(23, "venue matched time regressed: a print before the proven predecessor is at or after the start minute");
     }
     if (state_.cursor().seq && trade.id <= state_.cursor().seq) {
         const auto previous = state_.trade(trade.id);
@@ -375,9 +381,10 @@ void FenceSession::within_retention() const {
 }
 std::vector<Trade> FenceSession::page() {
     within_retention();
-    // REST may lag the WebSocket print that revealed the gap.
-    for (unsigned int attempt = 0; attempt < 3; ++attempt) {
-        if (attempt) pause_for(std::chrono::milliseconds(500 * attempt));
+    // REST may lag the WebSocket print that revealed the gap: about 7 seconds of spaced re-reads, like the
+    // reconnect overlap, before an empty answer counts.
+    for (unsigned int attempt = 0; attempt < 4; ++attempt) {
+        if (attempt) pause_for(std::chrono::milliseconds((state_.config().allow_insecure ? 100 : 1000) << (attempt - 1)));
         auto prints = venue_.history(next_id());
         if (!prints.empty()) {
             if (prints.front().id != next_id()) throw Error(20, "print history page does not start at the cursor");
@@ -497,7 +504,8 @@ void FenceSession::connected() {
             if (!(trades[index] == fetched[index])) throw Error(21, "reconnect print overlap changed");
     } else if (state_.cursor().predecessor) {
         const auto fetched = venue_.history(state_.cursor().predecessor->id, 1);
-        if (fetched.empty() || !(fetched.front() == *state_.cursor().predecessor)) throw Error(21, "initial predecessor overlap changed");
+        if (fetched.empty()) throw Error(20, "initial predecessor overlap is unavailable");
+        if (!(fetched.front() == *state_.cursor().predecessor)) throw Error(21, "initial predecessor overlap changed");
     }
     const auto& proofs = state_.cursor().proofs;
     if (!proofs.empty()) {
@@ -511,8 +519,11 @@ void FenceSession::connected() {
 }
 
 std::unique_ptr<Session> make_session(State& state, Venue& venue, std::function<void(const std::string&)> output) {
-    if (tick_mode(state.config().mode) && venue.tick_proof() == TickProof::NextPrintFence)
+    const auto& mode = state.config().mode;
+    if (tick_mode(mode) && venue.tick_proof() == TickProof::NextPrintFence)
         return std::make_unique<FenceSession>(state, venue, std::move(output));
+    // FeedSession proves only raw ticks through the kline ID range; any other tick mode would drop prints.
+    if (tick_mode(mode) && mode != "ticks") throw Error(23, "this venue has no proof for mode " + mode);
     return std::make_unique<FeedSession>(state, venue, std::move(output));
 }
 

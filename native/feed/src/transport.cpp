@@ -244,6 +244,11 @@ std::string HttpClient::body(const std::string& path, unsigned int weight, std::
             next_request_ = std::chrono::steady_clock::now() + std::chrono::seconds(wait);
             continue;
         }
+        if (code == CURLE_OK && policy_.transient && policy_.transient(status, response.body)) {
+            log("warn", "rest_transient_retry", Json::object({{"status", Json::number(std::to_string(status))}}));
+            next_request_ = std::chrono::steady_clock::now() + std::chrono::seconds(1U << attempt);
+            continue;
+        }
         if (code == CURLE_OK && status != 200 && policy_.rejected) policy_.rejected(status, response.body);
         if (status == 404) throw Error(20, "public history is unavailable");
         if (code != CURLE_OK || status >= 500) {
@@ -310,6 +315,8 @@ SourceMessage WebSocketPump::take() {
 void WebSocketPump::run() {
     try {
         unsigned int failures = 0;
+        // Reconnect backoff doubles from 2 units up to 30; loopback test origins use 50 ms units.
+        const auto unit = std::chrono::milliseconds(config_.allow_insecure ? 50 : 1000);
         auto next_attempt = std::chrono::steady_clock::now();
         while (!stopped()) {
             while (!stopped() && std::chrono::steady_clock::now() < next_attempt)
@@ -328,11 +335,10 @@ void WebSocketPump::run() {
                 throw Error(23, "public WebSocket access denied or redirected");
             if (handshake != CURLE_OK || status != 101) {
                 if (++failures >= 8) throw Error(20, "public WebSocket reconnect attempts exhausted");
-                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(std::min(30U, 1U << failures));
+                const auto deadline = std::chrono::steady_clock::now() + unit * std::min(30U, 1U << failures);
                 while (!stopped() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 continue;
             }
-            failures = 0;
             curl_socket_t socket = CURL_SOCKET_BAD;
             curl_easy_getinfo(handle.get(), CURLINFO_ACTIVESOCKET, &socket);
             // The marker precedes every message of this connection: the session verifies its REST
@@ -344,7 +350,7 @@ void WebSocketPump::run() {
             const auto birth = std::chrono::steady_clock::now();
             auto last_data = birth, message_birth = birth, last_ping = birth;
             std::string message;
-            bool assembling = false;
+            bool assembling = false, heard = false;
             std::uint64_t frame_offset = 0;
             while (subscribed && !stopped()) {
                 const auto now = std::chrono::steady_clock::now();
@@ -378,6 +384,8 @@ void WebSocketPump::run() {
                 if (metadata->flags & CURLWS_CONT) continue;
                 const auto kind = connection_.classify(message);
                 assembling = false;
+                // A connection counts as established only once the venue answers on it.
+                if (!heard) { heard = true; failures = 0; }
                 if (kind == Frame::Control) { message.clear(); continue; }
                 last_data = now;
                 push({false, std::move(message)});
@@ -387,6 +395,12 @@ void WebSocketPump::run() {
             if (!stopped()) {
                 log("warn", "websocket_reconnect");
                 std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                // Accepted, then closed or refused before any frame: that spends the reconnect budget too.
+                if (!heard) {
+                    if (++failures >= 8) throw Error(20, "public WebSocket reconnect attempts exhausted");
+                    const auto deadline = std::chrono::steady_clock::now() + unit * std::min(30U, 1U << failures);
+                    while (!stopped() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
             }
         }
     } catch (const Stopped&) {}

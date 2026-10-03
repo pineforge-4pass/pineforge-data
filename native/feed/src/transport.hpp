@@ -28,6 +28,8 @@ struct RestPolicy {
     std::function<void(long status, const std::string& body)> rejected;
     // A venue that signals rate limiting inside an HTTP 200 body.
     std::function<bool(const std::string& body)> throttled;
+    // A venue code that means "try again" (timeout, busy): retried with backoff like HTTP 5xx.
+    std::function<bool(long status, const std::string& body)> transient;
 };
 RestPolicy binance_spot_rest(const std::string& symbol);
 

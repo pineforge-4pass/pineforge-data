@@ -21,6 +21,13 @@ RestPolicy bybit_rest() {
     // 600 requests per 5 seconds per IP; this spends well under a fifth of it.
     policy.milliseconds_per_request = 100;
     policy.throttled = [](const std::string& body) { return body.find("\"retCode\":10006") != std::string::npos; };
+    // Server timeout and server error: the venue asks to retry.
+    policy.transient = [](long, const std::string& body) {
+        for (const char* code : {"10000", "10016"})
+            for (const char* end : {",", "}"})
+                if (body.find(std::string("\"retCode\":") + code + end) != std::string::npos) return true;
+        return false;
+    };
     return policy;
 }
 std::string category(const Config& config) { return config.market == "linear" ? "linear" : "spot"; }

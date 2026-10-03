@@ -24,6 +24,12 @@ RestPolicy okx_rest() {
     // Each endpoint allows 20 requests per 2 seconds per IP: spend at most half.
     policy.milliseconds_per_request = 200;
     policy.throttled = [](const std::string& body) { return body.find("\"code\":\"50011\"") != std::string::npos; };
+    // Service unavailable, endpoint timeout, system busy, system error: the venue asks to retry.
+    policy.transient = [](long, const std::string& body) {
+        for (const char* code : {"50001", "50004", "50013", "50026"})
+            if (body.find(std::string("\"code\":\"") + code + "\"") != std::string::npos) return true;
+        return false;
+    };
     return policy;
 }
 }
@@ -154,9 +160,21 @@ Trade Okx::predecessor(std::int64_t minute) {
     const auto page = data("/api/v5/market/history-trades?instId=" + config_.symbol + "&type=2&after=" + std::to_string(minute) + "&limit=1");
     const auto& items = rows(page, 1);
     if (items.empty()) throw Error(20, "no print precedes the start minute within the venue history");
-    const auto trade = okx_trade(items.front(), config_.symbol, multiplier_);
-    if (trade.ts >= minute) throw Error(20, "predecessor lookup returned a print at or after the start minute");
-    return trade;
+    auto candidate = okx_trade(items.front(), config_.symbol, multiplier_);
+    if (candidate.ts >= minute) throw Error(20, "predecessor lookup returned a print at or after the start minute");
+    // The time lookup alone is not proof: REST can trail the newest prints, and prints of one millisecond
+    // need not come back in ID order. Walk forward by ID until the next print is at or after the minute;
+    // only then is the candidate the last print before it. Nothing is anchored until that is seen.
+    for (unsigned int wait = 0; wait < 4;) {
+        const auto later = history(candidate.id + 1, 100);
+        for (const auto& trade : later) {
+            if (trade.ts >= minute) return candidate;
+            candidate = trade;
+        }
+        if (later.size() == 100) continue;
+        pause_for(std::chrono::milliseconds((config_.allow_insecure ? 100 : 1000) << wait++));
+    }
+    throw Error(20, "the print after the start predecessor is not yet available over REST");
 }
 std::vector<Kline> Okx::klines(std::int64_t start, std::int64_t end) {
     if (start <= 0 || start % 60000 || end <= start || end % 60000) throw Error(23, "invalid exclusive kline range");

@@ -225,17 +225,19 @@ std::vector<Trade> BinanceUsdm::history(std::uint64_t from, std::size_t limit) {
     return trades;
 }
 std::uint64_t BinanceUsdm::first_trade_id(std::int64_t minute) {
+    // The first aggregate at or after the start, searched over the next hour (the venue's longest time
+    // window), so a quiet start minute still has a fence; the fence session closes that minute on it.
     for (unsigned int attempt = 0; attempt < 3; ++attempt) {
         if (attempt) pause_for(std::chrono::milliseconds(500 * attempt));
         const auto response = http_.get("/fapi/v1/aggTrades?symbol=" + config_.symbol + "&startTime=" + std::to_string(minute) +
-            "&endTime=" + std::to_string(minute + 59999) + "&limit=1", 20);
+            "&endTime=" + std::to_string(minute + 3599999) + "&limit=1", 20);
         const auto& rows = array(response, 1);
         if (rows.empty()) continue;
         const auto first = usdm_aggregate(rows.front());
-        if (first.ts < minute || first.ts >= minute + 60000) throw Error(20, "initial aggregate fence is unavailable or ambiguous");
+        if (first.ts < minute || first.ts >= minute + 3600000) throw Error(20, "initial aggregate fence is unavailable or ambiguous");
         return first.id;
     }
-    throw Error(20, "initial minute has no available aggregate start fence");
+    throw Error(20, "no aggregate after the start minute is available yet");
 }
 std::vector<Kline> BinanceUsdm::klines(std::int64_t start, std::int64_t end) {
     if (start < 0 || start % 60000 || end <= start || end % 60000) throw Error(23, "invalid exclusive kline range");

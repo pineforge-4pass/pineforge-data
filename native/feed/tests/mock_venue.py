@@ -264,6 +264,9 @@ class MockServer(http.server.ThreadingHTTPServer):
         self.ws_paths = []
         self.exchange_info_bytes = 0
         self.pings = []
+        self.okx_time_lookup_skip = 0
+        self.refuse_once = None
+        self.usdm_unknown_symbol = False
         self.connections = 0
         self.trades = copy.deepcopy(TRADES)
         self.bars = copy.deepcopy(BARS)
@@ -314,6 +317,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if self.server.rate_once:
                 self.server.rate_once = False
                 self.respond(429, {}, retry=True)
+                return
+            if self.server.refuse_once:
+                status, value = self.server.refuse_once
+                self.server.refuse_once = None
+                self.respond(status, value)
                 return
             if self.server.venue != "binance":
                 status, rows = getattr(self, "rest_" + self.server.venue)(parsed.path, query)
@@ -466,6 +474,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 )
             return 200, rows
         if path == "/fapi/v1/klines":
+            if server.usdm_unknown_symbol:
+                return 400, {"code": -1121, "msg": "Invalid symbol."}
             if "startTime" not in query:
                 return 200, []
             start, end = int(query["startTime"][0]), int(query["endTime"][0])
@@ -506,6 +516,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     for key in sorted(server.okx_trades)
                     if server.okx_trades[key][0] < before_time
                 ]
+                # The time lookup can answer an older print first (lag, or one millisecond's order).
+                keys = keys[: len(keys) - server.okx_time_lookup_skip]
             else:
                 upper = int(query["after"][0])
                 lower = int(query["before"][0])
@@ -720,6 +732,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 time.sleep(action[1])
             elif action[0] == "raw":
                 send(action[1])
+            elif action[0] == "okx_unconfirm":
+                # REST trails the WebSocket confirm of this minute for a moment.
+                with self.server.lock:
+                    self.server.okx_unconfirmed.add(action[1])
+                threading.Timer(
+                    action[2], self.server.okx_unconfirmed.discard, (action[1],)
+                ).start()
             elif action[0] == "revise_okx_trade":
                 with self.server.lock:
                     matched, price, _size = self.server.okx_trades[action[1]]
@@ -1289,6 +1308,94 @@ class FeedMockTests(unittest.TestCase):
         saved = json.loads((self.directory / "state" / "cursor.json").read_text())["cursor"]
         self.assertEqual(saved["qty_multiplier"], "0.01")
 
+    def test_okx_start_predecessor_is_proven_by_the_next_print(self):
+        server = self.server([[okx_trades(100), okx_trades(101)]], "okx")
+        server.okx_trades[98] = (119998, "10.1", "10")
+        server.okx_time_lookup_skip = 1
+        output, _ = self.run_feed(server, "ticks", ["--max-messages", "2"])
+        self.assertEqual(sequence(output), [100, 101])
+        saved = json.loads((self.directory / "state" / "cursor.json").read_text())["cursor"]
+        self.assertEqual(saved["predecessor"]["seq"], 99)
+        # No print at or after the start is in REST yet: nothing is anchored and the stop is 20.
+        self.reset_state()
+        server = self.server([[okx_trades(100)]], "okx")
+        for identifier in range(100, 106):
+            del server.okx_trades[identifier]
+        output, result = self.run_feed(server, "ticks", expected=20)
+        self.assertEqual(output, [])
+        self.assertIn("not yet available", result.stderr)
+        saved = json.loads((self.directory / "state" / "cursor.json").read_text())["cursor"]
+        self.assertIsNone(saved["predecessor"])
+
+    def test_okx_busy_and_rate_limit_codes_are_retried(self):
+        for status, code, event in (
+            (400, "50004", "rest_transient_retry"),
+            (200, "50011", "rest_rate_limited"),
+        ):
+            with self.subTest(code=code):
+                self.reset_state()
+                server = self.server([[okx_candle(120000)]], "okx")
+                server.refuse_once = (status, {"code": code, "msg": "synthetic", "data": []})
+                output, result = self.run_feed(server, extra=["--max-messages", "1"])
+                self.assertEqual(len(output), 1)
+                self.assertIn(event, result.stderr)
+
+    def test_bybit_rate_limit_and_server_error_codes_are_retried(self):
+        for code, event in ((10006, "rest_rate_limited"), (10016, "rest_transient_retry")):
+            with self.subTest(code=code):
+                self.reset_state()
+                server = self.server([[bybit_push(bybit_row(120000, True))]], "bybit")
+                server.refuse_once = (200, {"retCode": code, "retMsg": "synthetic", "result": {}})
+                output, result = self.run_feed(server, extra=["--max-messages", "1"])
+                self.assertEqual(len(output), 1)
+                self.assertIn(event, result.stderr)
+
+    def test_usdm_unknown_symbol_is_refused_at_startup(self):
+        server = self.server([[candle(120000)]], "usdm")
+        server.usdm_unknown_symbol = True
+        output, result = self.run_feed(server, expected=23)
+        self.assertEqual(output, [])
+        self.assertIn("unknown USD-M symbol", result.stderr)
+        self.assertEqual(server.connections, 0)
+
+    def test_usdm_quiet_start_minute_closes_on_the_fence(self):
+        rows = {
+            500: {"T": 180001, "p": "12.00000000", "q": "0.40000000", "f": 1010, "l": 1012},
+            501: {"T": 180050, "p": "11.00000000", "q": "0.10000000", "f": 1013, "l": 1013},
+            502: {"T": 240001, "p": "12.00000000", "q": "0.10000000", "f": 1014, "l": 1014},
+        }
+        server = self.server(
+            [
+                [
+                    candle(120000, v="0.00000000", n=0, f=-1, L=-1),
+                    aggregate(500, nq=rows[500]["q"], **rows[500]),
+                    aggregate(501, nq=rows[501]["q"], **rows[501]),
+                    candle(180000),
+                    aggregate(502, nq=rows[502]["q"], **rows[502]),
+                ]
+            ],
+            "usdm",
+        )
+        server.aggregates = {499: AGGREGATES[499]}
+        for identifier, row in rows.items():
+            server.aggregates[identifier] = (
+                row["T"],
+                row["p"],
+                row["q"],
+                row["q"],
+                row["f"],
+                row["l"],
+            )
+        output, _ = self.run_feed(server, "agg-ticks", ["--max-messages", "5"])
+        self.assertEqual(sequence(output), [("time", 180000), 500, 501, ("time", 240000), 502])
+
+    def test_websocket_closed_before_any_frame_spends_the_reconnect_budget(self):
+        server = self.server([[("close",)]])
+        result = subprocess.run(self.command(server), capture_output=True, text=True, timeout=40)
+        self.assertEqual(result.returncode, 20, result.stderr)
+        self.assertIn("reconnect attempts exhausted", result.stderr)
+        self.assertGreaterEqual(server.connections, 8)
+
     def test_okx_websocket_and_rest_lexemes_differ_but_overlap_values_match(self):
         notice = {"event": "notice", "code": "64008", "msg": "upgrade", "connId": "mock"}
         rendered = {120000: ("10.10", "11.20", "9.90", "9.9", "60.0")}
@@ -1302,9 +1409,7 @@ class FeedMockTests(unittest.TestCase):
         self.assertGreaterEqual(server.connections, 2)
 
     def test_okx_warmup_rereads_a_rest_row_that_trails_the_websocket_confirm(self):
-        server = self.server([[okx_candle(180000)]], "okx")
-        server.okx_unconfirmed = {180000}
-        threading.Timer(0.35, server.okx_unconfirmed.clear).start()
+        server = self.server([[("okx_unconfirm", 180000, 0.35), okx_candle(180000)]], "okx")
         port = server.server_address[1]
         output = self.directory / "warmup.csv"
         command = [
@@ -1430,7 +1535,10 @@ class FeedMockTests(unittest.TestCase):
         output, result = self.run_feed(server, "ticks", expected=20)
         self.assertEqual([event["seq"] for event in output], [100])
         self.assertIn("beyond the venue's REST history window", result.stderr)
-        self.assertEqual(self.history_pages(server), [])
+        # Only the start predecessor's proof read prints by ID; the gap from 101 was never read.
+        self.assertEqual(
+            [page for page in self.history_pages(server) if int(page["before"][0]) >= 100], []
+        )
 
     def test_okx_warmup_converts_contract_volume(self):
         server = self.server([[okx_candle(240000)]], "okx")

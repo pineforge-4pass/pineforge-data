@@ -3,8 +3,28 @@
 An independent Apache-2.0 C++17 public-market-data adapter. It produces the
 native `pineforge-live` runner's JSONL protocol; it does not load strategies,
 place orders, access accounts, consume fills, or accept API keys. It is not part
-of the Python package or wheel. This first release supports **Binance spot**,
-`warmup` and `run`, with `bars` and raw `ticks`. There is no `serve` subcommand.
+of the Python package or wheel. It has `warmup` and `run`; there is no `serve`
+subcommand yet.
+
+## Venues and modes
+
+| `--venue` `--market` | Example `--symbol` | `bars` (confirmed 1m) | Ticks |
+|---|---|---|---|
+| `binance spot` | `BTCUSDT` | `kline_1m`, `x=true` | `ticks`: raw `trade`, ID+1, healed by `historicalTrades` |
+| `binance usdm` | `BTCUSDT` | routed `/market` `kline_1m`, `x=true` | `agg-ticks` only: aggregate prints, healed by `aggTrades` within 48 h |
+| `okx spot` | `BTC-USDT` | `candle1m`, confirm `"1"` | `ticks`: `trades-all`, ID+1, healed by `history-trades` within 3 months |
+| `okx swap` | `BTC-USDT-SWAP` | `candle1m`, confirm `"1"`, base volume | `ticks`: `trades-all`, base quantities |
+| `bybit spot`, `bybit linear` | `BTCUSDT` | `kline.1`, `confirm=true` | refused |
+| `coinbase` | | refused: deferred | refused: deferred |
+
+Gates are checked at startup, before any network access. Bybit tick modes stop
+with 23: Bybit trade IDs are not a contiguous cursor and its public REST cannot
+page back through trades, so no gap can be proven healed. Bybit bars never come
+from trades, because trade-built bars disagree with Bybit candles. Binance USD-M
+`ticks` stops with 23: its raw trades have no public REST history. Coinbase
+stops with 23 as deferred: it has no confirmed one-minute candle stream, and its
+REST and WebSocket trade timestamps disagree, so lossless tick paging does not
+exist. OKX inverse swaps are refused (their contracts are quote-denominated).
 
 ## Build
 
@@ -39,15 +59,24 @@ build-feed/pineforge-feed run --venue binance --market spot --symbol BTCUSDT \
   pineforge-live run --strategy strategy.so --warmup warmup.csv --mode bars \
     --script-tf 1 --feed - --ledger runner.sqlite3 --symbol BINANCE:BTCUSDT \
     --webhook-url https://receiver.example/actions
+# OKX swap ticks and USD-M aggregate prints both feed the runner's tick mode:
+build-feed/pineforge-feed run --venue okx --market swap --symbol BTC-USDT-SWAP \
+  --mode ticks --state-dir okx-state --start 2026-10-03T03:20:00Z |
+  pineforge-live run --strategy strategy.so --warmup okx-warmup.csv --mode ticks ...
+build-feed/pineforge-feed run --venue binance --market usdm --symbol BTCUSDT \
+  --mode agg-ticks --state-dir usdm-state --start 2026-10-03T03:20:00Z | ...
 ```
+
+Each venue's warmup takes the same flags and writes its own venue's candles:
+use a warmup from the venue and market that the live feed reads.
 
 Times are minute-aligned Unix milliseconds or strict UTC RFC3339 seconds.
 Warmup fetches contiguous REST 1m klines only behind an observed `x=true` WS
 watermark. Its end is **exclusive** and must be the live start. It writes the
 runner CSV columns `timestamp,open,high,low,close,volume` and an atomic
 `warmup.csv.manifest.json` containing source, symbol, units, start, exclusive
-cut, confirmation watermark, row count, and the CSV SHA-256. It refuses to
-overwrite either output. Keep both files together; an interrupted two-file
+cut, confirmation watermark, row count, quantity multiplier, and the CSV
+SHA-256. It refuses to overwrite either output. Keep both files together; an interrupted two-file
 publication without its manifest is not a qualified warmup.
 
 ## Protocol and proof policy
@@ -64,6 +93,23 @@ Venue decimal string tokens become JSON number tokens unchanged, including
 trailing zeros. Fixed-point string arithmetic reconciles OHLCV; no price or
 quantity enters a binary float. Bounds are 96 token characters, 32 fractional
 digits, and 128 arithmetic digits. Invalid/zero tick quantities fail closed.
+Overlap, duplicate and revision checks compare exact decimal **values**, not
+lexemes: OKX renders one candle price as `84850.0` on its WebSocket and as
+`84850` over REST, which is not a revision; any change of value still is.
+
+### Units
+
+Prices are quote per base, times are Unix milliseconds, and every quantity and
+volume is in **base** units. OKX swap `sz` and candle `vol` are contracts: the
+feed multiplies them exactly (decimal arithmetic, never float) by the
+instrument's `ctVal` x `ctMult` from the public instruments endpoint, which must
+be a live linear swap with `ctValCcy` equal to the base currency. For
+`BTC-USDT-SWAP`, 1.64 contracts are emitted as `0.0164`. A converted quantity is
+the canonical product (no trailing fractional zeros); every other token is the
+venue's own. The multiplier is bound into the cursor and the warmup manifest;
+a resume with a changed multiplier stops with 21.
+
+### Binance spot ticks
 
 Bars mode subscribes to `kline_1m` only; ticks mode adds the raw `trade`
 stream. Raw `t` is the positive sequence and matched `T` is time, not dispatch
@@ -90,23 +136,93 @@ Empty/ambiguous tick minutes deliberately stop rather than invent a fence.
 Bars heal missing minutes from REST only behind the verified closed watermark.
 Any discovered already-emitted bar revision stops; history is never rewritten.
 
+### Next-print fence: OKX ticks and USD-M aggregate prints
+
+OKX candles and USD-M klines name no print-ID range (a USD-M kline's `f..L`
+and `n` count raw trades, not aggregates), so a minute `M` closes with
+`time = M + 60000` only on this proof:
+
+1. a contiguous ID chain (`tradeId` or aggregate `a`, each exactly its
+   predecessor plus one) from the REST-proven predecessor, the last print
+   strictly before `--start`;
+2. the fence: the next print in that chain has a matched time at or after
+   `M + 60000`, so no further print of `M` can exist (matched time never goes
+   backwards along the chain; if it does, the feed stops with 23);
+3. the minute's closed candle: a confirmed WebSocket candle, or, only behind a
+   later confirmed WebSocket candle, the REST candle (OKX additionally requires
+   its per-row confirm `"1"`);
+4. exact OHLC and volume equality between the minute's prints and that candle.
+
+A candle without the fence never closes a minute, and the fence without the
+candle waits. A quiet minute closes on the same fence when its candle shows
+zero volume; nonzero volume there stops with 21. Prints of later minutes stay
+buffered until the proof. Holes heal by ID through REST: OKX `history-trades`
+pages of 100 with exclusive `after`/`before` trade-ID bounds, USD-M `aggTrades`
+`fromId` pages of 1000. A hole that starts more than the venue's documented
+window before the newest venue time on the WebSocket (OKX 89 days, inside its
+3-month window; USD-M 48 hours) stops with 20 without asking REST, and a USD-M
+`-4166` "recent 2 days" rejection also stops with 20.
+
+### OKX
+
+`candle1m` and `trades-all` come from the business endpoint `/ws/v5/business`,
+subscribed by message after every handshake. Only confirm `"1"` candles are
+bars; a forming candle is never one, and a REST row without confirm `"1"` ends
+the healed prefix. Ticks never come from the aggregated `trades` channel: a
+push on it, or any print carrying `count`, stops with 23. The feed sends text
+`ping` every `--keepalive-seconds` (default 20, at most 25: OKX closes a
+connection after 30 seconds without traffic) and treats `pong` as control,
+never data; a `notice` event (service upgrade) reconnects with overlap.
+
+### Bybit
+
+Bars only, from `kline.1.<SYMBOL>` on `/v5/public/spot` or `/v5/public/linear`.
+A push can carry the minute that just closed (`confirm=true`) and the next
+forming one; only the confirmed row is a bar. REST klines arrive newest first
+and a range wider than `limit` keeps only its newest rows, so each request asks
+for exactly the rows it can hold and the reversed rows must be contiguous. The
+feed sends `{"op":"ping"}` every `--keepalive-seconds`.
+
+### Binance USD-M
+
+Both modes use the routed `/market/stream` endpoint: since 2026-10-02 the
+unrouted origin no longer serves `aggTrade` or `kline` streams, and a raw
+`trade` event stops with 23. `agg-ticks` maps each aggregate `a` to exactly one
+print and never expands `f..l` into imaginary raw trades. **Aggregate prints
+are not raw trades**: one print is the sum of same-price, same-side executions,
+so a strategy sees fewer, larger intrabar prints than in raw tick mode. The
+print quantity is `q`, which includes RPI (retail price improvement)
+executions; `nq` excludes them and would not reconcile with the kline volume,
+which counts every execution. USD-M `exchangeInfo` exceeds the 1 MiB JSON
+bound, so only its top-level `rateLimits` member is extracted (4 MiB body cap)
+and parsed; requests then spend at most half of the published weight ceiling.
+
 The subscribed data streams are strict: another event type on them, a
-malformed trade or kline, or an unknown shape stops with 23. An event outside
+malformed trade or kline, or an unknown shape stops with 23 (on every venue). An event outside
 the data streams with an unknown type (a new venue notice) is logged as a
 structured `unknown_stream_event` warning and ignored; `serverShutdown`
 reconnects.
 
-Curl answers server PING with matching-payload PONG. Reconnect occurs on
-`serverShutdown`, transport loss/75-second source silence, or at 23h55 (before
-the venue's 24-hour limit). The reader buffers during REST healing. Every new
+Curl answers server PING with matching-payload PONG; OKX and Bybit get their
+text keepalives. Keepalive replies are control messages: they never count as
+data, so a silent data stream still reconnects. Reconnect occurs on
+`serverShutdown` or an OKX `notice`, transport loss/75 seconds without data, or
+at 23h55 (before the 24-hour Binance limit). The reader buffers during REST healing. Every new
 connection re-fetches up to 1000 raw prints and 32 closed-bar proofs, requires
 exact token/ID/time overlap, then continues the same stream epoch and sequence.
-An altered duplicate discovered outside that window is checked against the
-full retained normalized journal. Older, undiscovered revisions are not claimed
-to be continuously polled.
+A venue's REST row for the minute that just closed can trail its WebSocket
+close by a second or more (observed on USD-M at a restart): a disagreement must
+survive three spaced re-reads (about 7 seconds) before it stops with 21, and
+warmup re-reads its newest rows the same way. An altered duplicate discovered
+outside that window is checked against the full retained normalized journal.
+Older, undiscovered revisions are not claimed to be continuously polled.
 
-REST routes are restricted to public `exchangeInfo`, `historicalTrades`,
-`aggTrades`, and `klines`. Current public weight/raw-request limits are read
+REST routes are allowlisted per venue: Binance spot `exchangeInfo`,
+`historicalTrades`, `aggTrades`, `klines`; USD-M `exchangeInfo`, `aggTrades`,
+`klines`; OKX `public/instruments`, `market/history-trades`,
+`market/history-candles` (one request per 200 ms, half of 20 per 2 s); Bybit
+`market/kline`, `market/instruments-info` (one request per 100 ms, OKX `50011`
+and Bybit `10006` rate-limit bodies wait and retry like `429`). Current public weight/raw-request limits are read
 from `exchangeInfo`, and requests are spaced to spend at most half of each
 published ceiling (about 50% headroom; 20 ms per weight at 6000 per minute, so
 500 ms per 1000-print page). The venue's `X-MBX-USED-WEIGHT-1M` header counts
@@ -209,11 +325,13 @@ each bounded by `--max-replay-seconds`.
 
 ### Tick mode needs a liquid symbol
 
-75 seconds without any text frame forces a reconnect, and each reconnect costs
-a weight-27 overlap check (one `historicalTrades` page and one `klines` call).
-A minute without a print cannot be fenced, so tick mode stops with 20 there,
-and again on every resume. Use bars mode for symbols that can go quiet for a
-minute.
+75 seconds without any data message forces a reconnect, and each reconnect
+costs an overlap check (on Binance spot a weight-27 `historicalTrades` page and
+`klines` call). On Binance spot a minute without a print cannot be fenced, so
+tick mode stops with 20 there, and again on every resume. OKX and USD-M close a
+quiet minute on the next-print fence and its zero-volume candle, but the
+runner then sees a `time` event with no print in that minute. Use bars mode for
+symbols that can go quiet for a minute.
 
 ### Restart policy
 
@@ -229,12 +347,14 @@ disk, or a consumer that reads stdout again.
 ## Qualification and next adapters
 
 `tests/unit.cpp` and `tests/mock_venue.py` contain **synthetic** documented
-Binance message shapes only: holes, reordering, duplicates, revisions, access,
-reconnect overlap, fragmented text, PING/PONG, retirement, budgets, and recovery.
-Never commit public exchange captures. `tests/public_e2e.py` explicitly opts
-into public BTCUSDT capture, local receiver delivery, a hard-kill restart,
-exact REST verification, bar batch action parity through `run_backtest_full`,
-and tick same-print replay determinism. Tick actions are compared with the
+message shapes only (Binance spot, USD-M, OKX, Bybit): holes, reordering,
+duplicates, revisions, access, reconnect overlap, fragmented text, PING/PONG
+and text keepalives, retirement, budgets, recovery, and every venue quirk above.
+Never commit public exchange captures. `tests/public_e2e.py --venue V --market
+M --symbol S --modes bars,ticks|agg-ticks` explicitly opts into a public
+capture of one venue, local receiver delivery, a hard-kill restart, exact REST
+verification (OKX candle values; lexemes elsewhere), bar batch action parity
+through `run_backtest_full`, and tick same-print replay determinism. Tick actions are compared with the
 batch under the predeclared R-B2 mapping: each action timestamp becomes
 `floor(ts / script_tf) * script_tf` on both sides, because a tick fill carries
 its print's time while the OHLC batch carries its modeled segment's clock.
@@ -243,9 +363,10 @@ difference fails the run. Its batch observer is linked separately from the
 read-only engine's `tests/native_live_equivalence_observer.cpp`; it is not a
 feed dependency.
 
-`src/venue.hpp` is the adapter boundary. Later slices add OKX raw ticks/bars
-(contract-unit conversion where needed), Bybit confirmed bars **without ticks**,
-and USD-M confirmed bars / separately opted-in aggregate-print ticks. Coinbase
-remains deferred. `serve` will add approved MIT CivetWeb only to its server
-target, bounded client replay/queues, and cursor-bound fan-out; no server library
-is linked in this slice. The engine executable remains `pineforge-live`.
+`src/venue.hpp` is the adapter boundary: a venue supplies its WebSocket
+connection (path, subscription frames, keepalive, frame classifier), decoding,
+REST history and candles, its tick proof and its print history window.
+`src/session.cpp` holds the venue-neutral sessions. Coinbase remains deferred.
+`serve` will add approved MIT CivetWeb only to its server target, bounded client
+replay/queues, and cursor-bound fan-out; no server library is linked yet. The
+engine executable remains `pineforge-live`.

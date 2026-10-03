@@ -53,6 +53,14 @@ def action_key(record, mode):
     )
 
 
+def proven_actions(records, mode, window):
+    """Runner actions on the bars the batch replays, and how many fell after them. The batch
+    sees only proven minutes; ticks of a minute without its `time` event can still drive
+    actions in the runner, and those have no batch counterpart."""
+    inside = [action_key(record, mode) for record in records if record["bar_index"] < window]
+    return inside, len(records) - len(inside)
+
+
 class Receiver(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
@@ -367,9 +375,9 @@ class Soak:
             for record in rows(batch_actions)
             if record["origin_input_index"] >= 200
         ]
-        actual_actions = [
-            action_key(record, mode) for record in self.receiver.payloads.get(mode, [])
-        ]
+        actual_actions, trailing = proven_actions(
+            self.receiver.payloads.get(mode, []), mode, 200 + len(normalized)
+        )
         event_ids = [record["event_id"] for record in self.receiver.payloads.get(mode, [])]
         assert len(event_ids) == len(set(event_ids)), "duplicate delivered action after restart"
         equal = expected_actions == actual_actions
@@ -383,7 +391,8 @@ class Soak:
         verdict = "PASS" if equal else "FAIL"
         self.receipt(
             f"{verdict} {mode} actions equal batch via run_backtest_full{mapping} "
-            f"batch={len(expected_actions)} runner={len(actual_actions)}"
+            f"batch={len(expected_actions)} runner={len(actual_actions)} "
+            f"after_last_proven_minute={trailing}"
         )
         if mode == "ticks":
             name = "ticks-replay"
@@ -405,14 +414,13 @@ class Soak:
             assert raw == [
                 action_key(record, "bars") for record in self.receiver.payloads.get(name, [])
             ]
-            self.receipt(
-                f"PASS ticks same-print runner replay actions equal actions={len(actual_actions)}"
-            )
+            self.receipt(f"PASS ticks same-print runner replay actions equal actions={len(raw)}")
         return {
             "duration_seconds": duration,
             "messages": cursor,
             "minutes": len(normalized),
             "actions": len(actual_actions),
+            "actions_after_last_proven_minute": trailing,
             "batch_actions_equal": equal,
         }
 

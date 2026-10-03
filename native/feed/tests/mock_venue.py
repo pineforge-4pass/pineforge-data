@@ -21,7 +21,7 @@ import unittest
 import urllib.parse
 from types import SimpleNamespace
 
-from public_e2e import Soak, action_key
+from public_e2e import Soak, action_key, proven_actions
 
 BINARY = str(pathlib.Path(sys.argv[1]).resolve())
 sys.argv = [sys.argv[0]]
@@ -385,6 +385,25 @@ class FeedMockTests(unittest.TestCase):
         self.assertNotEqual(action_key(record, "bars"), action_key(batch, "bars"))
         moved = dict(record, order=dict(record["order"], price=84816.5))
         self.assertNotEqual(action_key(moved, "ticks"), action_key(batch, "ticks"))
+
+    def test_only_actions_on_proven_bars_are_compared(self):
+        record = {
+            "timestamp": 1791051480451,
+            "bar_index": 221,
+            "order": {
+                "id": "S",
+                "action": "sell",
+                "leg": "entry",
+                "contracts": 1.0,
+                "price": 84980.0,
+                "reduce_only": False,
+                "entry_incarnation": 15,
+            },
+        }
+        open_minute = dict(record, bar_index=222)
+        inside, trailing = proven_actions([record, open_minute], "ticks", 222)
+        self.assertEqual(inside, [action_key(record, "ticks")])
+        self.assertEqual(trailing, 1)
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="pineforge-feed-mock-")

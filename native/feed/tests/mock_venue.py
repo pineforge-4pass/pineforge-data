@@ -1505,7 +1505,8 @@ class FeedMockTests(unittest.TestCase):
                 [
                     okx_candle(120000, candles=quiet),
                     okx_candle(180000, candles=quiet),
-                    ("pause", 0.5),
+                    # Longer than the venue's 1.5 s predecessor wait: a blind anchor would stop 20.
+                    ("pause", 3.0),
                     ("add_okx_trade", 100, (240001, "12", "10")),
                     ("add_okx_trade", 101, (300001, "12", "10")),
                     okx_trades(100, ts="240001", px="12", sz="10"),
@@ -1535,7 +1536,7 @@ class FeedMockTests(unittest.TestCase):
         notice = {"event": "notice", "code": "64008", "msg": "upgrade", "connId": "mock"}
         server = self.server(
             [
-                # The pause lets the first connection's own instrument check and its bar finish first.
+                # The pause lets the first connection's instrument check and its bar finish first.
                 [okx_candle(120000), ("pause", 1.0), ("set_instrument", {"ctVal": "0.1"}), notice],
                 [okx_candle(180000)],
             ],

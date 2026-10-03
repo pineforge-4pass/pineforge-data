@@ -160,8 +160,8 @@ int main() {
     assert(normalized_trade(parse_json(exact.wire())) == exact);
     expect(23, [] { Trade{1, 1, "1", "0"}.validate(); });
     // Equality is by exact value: one venue number rendered two ways is not a revision; any change is.
-    assert((Bar{120000, "84850.0", "84850.1", "84826.5", "84826.5", "18.30"} == Bar{120000, "84850", "84850.1", "84826.5", "84826.5", "18.3"}));
-    assert(!(Bar{120000, "84850.0", "84850.1", "84826.5", "84826.5", "18.30"} == Bar{120000, "84850.01", "84850.1", "84826.5", "84826.5", "18.3"}));
+    assert((Bar{120000, "100.0", "100.1", "99.5", "99.5", "12.30"} == Bar{120000, "100", "100.1", "99.5", "99.5", "12.3"}));
+    assert(!(Bar{120000, "100.0", "100.1", "99.5", "99.5", "12.30"} == Bar{120000, "100.01", "100.1", "99.5", "99.5", "12.3"}));
     assert((Trade{7, 120001, "10.10", "0.5"} == Trade{7, 120001, "10.1", "0.50"}) && !(Trade{7, 120001, "10.1", "0.5"} == Trade{7, 120001, "10.1", "0.51"}));
     passed("decimal_tokens_and_uint64_identity");
 
@@ -451,16 +451,16 @@ int main() {
     }
 
     {
-        assert(Decimal("1.64").multiply(Decimal("0.01")).str() == "0.0164");
+        assert(Decimal("2.75").multiply(Decimal("0.01")).str() == "0.0275");
         assert(Decimal("2").multiply(Decimal("0.01")).str() == "0.02");
         assert(Decimal("100").multiply(Decimal("0.01")).str() == "1");
         assert(Decimal("0.5").multiply(Decimal("0")).str() == "0");
         assert(Decimal("12.30").str() == "12.3" && Decimal("0.00012").str() == "0.00012");
-        assert(scaled_quantity("1.640", "1") == "1.640");
-        assert(scaled_quantity("1.64", "0.01") == "0.0164");
+        assert(scaled_quantity("2.750", "1") == "2.750");
+        assert(scaled_quantity("2.75", "0.01") == "0.0275");
         // Contract conversion distributes exactly over the candle volume: no float, no rounding.
-        assert(Decimal(scaled_quantity("0.07", "0.01")).add(Decimal(scaled_quantity("186.80", "0.01"))) ==
-               Decimal(scaled_quantity("186.87", "0.01")));
+        assert(Decimal(scaled_quantity("0.05", "0.01")).add(Decimal(scaled_quantity("7.20", "0.01"))) ==
+               Decimal(scaled_quantity("7.25", "0.01")));
         expect(23, [] { Decimal("0." + std::string(20, '1')).multiply(Decimal("0." + std::string(20, '1'))); });
         passed("decimal_multiply_exact_contract_units");
     }
@@ -474,10 +474,10 @@ int main() {
         passed("json_member_extracts_one_member_beyond_the_parser_bound");
     }
     {
-        auto row = parse_json(R"({"instId":"TEST-USDT-SWAP","tradeId":"100","px":"10.1","sz":"1.64","side":"buy","ts":"120001","source":"0"})");
+        auto row = parse_json(R"({"instId":"TEST-USDT-SWAP","tradeId":"100","px":"10.1","sz":"2.75","side":"buy","ts":"120001","source":"0"})");
         const auto swap = okx_trade(row, "TEST-USDT-SWAP", "0.01");
-        assert(swap.id == 100 && swap.ts == 120001 && swap.price == "10.1" && swap.qty == "0.0164");
-        assert(okx_trade(row, "TEST-USDT-SWAP", "1").qty == "1.64");
+        assert(swap.id == 100 && swap.ts == 120001 && swap.price == "10.1" && swap.qty == "0.0275");
+        assert(okx_trade(row, "TEST-USDT-SWAP", "1").qty == "2.75");
         expect(23, [&] { okx_trade(row, "OTHER-USDT-SWAP", "0.01"); });
         auto aggregated = row;
         aggregated.members["count"] = Json::string("3");

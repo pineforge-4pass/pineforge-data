@@ -327,8 +327,8 @@ std::string Trade::wire() const {
     return "{\"type\":\"tick\",\"ts\":" + std::to_string(ts) + ",\"seq\":" + std::to_string(id) +
         ",\"price\":" + price + ",\"qty\":" + qty + "}";
 }
-// Exact decimal values, not lexemes: a venue may render one number as "84850.0" on its WebSocket and as
-// "84850" over REST. Emitted tokens stay verbatim; only the comparison is by value.
+// Exact decimal values, not lexemes: a venue may render one number as "100.0" on its WebSocket and as
+// "100" over REST. Emitted tokens stay verbatim; only the comparison is by value.
 bool Trade::operator==(const Trade& other) const {
     return id == other.id && ts == other.ts && Decimal(price) == Decimal(other.price) && Decimal(qty) == Decimal(other.qty);
 }

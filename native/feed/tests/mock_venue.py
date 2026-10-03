@@ -781,35 +781,35 @@ class FeedMockTests(unittest.TestCase):
 
     def test_r_b2_maps_only_tick_action_timestamps(self):
         record = {
-            "timestamp": 1791037920021,
+            "timestamp": 120021,
             "bar_index": 7,
             "order": {
                 "id": "long",
                 "action": "entry",
                 "leg": "long",
                 "contracts": 1.0,
-                "price": 84816.0,
+                "price": 10.1,
                 "reduce_only": False,
                 "entry_incarnation": 1,
             },
         }
-        batch = dict(record, timestamp=1791037920000)
+        batch = dict(record, timestamp=120000)
         self.assertEqual(action_key(record, "ticks"), action_key(batch, "ticks"))
         self.assertEqual(action_key(record, "agg-ticks"), action_key(batch, "agg-ticks"))
         self.assertNotEqual(action_key(record, "bars"), action_key(batch, "bars"))
-        moved = dict(record, order=dict(record["order"], price=84816.5))
+        moved = dict(record, order=dict(record["order"], price=10.15))
         self.assertNotEqual(action_key(moved, "ticks"), action_key(batch, "ticks"))
 
     def test_only_actions_on_proven_bars_are_compared(self):
         record = {
-            "timestamp": 1791051480451,
+            "timestamp": 180451,
             "bar_index": 221,
             "order": {
                 "id": "S",
                 "action": "sell",
                 "leg": "entry",
                 "contracts": 1.0,
-                "price": 84980.0,
+                "price": 11.2,
                 "reduce_only": False,
                 "entry_incarnation": 15,
             },

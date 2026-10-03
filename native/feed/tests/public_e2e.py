@@ -403,8 +403,8 @@ class Soak:
                         *(Decimal(token) for token in candle[1]),
                     ], "bar REST mismatch"
                     assert tape[index]["type"] == "bar"
-                    # OKX renders one candle number differently on its WebSocket ("84850.0") and
-                    # REST ("84850"); values are compared exactly above, lexemes where they agree.
+                    # OKX renders one candle number differently on its WebSocket ("100.0") and
+                    # REST ("100"); values are compared exactly above, lexemes where they agree.
                     if self.venue.venue != "okx":
                         assert [tokens[index]["bar"][key] for key in keys] == candle[1], (
                             "bar decimal tokens changed"

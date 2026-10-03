@@ -119,7 +119,7 @@ def receive(connection):
     size = second & 127
     if size == 126:
         size = struct.unpack("!H", exact(2))[0]
-    if size == 127:
+    elif size == 127:
         size = struct.unpack("!Q", exact(8))[0]
     if not second & 128:
         raise AssertionError("client frames must be masked")

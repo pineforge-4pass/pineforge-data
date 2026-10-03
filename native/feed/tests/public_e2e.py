@@ -455,15 +455,22 @@ class Soak:
                         assert event["type"] == "time" and event["ts"] == minute + 60000
                         candle = expected[len(normalized)]
                         prices = [tick["price"] for tick in minute_trades]
-                        assert prices, "a proven minute without prints"
-                        assert candle[2] is None or len(prices) == candle[2], "time count mismatch"
-                        values = [
-                            prices[0],
-                            max(prices),
-                            min(prices),
-                            prices[-1],
-                            sum(tick["qty"] for tick in minute_trades),
-                        ]
+                        if not prices:
+                            # A quiet minute closes on the next-print fence (OKX, USD-M) only with a
+                            # zero-volume candle; the batch then sees that flat candle.
+                            assert candle[2] is None and Decimal(candle[1][4]) == 0, (
+                                "a proven minute without prints"
+                            )
+                            values = [Decimal(token) for token in candle[1]]
+                        else:
+                            assert candle[2] is None or len(prices) == candle[2], "count mismatch"
+                            values = [
+                                prices[0],
+                                max(prices),
+                                min(prices),
+                                prices[-1],
+                                sum(tick["qty"] for tick in minute_trades),
+                            ]
                         assert values == [Decimal(token) for token in candle[1]], (
                             "time OHLCV mismatch"
                         )

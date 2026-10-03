@@ -365,6 +365,18 @@ class Soak:
         summary = json.loads((self.directory / f"{mode}-runner-{generation}.stdout").read_text())
         return summary["inputs_committed"]
 
+    @staticmethod
+    def settled(check, attempts=6, pause=5):
+        """REST rows of the newest minutes and prints can trail the feed's WebSocket by seconds:
+        a REST disagreement must persist across spaced re-reads (about 25 s) before it fails."""
+        for attempt in range(attempts):
+            try:
+                return check()
+            except AssertionError:
+                if attempt == attempts - 1:
+                    raise
+                time.sleep(pause)
+
     def validate(self, mode, duration, cursor, minutes):
         getcontext().prec = 160
         tape = rows(self.directory / (mode + "-feed.jsonl"), True)
@@ -379,19 +391,24 @@ class Soak:
         if mode == "bars":
             normalized = [event["bar"] for event in tape]
             assert len(normalized) >= minutes - 1 and duration >= (minutes - 1) * 60
-            expected = self.venue.candles(self.cut, normalized[-1]["ts_open"] + 60000)
-            for index, (actual, candle) in enumerate(zip(normalized, expected, strict=True)):
-                assert [actual["ts_open"], *(actual[key] for key in ("o", "h", "l", "c", "v"))] == [
-                    candle[0],
-                    *(Decimal(token) for token in candle[1]),
-                ], "bar REST mismatch"
-                assert tape[index]["type"] == "bar"
-                # OKX renders one candle number differently on its WebSocket ("84850.0") and REST
-                # ("84850"); values are compared exactly above, lexemes only where they agree.
-                if self.venue.venue != "okx":
-                    assert [
-                        tokens[index]["bar"][key] for key in ("o", "h", "l", "c", "v")
-                    ] == candle[1], "bar decimal tokens changed"
+
+            def compare_bars():
+                expected = self.venue.candles(self.cut, normalized[-1]["ts_open"] + 60000)
+                for index, (actual, candle) in enumerate(zip(normalized, expected, strict=True)):
+                    keys = ("o", "h", "l", "c", "v")
+                    assert [actual["ts_open"], *(actual[key] for key in keys)] == [
+                        candle[0],
+                        *(Decimal(token) for token in candle[1]),
+                    ], "bar REST mismatch"
+                    assert tape[index]["type"] == "bar"
+                    # OKX renders one candle number differently on its WebSocket ("84850.0") and
+                    # REST ("84850"); values are compared exactly above, lexemes where they agree.
+                    if self.venue.venue != "okx":
+                        assert [tokens[index]["bar"][key] for key in keys] == candle[1], (
+                            "bar decimal tokens changed"
+                        )
+
+            self.settled(compare_bars)
             self.receipt(
                 f"PASS bars equal REST minutes={len(normalized)} duration_seconds={duration:.3f}"
             )
@@ -403,56 +420,61 @@ class Soak:
             assert len(times) >= minutes - 1 and trades
             for previous, current in itertools.pairwise(trades):
                 assert current["seq"] == previous["seq"] + 1 and current["ts"] >= previous["ts"]
-            next_id = trades[0]["seq"]
-            trade_offset = 0
-            while trade_offset < len(trades):
-                for identifier, matched, price, quantity in self.venue.prints(next_id):
-                    if trade_offset == len(trades):
-                        break
-                    tick = trades[trade_offset]
-                    assert [tick["seq"], tick["ts"], tick["price"], tick["qty"]] == [
-                        identifier,
-                        matched,
-                        Decimal(price),
-                        Decimal(quantity),
-                    ], "print REST mismatch"
-                    assert [trade_tokens[trade_offset][key] for key in ("price", "qty")] == [
-                        price,
-                        quantity,
-                    ], "print decimal tokens changed"
-                    trade_offset += 1
-                    next_id += 1
-            expected = self.venue.candles(self.cut, times[-1])
-            normalized = []
-            minute_trades = []
-            minute = self.cut
-            for event in tape:
-                if event["type"] == "tick":
-                    assert minute <= event["ts"] < minute + 60000, "time/print ordering violation"
-                    minute_trades.append(event)
-                else:
-                    assert event["type"] == "time" and event["ts"] == minute + 60000
-                    candle = expected[len(normalized)]
-                    prices = [tick["price"] for tick in minute_trades]
-                    assert prices, "a proven minute without prints"
-                    assert candle[2] is None or len(prices) == candle[2], "time count mismatch"
-                    values = [
-                        prices[0],
-                        max(prices),
-                        min(prices),
-                        prices[-1],
-                        sum(tick["qty"] for tick in minute_trades),
-                    ]
-                    assert values == [Decimal(token) for token in candle[1]], "time OHLCV mismatch"
-                    normalized.append(
-                        dict(
-                            zip(
-                                ("ts_open", "o", "h", "l", "c", "v"), [minute, *values], strict=True
-                            )
+
+            def compare_prints():
+                next_id = trades[0]["seq"]
+                trade_offset = 0
+                while trade_offset < len(trades):
+                    for identifier, matched, price, quantity in self.venue.prints(next_id):
+                        if trade_offset == len(trades):
+                            break
+                        tick = trades[trade_offset]
+                        assert [tick["seq"], tick["ts"], tick["price"], tick["qty"]] == [
+                            identifier,
+                            matched,
+                            Decimal(price),
+                            Decimal(quantity),
+                        ], "print REST mismatch"
+                        assert [trade_tokens[trade_offset][key] for key in ("price", "qty")] == [
+                            price,
+                            quantity,
+                        ], "print decimal tokens changed"
+                        trade_offset += 1
+                        next_id += 1
+
+            def compare_minutes():
+                expected = self.venue.candles(self.cut, times[-1])
+                normalized = []
+                minute_trades = []
+                minute = self.cut
+                for event in tape:
+                    if event["type"] == "tick":
+                        assert minute <= event["ts"] < minute + 60000, "time/print ordering"
+                        minute_trades.append(event)
+                    else:
+                        assert event["type"] == "time" and event["ts"] == minute + 60000
+                        candle = expected[len(normalized)]
+                        prices = [tick["price"] for tick in minute_trades]
+                        assert prices, "a proven minute without prints"
+                        assert candle[2] is None or len(prices) == candle[2], "time count mismatch"
+                        values = [
+                            prices[0],
+                            max(prices),
+                            min(prices),
+                            prices[-1],
+                            sum(tick["qty"] for tick in minute_trades),
+                        ]
+                        assert values == [Decimal(token) for token in candle[1]], (
+                            "time OHLCV mismatch"
                         )
-                    )
-                    minute += 60000
-                    minute_trades = []
+                        keys = ("ts_open", "o", "h", "l", "c", "v")
+                        normalized.append(dict(zip(keys, [minute, *values], strict=True)))
+                        minute += 60000
+                        minute_trades = []
+                return normalized
+
+            self.settled(compare_prints)
+            normalized = self.settled(compare_minutes)
             self.receipt(
                 f"PASS {mode} contiguous and time events equal REST ticks={len(trades)} "
                 f"minutes={len(times)} duration_seconds={duration:.3f}"

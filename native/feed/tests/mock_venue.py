@@ -1301,6 +1301,38 @@ class FeedMockTests(unittest.TestCase):
         self.assertIn('"o":10.10,"h":11.20,"l":9.90,"c":9.9,"v":0.6}', result.stdout)
         self.assertGreaterEqual(server.connections, 2)
 
+    def test_okx_warmup_rereads_a_rest_row_that_trails_the_websocket_confirm(self):
+        server = self.server([[okx_candle(180000)]], "okx")
+        server.okx_unconfirmed = {180000}
+        threading.Timer(0.35, server.okx_unconfirmed.clear).start()
+        port = server.server_address[1]
+        output = self.directory / "warmup.csv"
+        command = [
+            BINARY,
+            "warmup",
+            "--venue",
+            "okx",
+            "--market",
+            "swap",
+            "--symbol",
+            OKX_SWAP,
+            "--start",
+            "120000",
+            "--end",
+            "240000",
+            "--output",
+            str(output),
+            "--rest-url",
+            f"http://127.0.0.1:{port}",
+            "--ws-url",
+            f"ws://127.0.0.1:{port}",
+            "--allow-insecure-http",
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("rest_overlap_trailing", result.stderr)
+        self.assertEqual(len(output.read_text().splitlines()), 3)
+
     def test_okx_unconfirmed_rest_candle_is_never_a_bar(self):
         server = self.server([[okx_candle(180000)]], "okx")
         server.okx_unconfirmed = {120000}

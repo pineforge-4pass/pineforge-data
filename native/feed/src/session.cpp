@@ -32,8 +32,13 @@ bool same_bars(const std::vector<Kline>& fetched, const std::deque<Bar>& bars) {
 std::vector<Kline> settled_klines(Venue& venue, const Config& config, std::int64_t start, std::int64_t end,
                                   const std::function<bool(const std::vector<Kline>&)>& agrees) {
     for (unsigned int attempt = 0;; ++attempt) {
-        auto fetched = venue.klines(start, end);
-        if (agrees(fetched) || attempt == 3) return fetched;
+        try {
+            auto fetched = venue.klines(start, end);
+            if (agrees(fetched) || attempt == 3) return fetched;
+        } catch (const Error& failure) {
+            // A missing or still-unconfirmed newest row (20) is the same lag; it persists only after re-reads.
+            if (failure.code != 20 || attempt == 3) throw;
+        }
         log("warn", "rest_overlap_trailing", Json::object({{"attempt", Json::number(std::to_string(attempt + 1))}}));
         pause_for(std::chrono::milliseconds((config.allow_insecure ? 100 : 1000) << attempt));
     }

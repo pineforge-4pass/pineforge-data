@@ -3,6 +3,7 @@
 #include "core.hpp"
 #include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace pineforge::feed {
@@ -44,6 +45,14 @@ public:
         if (previous.empty() || previous.front().id != first - 1) throw Error(20, "raw predecessor is unavailable");
         return previous.front();
     }
+    // The same predecessor, but only once the venue holds a print at or after `minute`: nullopt while it
+    // holds none, without waiting or stopping (a quiet start). Fence venues override it.
+    virtual std::optional<Trade> predecessor_if_ready(std::int64_t minute) {
+        try { return predecessor(minute); }
+        catch (const Error& failure) { if (failure.code == 20) return std::nullopt; throw; }
+    }
+    // Re-checks instrument metadata that fixes the stream's units; a change stops 21. Called on connect.
+    virtual void reverify() {}
     // Contiguous closed one-minute candles in [start, end), ascending.
     virtual std::vector<Kline> klines(std::int64_t start, std::int64_t end) = 0;
     virtual TickProof tick_proof() const { return TickProof::KlineIdRange; }

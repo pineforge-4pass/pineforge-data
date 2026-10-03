@@ -37,6 +37,7 @@ public:
     std::vector<VenueEvent> decode(const std::string& message) const override;
     std::vector<Trade> history(std::uint64_t from, std::size_t limit = 1000) override;
     std::uint64_t first_trade_id(std::int64_t minute) override;
+    std::optional<Trade> predecessor_if_ready(std::int64_t minute) override;
     std::vector<Kline> klines(std::int64_t start, std::int64_t end) override;
     TickProof tick_proof() const override { return TickProof::NextPrintFence; }
     std::int64_t retention_ms() const override { return 48LL * 3600000; }

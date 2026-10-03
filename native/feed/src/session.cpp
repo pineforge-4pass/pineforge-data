@@ -108,6 +108,7 @@ FeedSession::FeedSession(State& state, Venue& venue, std::function<void(const st
 
 void FeedSession::connected() {
     publish();
+    venue_.reverify();
     const auto& trades = state_.recent_trades();
     if (!trades.empty()) {
         const auto fetched = settled_prints(venue_, state_.config(), trades);
@@ -379,11 +380,11 @@ void FenceSession::within_retention() const {
     if (window && last >= 0 && newest_ > last && newest_ - last > window)
         throw Error(20, "print gap starts beyond the venue's REST history window");
 }
-std::vector<Trade> FenceSession::page() {
+std::vector<Trade> FenceSession::page(bool patient) {
     within_retention();
     // REST may lag the WebSocket print that revealed the gap: about 7 seconds of spaced re-reads, like the
-    // reconnect overlap, before an empty answer counts.
-    for (unsigned int attempt = 0; attempt < 4; ++attempt) {
+    // reconnect overlap, before an empty answer counts. Looking ahead without such a print reads once.
+    for (unsigned int attempt = 0; attempt < (patient ? 4U : 1U); ++attempt) {
         if (attempt) pause_for(std::chrono::milliseconds((state_.config().allow_insecure ? 100 : 1000) << (attempt - 1)));
         auto prints = venue_.history(next_id());
         if (!prints.empty()) {
@@ -396,7 +397,7 @@ std::vector<Trade> FenceSession::page() {
 void FenceSession::heal() {
     const auto target = pending_.begin()->first - 1;
     log("warn", "print_gap_healing", Json::object({{"from_id", Json::number(std::to_string(next_id()))}, {"through_id", Json::number(std::to_string(target))}}));
-    const auto prints = page();
+    const auto prints = page(true);
     if (prints.empty()) throw Error(20, "print gap cannot advance within available history");
     for (const auto& trade : prints) {
         if (trade.id > target) break;
@@ -404,11 +405,17 @@ void FenceSession::heal() {
     }
 }
 // A later minute was confirmed while no print beyond the chain is in hand: look for the fence by ID.
+// A quiet start waits: nothing is anchored, and no minute closes, until the venue holds a print at or
+// after --start. An empty page means no print beyond the chain yet, not a gap.
 bool FenceSession::forward() {
     if (forward_watermark_ >= watermark_) return false;
     forward_watermark_ = watermark_;
-    anchor();
-    const auto prints = page();
+    if (!state_.cursor().predecessor) {
+        const auto predecessor = venue_.predecessor_if_ready(state_.cursor().start);
+        if (!predecessor) return false;
+        state_.anchor(*predecessor);
+    }
+    const auto prints = page(false);
     for (const auto& trade : prints) put(trade, true);
     return !prints.empty();
 }
@@ -498,6 +505,7 @@ void FenceSession::stage(const VenueEvent& event) {
 }
 void FenceSession::connected() {
     publish();
+    venue_.reverify();
     const auto& trades = state_.recent_trades();
     if (!trades.empty()) {
         const auto fetched = settled_prints(venue_, state_.config(), trades);

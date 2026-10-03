@@ -65,7 +65,7 @@ class FenceSession final : public Session {
     void put(const Trade& trade, bool healed);
     void emit_trade(const Trade& trade);
     void within_retention() const;
-    std::vector<Trade> page();
+    std::vector<Trade> page(bool patient);
     void heal();
     bool forward();
     bool close_minute();

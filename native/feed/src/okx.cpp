@@ -91,11 +91,18 @@ Frame okx_frame(const std::string& message) {
 }
 
 Okx::Okx(const Config& config) : config_(config), http_(config, okx_rest()) {
+    multiplier_ = instrument_multiplier();
+    log("info", "instrument_verified", Json::object({{"symbol", Json::string(config_.symbol)}, {"qty_multiplier", Json::string(multiplier_)}}));
+}
+std::string Okx::instrument_multiplier() {
     const auto& instruments = data("/api/v5/public/instruments?instType=" + std::string(config_.market == "swap" ? "SWAP" : "SPOT") +
                                    "&instId=" + config_.symbol).items;
     if (instruments.size() != 1) throw Error(23, "unknown OKX instrument");
-    multiplier_ = okx_multiplier(instruments.front(), config_.market, config_.symbol);
-    log("info", "instrument_verified", Json::object({{"symbol", Json::string(config_.symbol)}, {"qty_multiplier", Json::string(multiplier_)}}));
+    return okx_multiplier(instruments.front(), config_.market, config_.symbol);
+}
+// Every reconnect re-reads ctVal x ctMult: quantities already emitted were converted with the old one.
+void Okx::reverify() {
+    if (instrument_multiplier() != multiplier_) throw Error(21, "OKX contract multiplier changed during the run");
 }
 Json Okx::data(const std::string& path) {
     const auto response = http_.get(path, 1);
@@ -155,27 +162,34 @@ std::vector<Trade> Okx::history(std::uint64_t from, std::size_t limit) {
     }
     return result;
 }
-Trade Okx::predecessor(std::int64_t minute) {
+// The time lookup alone is not proof: REST can trail the newest prints, and prints of one millisecond need
+// not come back in ID order. Walk forward by ID until the next print is at or after the minute; only then
+// is the candidate the last print before it. Nothing is anchored until that is seen.
+std::optional<Trade> Okx::walk_to(std::int64_t minute) {
     // type=2 pages by time: `after` returns prints strictly earlier than the minute, newest first.
     const auto page = data("/api/v5/market/history-trades?instId=" + config_.symbol + "&type=2&after=" + std::to_string(minute) + "&limit=1");
     const auto& items = rows(page, 1);
     if (items.empty()) throw Error(20, "no print precedes the start minute within the venue history");
     auto candidate = okx_trade(items.front(), config_.symbol, multiplier_);
     if (candidate.ts >= minute) throw Error(20, "predecessor lookup returned a print at or after the start minute");
-    // The time lookup alone is not proof: REST can trail the newest prints, and prints of one millisecond
-    // need not come back in ID order. Walk forward by ID until the next print is at or after the minute;
-    // only then is the candidate the last print before it. Nothing is anchored until that is seen.
-    for (unsigned int wait = 0; wait < 4;) {
+    for (;;) {
         const auto later = history(candidate.id + 1, 100);
         for (const auto& trade : later) {
             if (trade.ts >= minute) return candidate;
             candidate = trade;
         }
-        if (later.size() == 100) continue;
-        pause_for(std::chrono::milliseconds((config_.allow_insecure ? 100 : 1000) << wait++));
+        if (later.size() < 100) return std::nullopt;
+    }
+}
+// A WebSocket print at or after the minute exists: REST must show its successor within about 15 seconds.
+Trade Okx::predecessor(std::int64_t minute) {
+    for (unsigned int wait = 0; wait < 4; ++wait) {
+        if (const auto found = walk_to(minute)) return *found;
+        pause_for(std::chrono::milliseconds((config_.allow_insecure ? 100 : 1000) << wait));
     }
     throw Error(20, "the print after the start predecessor is not yet available over REST");
 }
+std::optional<Trade> Okx::predecessor_if_ready(std::int64_t minute) { return walk_to(minute); }
 std::vector<Kline> Okx::klines(std::int64_t start, std::int64_t end) {
     if (start <= 0 || start % 60000 || end <= start || end % 60000) throw Error(23, "invalid exclusive kline range");
     std::vector<Kline> result;

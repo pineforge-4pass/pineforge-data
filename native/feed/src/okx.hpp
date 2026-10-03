@@ -18,12 +18,17 @@ class Okx final : public Venue {
     HttpClient http_;
     std::string multiplier_ = "1";
     Json data(const std::string& path);
+    std::string instrument_multiplier();
+    // The time lookup plus the walk by ID; nullopt when no print at or after the minute is visible yet.
+    std::optional<Trade> walk_to(std::int64_t minute);
 public:
     explicit Okx(const Config& config);
     Connection connection() const override;
     std::vector<VenueEvent> decode(const std::string& message) const override;
     std::vector<Trade> history(std::uint64_t from, std::size_t limit = 1000) override;
     Trade predecessor(std::int64_t minute) override;
+    std::optional<Trade> predecessor_if_ready(std::int64_t minute) override;
+    void reverify() override;
     std::vector<Kline> klines(std::int64_t start, std::int64_t end) override;
     TickProof tick_proof() const override { return TickProof::NextPrintFence; }
     // history-trades covers the last three months; 89 days stays inside every three-month span.

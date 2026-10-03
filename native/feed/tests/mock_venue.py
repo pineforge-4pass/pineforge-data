@@ -176,9 +176,9 @@ BYBIT_BARS = {
 }
 
 
-def bybit_row(minute, confirm):
+def bybit_row(minute, confirm, **changes):
     opening, high, low, close, volume = BYBIT_BARS[minute]
-    return {
+    row = {
         "start": minute,
         "end": minute + 59999,
         "interval": "1",
@@ -191,6 +191,8 @@ def bybit_row(minute, confirm):
         "confirm": confirm,
         "timestamp": minute + 30000,
     }
+    row.update(changes)
+    return row
 
 
 def bybit_push(*rows):
@@ -732,6 +734,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 time.sleep(action[1])
             elif action[0] == "raw":
                 send(action[1])
+            elif action[0] == "add_okx_trade":
+                with self.server.lock:
+                    self.server.okx_trades[action[1]] = action[2]
+            elif action[0] == "set_instrument":
+                with self.server.lock:
+                    self.server.instrument = dict(self.server.instrument, **action[1])
             elif action[0] == "okx_unconfirm":
                 # REST trails the WebSocket confirm of this minute for a moment.
                 with self.server.lock:
@@ -1396,6 +1404,147 @@ class FeedMockTests(unittest.TestCase):
         self.assertIn("reconnect attempts exhausted", result.stderr)
         self.assertGreaterEqual(server.connections, 8)
 
+    def test_usdm_forming_kline_never_closes_a_fenced_minute(self):
+        forming = candle(120000, confirmed=False)
+        server = self.server(
+            [
+                [
+                    aggregate(500),
+                    aggregate(501),
+                    aggregate(502),
+                    forming,
+                    aggregate(503),
+                    ("pause", 0.3),
+                    ("raw", "{"),
+                ]
+            ],
+            "usdm",
+        )
+        output, _ = self.run_feed(server, "agg-ticks", expected=23)
+        self.assertEqual(sequence(output), [500, 501, 502])
+
+    def test_usdm_conflicting_duplicate_aggregate_stops_21(self):
+        for script, emitted in (
+            ([aggregate(500), aggregate(500, q="0.20000000")], [500]),
+            (
+                [
+                    aggregate(500),
+                    aggregate(501),
+                    aggregate(502),
+                    aggregate(503),
+                    aggregate(503, p="12.10000000"),
+                ],
+                [500, 501, 502],
+            ),
+        ):
+            with self.subTest(emitted=emitted):
+                self.reset_state()
+                server = self.server([script], "usdm")
+                output, result = self.run_feed(server, "agg-ticks", expected=21)
+                self.assertEqual(sequence(output), emitted)
+                self.assertIn("duplicate print conflicts", result.stderr)
+
+    def test_usdm_reconnect_changed_kline_overlap_stops_21(self):
+        server = self.server(
+            [
+                [
+                    aggregate(500),
+                    aggregate(501),
+                    aggregate(502),
+                    candle(120000),
+                    aggregate(503),
+                    ("revise_rest", 120000),
+                    retirement(),
+                ],
+                [aggregate(504)],
+            ],
+            "usdm",
+        )
+        output, result = self.run_feed(server, "agg-ticks", expected=21)
+        self.assertEqual(sequence(output), [500, 501, 502, ("time", 180000), 503])
+        self.assertIn("reconnect already-closed candle changed", result.stderr)
+
+    def test_okx_rest_page_with_a_nonunit_id_stops_20(self):
+        # The hole sits inside a heal page, past the 100 IDs the start predecessor's proof reads.
+        server = self.server([[]], "okx")
+        server.okx_trades = {99: OKX_TRADES[99]}
+        for identifier in range(100, 261):
+            server.okx_trades[identifier] = (120001 + (identifier - 100) * 100, "10", "1")
+        del server.okx_trades[230]
+
+        def push(identifier):
+            matched, price, size = server.okx_trades[identifier]
+            row = {
+                "instId": OKX_SWAP,
+                "tradeId": str(identifier),
+                "px": price,
+                "sz": size,
+                "side": "buy",
+                "ts": str(matched),
+                "source": "0",
+            }
+            return {"arg": {"channel": "trades-all", "instId": OKX_SWAP}, "data": [row]}
+
+        server.scripts = [[push(100), push(260)]]
+        output, result = self.run_feed(server, "ticks", expected=20)
+        self.assertEqual(sequence(output), [100])
+        self.assertIn("trade-id page has a missing or nonunit venue trade ID", result.stderr)
+
+    def test_usdm_rest_page_with_a_nonunit_id_stops_20(self):
+        server = self.server([[aggregate(500), aggregate(504)]], "usdm")
+        del server.aggregates[502]
+        output, result = self.run_feed(server, "agg-ticks", expected=20)
+        self.assertEqual(sequence(output), [500])
+        self.assertIn("aggregate-history page has a missing or nonunit aggregate ID", result.stderr)
+
+    def test_okx_quiet_start_waits_for_the_first_print(self):
+        quiet = {minute: ("10.1", "10.1", "10.1", "10.1", "0") for minute in (120000, 180000)}
+        quiet[240000] = ("12", "12", "12", "12", "10")
+        server = self.server(
+            [
+                [
+                    okx_candle(120000, candles=quiet),
+                    okx_candle(180000, candles=quiet),
+                    ("pause", 0.5),
+                    ("add_okx_trade", 100, (240001, "12", "10")),
+                    ("add_okx_trade", 101, (300001, "12", "10")),
+                    okx_trades(100, ts="240001", px="12", sz="10"),
+                    okx_candle(240000, candles=quiet),
+                    okx_trades(101, ts="300001", px="12", sz="10"),
+                ]
+            ],
+            "okx",
+        )
+        server.okx_trades = {99: OKX_TRADES[99]}
+        server.okx_candles = quiet
+        output, result = self.run_feed(server, "ticks", ["--max-messages", "4"])
+        self.assertEqual(
+            sequence(output), [("time", 180000), ("time", 240000), 100, ("time", 300000)]
+        )
+        self.assertNotIn('"code":20', result.stderr)
+
+    def test_bybit_http_403_is_a_retryable_rate_ban(self):
+        server = self.server([[bybit_push(bybit_row(120000, True))]], "bybit")
+        server.fail_status = 403
+        output, result = self.run_feed(server, expected=20)
+        self.assertEqual(output, [])
+        self.assertIn("Bybit IP rate ban", result.stderr)
+        self.assertEqual(server.auth_headers, [])
+
+    def test_okx_changed_contract_multiplier_stops_21_on_reconnect(self):
+        notice = {"event": "notice", "code": "64008", "msg": "upgrade", "connId": "mock"}
+        server = self.server(
+            [
+                # The pause lets the first connection's own instrument check and its bar finish first.
+                [okx_candle(120000), ("pause", 1.0), ("set_instrument", {"ctVal": "0.1"}), notice],
+                [okx_candle(180000)],
+            ],
+            "okx",
+        )
+        output, result = self.run_feed(server, expected=21)
+        self.assertEqual([event["bar"]["ts_open"] for event in output], [120000])
+        self.assertIn("contract multiplier changed", result.stderr)
+
     def test_okx_websocket_and_rest_lexemes_differ_but_overlap_values_match(self):
         notice = {"event": "notice", "code": "64008", "msg": "upgrade", "connId": "mock"}
         rendered = {120000: ("10.10", "11.20", "9.90", "9.9", "60.0")}
@@ -1578,15 +1727,25 @@ class FeedMockTests(unittest.TestCase):
         server = self.server(
             [
                 [
-                    bybit_push(bybit_row(120000, False)),
-                    bybit_push(bybit_row(120000, True), bybit_row(180000, False)),
+                    bybit_push(bybit_row(120000, False, close="10.5", volume="0.3")),
+                    bybit_push(
+                        bybit_row(120000, True),
+                        bybit_row(180000, False, close="11.5", volume="0.05"),
+                    ),
                     bybit_push(bybit_row(180000, True), bybit_row(240000, False)),
                 ]
             ],
             "bybit",
         )
         output, _ = self.run_feed(server, extra=["--max-messages", "2"])
-        self.assertEqual([event["bar"]["ts_open"] for event in output], [120000, 180000])
+        # The forming rows carry other closes and volumes: only the confirmed rows become bars.
+        self.assertEqual(
+            [event["bar"] for event in output],
+            [
+                {"ts_open": 120000, "o": 10.1, "h": 11.2, "l": 9.9, "c": 9.9, "v": 0.6},
+                {"ts_open": 180000, "o": 12, "h": 12, "l": 11, "c": 11, "v": 0.5},
+            ],
+        )
         self.assertEqual(server.subscriptions, [{"op": "subscribe", "args": ["kline.1.TESTUSDT"]}])
         self.assertEqual(server.ws_paths, ["/v5/public/linear"])
 

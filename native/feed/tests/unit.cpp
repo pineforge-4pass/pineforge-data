@@ -108,13 +108,17 @@ struct FenceVenue final : Venue {
     std::int64_t retention = 0;
     bool print_sum = true;
     std::size_t pages = 0, candle_requests = 0;
+    // REST lag: the next `empty_reads` history reads return nothing, the next `short_reads` drop their last row.
+    std::size_t empty_reads = 0, short_reads = 0;
     Connection connection() const override { return {"/synthetic", {}, {}, &binance_frame}; }
     std::vector<VenueEvent> decode(const std::string&) const override { throw Error(23, "not used by deterministic unit venue"); }
     std::vector<Trade> history(std::uint64_t from, std::size_t limit) override {
         ++pages;
         std::vector<Trade> result;
+        if (empty_reads) { --empty_reads; return result; }
         for (auto found = trades.find(from); found != trades.end() && result.size() < limit && found->first == from + result.size(); ++found)
             result.push_back(found->second);
+        if (short_reads && !result.empty()) { --short_reads; result.pop_back(); }
         return result;
     }
     Trade predecessor(std::int64_t minute) override {
@@ -122,6 +126,10 @@ struct FenceVenue final : Venue {
         for (const auto& [id, trade] : trades) if (trade.ts < minute) last = trade;
         if (!last) throw Error(20, "synthetic venue has no predecessor");
         return *last;
+    }
+    std::optional<Trade> predecessor_if_ready(std::int64_t minute) override {
+        for (const auto& [id, trade] : trades) if (trade.ts >= minute) return predecessor(minute);
+        return std::nullopt;
     }
     std::vector<Kline> klines(std::int64_t start, std::int64_t end) override {
         ++candle_requests;
@@ -749,6 +757,127 @@ int main() {
         for (const std::uint64_t id : {100, 101, 102, 103}) raw.ingest(venue.tick(id));
         expect(21, [&] { raw.ingest(venue.close(120000)); });
         passed("aggregate_prints_close_on_the_fence_without_candle_equality");
+    }
+    {
+        // A forming candle never closes a fenced minute and never licenses a REST candle.
+        Temporary temporary;
+        FenceVenue venue;
+        State state(config(temporary, "ticks"));
+        std::vector<std::string> output;
+        FenceSession session(state, venue, [&](const auto& line) { output.push_back(line); });
+        for (const std::uint64_t id : {100, 101, 102, 103}) session.ingest(venue.tick(id));
+        for (const std::int64_t minute : {120000, 180000, 240000}) {
+            auto forming = venue.close(minute);
+            forming.kline.confirmed = false;
+            session.ingest(forming);
+        }
+        assert(output.size() == 3 && venue.candle_requests == 0);
+        session.ingest(venue.close(120000));
+        assert(kinds(output).back() == "103" && kinds(output)[3] == "time:180000");
+        passed("fence_forming_candle_never_closes_a_minute");
+    }
+    {
+        // A duplicate print with changed content stops 21, already emitted or still buffered.
+        Temporary temporary;
+        FenceVenue venue;
+        State state(config(temporary, "ticks"));
+        std::vector<std::string> output;
+        FenceSession session(state, venue, [&](const auto& line) { output.push_back(line); });
+        session.ingest(venue.tick(100));
+        session.ingest(venue.tick(101));
+        auto emitted = venue.tick(100);
+        emitted.trade.qty = "0.20000000";
+        expect(21, [&] { session.ingest(emitted); });
+        Temporary second;
+        State buffering(config(second, "ticks"));
+        FenceSession fence(buffering, venue, [](const auto&) {});
+        for (const std::uint64_t id : {100, 101, 102, 103}) fence.ingest(venue.tick(id));
+        auto buffered = venue.tick(103);
+        buffered.trade.price = "12.10000000";
+        expect(21, [&] { fence.ingest(buffered); });
+        assert(buffering.durable().seq == 102 && output.size() == 2);
+        passed("fence_conflicting_duplicate_print_stops_21_emitted_or_buffered");
+    }
+    {
+        // Reconnect: a changed closed candle, a changed start predecessor, or a candle revised before its
+        // minute closed each stop 21.
+        Temporary temporary;
+        FenceVenue venue;
+        State state(config(temporary, "ticks"));
+        FenceSession session(state, venue, [](const auto&) {});
+        for (const std::uint64_t id : {100, 101, 102, 103}) session.ingest(venue.tick(id));
+        session.ingest(venue.close(120000));
+        venue.candles.at(120000).bar.volume = "0.70000000";
+        expect(21, [&] { session.connected(); });
+        FenceVenue quiet;
+        quiet.trades = {{99, {99, 119999, "10.10000000", "0.10000000"}}, {100, {100, 180001, "12.00000000", "0.50000000"}}};
+        Temporary second;
+        State anchored(config(second, "ticks"));
+        FenceSession waiting(anchored, quiet, [](const auto&) {});
+        waiting.ingest(quiet.tick(100));
+        assert(anchored.durable().predecessor && anchored.durable().message_index == 0);
+        quiet.trades.at(99).qty = "0.20000000";
+        expect(21, [&] { waiting.connected(); });
+        Temporary third;
+        State open(config(third, "ticks"));
+        FenceSession revising(open, venue, [](const auto&) {});
+        for (const std::uint64_t id : {100, 101, 102}) revising.ingest(venue.tick(id));
+        revising.ingest(venue.close(120000));
+        auto revised = venue.close(120000);
+        revised.kline.bar.close = "11.10000000";
+        expect(21, [&] { revising.ingest(revised); });
+        assert(open.durable().cut == 120000);
+        passed("fence_reconnect_candle_and_predecessor_overlap_and_open_candle_revision_stop_21");
+    }
+    {
+        // The unconfirmed-print buffer is bounded by --max-queue-bytes on a fence venue too.
+        Temporary temporary;
+        FenceVenue venue;
+        auto options = config(temporary, "ticks");
+        options.max_queue_bytes = 450;
+        State state(options);
+        FenceSession session(state, venue, [](const auto&) {});
+        for (const std::uint64_t id : {100, 101, 102, 103, 104}) session.ingest(venue.tick(id));
+        expect(22, [&] { session.ingest(venue.tick(105)); });
+        assert(state.durable().seq == 102);
+        passed("fence_unconfirmed_print_buffer_is_bounded");
+    }
+    {
+        // REST trailing the newest prints is re-read: the reconnect overlap and a heal page.
+        Temporary temporary;
+        FenceVenue venue;
+        State state(config(temporary, "ticks"));
+        std::vector<std::string> output;
+        FenceSession session(state, venue, [&](const auto& line) { output.push_back(line); });
+        session.ingest(venue.tick(100));
+        session.ingest(venue.tick(101));
+        venue.short_reads = 1;
+        const auto before = venue.pages;
+        session.connected();
+        assert(venue.pages == before + 2);
+        venue.empty_reads = 1;
+        session.ingest(venue.tick(103));
+        assert(kinds(output) == std::vector<std::string>({"100", "101", "102"}));
+        passed("fence_reconnect_overlap_and_heal_page_reread_trailing_rest");
+    }
+    {
+        // A quiet start waits: no print after --start means nothing anchored, nothing emitted, no stop.
+        Temporary temporary;
+        FenceVenue venue;
+        venue.trades = {{99, {99, 119999, "10.10000000", "0.10000000"}}};
+        for (const std::int64_t minute : {120000, 180000})
+            venue.candles.at(minute).bar = {minute, "10.10000000", "10.10000000", "10.10000000", "10.10000000", "0"};
+        venue.candles.at(240000).bar = {240000, "12.00000000", "12.00000000", "12.00000000", "12.00000000", "0.10000000"};
+        State state(config(temporary, "ticks"));
+        std::vector<std::string> output;
+        FenceSession session(state, venue, [&](const auto& line) { output.push_back(line); });
+        session.ingest(venue.close(120000));
+        session.ingest(venue.close(180000));
+        assert(output.empty() && !state.durable().predecessor);
+        venue.trades[100] = {100, 240001, "12.00000000", "0.10000000"};
+        session.ingest(venue.tick(100));
+        assert(kinds(output) == std::vector<std::string>({"time:180000", "time:240000", "100"}));
+        passed("fence_quiet_start_waits_for_the_first_print");
     }
     {
         Temporary temporary;

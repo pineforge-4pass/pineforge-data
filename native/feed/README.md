@@ -92,7 +92,8 @@ publication without its manifest is not a qualified warmup.
 
 ```sh
 build-feed/pineforge-feed export --venue binance --market usdm --symbol BTCUSDT \
-  --mode agg-ticks --start 2026-10-03T00:00:00Z --end 2026-10-03T03:20:00Z --output agg-bars.csv
+  --mode agg-ticks --start 2026-10-03T00:00:00Z --end 2026-10-03T03:20:00Z --output agg-bars.csv \
+  --warmup warmup.csv
 # or from a local copy of the venue's public daily aggregate-trade archive:
 build-feed/pineforge-feed export --venue binance --market usdm --symbol BTCUSDT \
   --mode agg-ticks --start 2026-10-02T00:10:00Z --end 2026-10-02T23:50:00Z --output agg-bars.csv \
@@ -106,9 +107,14 @@ writes exactly those bars in the warmup CSV format, by the runner's tick-built
 bar rule: a print belongs to minute `floor(ts / 60000) * 60000`; open is the first
 price, high the maximum, low the minimum, close the last price, and volume the
 exact decimal sum of the quantities; a minute without a print repeats the
-previous close (for the first minute, the last print before `--start`) with
-volume `0`, as the runner's carry-forward bar does. Price tokens are the venue's
-own; the volume is the canonical exact sum.
+previous close with volume `0`, as the runner's carry-forward bar does. Before
+the window's first print that close is the runner's last warmup close, not the
+last print before `--start`: `--warmup` takes the runner's warmup CSV, whose last
+row must be the minute before `--start` (20 otherwise), and the manifest records
+it as `warmup_close`. Without `--warmup` a quiet first minute stops with 20
+rather than guess. Price tokens are the venue's own; the volume is the canonical
+exact sum. (Without a `qty_step` the runner sums tick volume in compensated
+doubles, which can land one ulp from the exact sum the export writes.)
 
 Completeness is proven, never assumed: the prints must form a contiguous ID chain
 from the last print strictly before `--start` through the fence, the first print
@@ -126,7 +132,11 @@ without its header line), streamed rather than loaded. A `transact_time` above
 takes the published `<sha256>  <file name>` file and must match the archive's
 SHA-256 and base name (21 otherwise); without it the export logs
 `archive_not_checksum_verified`. The window, its predecessor and its fence must
-all lie inside the one archive (else 20). Archives are never fetched
+all lie inside the one archive (else 20, naming the daily file that holds the
+missing print). So a window starting at 00:00 UTC, whose predecessor is the
+previous day's last print, or one ending at 24:00, whose fence is the next day's
+first print, cannot come from the one archive: start or end the window inside
+the day, or export it from REST within its retention. Archives are never fetched
 automatically.
 
 An existing output or manifest is refused. The CSV and then
@@ -346,6 +356,11 @@ weight ceiling is spent by the venue's own count: every response's
 `X-MBX-USED-WEIGHT-1M` header (which counts every client on the IP) is kept, and
 a request whose weight would take the current window past 90% of the ceiling
 waits for the next window (`rest_quota_wait`); otherwise requests are not spaced.
+The 90% share is per process: each producer sees the count only as of its own
+last response, so several producers on one IP (one per symbol) can together cross
+the ceiling between their requests. A `429` waits; a `418` ban stops every
+producer on that IP with 22. Run one Binance REST client per IP for large
+catch-ups, or stagger the producers.
 Other published ceilings are paced evenly across their interval. `429` honours `Retry-After` as delta-seconds or an
 IMF-fixdate HTTP-date; a wait above 24 hours stops with 22 and an unparseable
 value with 23. A ban/access rejection is not retried as anonymous trading
@@ -557,7 +572,17 @@ Neither ever blocks the producer or another client. A client holds a journal
 segment open only while it catches up. At start `serve` raises its open-file
 limit to the hard limit and refuses to start (23) when that is below
 `2 x --max-clients + 64`. A client that stops reading entirely is dropped when its blocked write
-times out (30 seconds). On SIGTERM the producer drains each live client's queue
+times out (10 seconds). A client never sends a message: any frame it sends after
+`serve` has closed it ends the connection at once.
+
+Capacity: the HTTP server runs one worker thread per connection, and each
+streaming client holds one for its lifetime. `serve` runs `--max-clients + 16`
+workers, so status, snapshot and new runner connects keep spare workers, and it
+drops any request not complete within 10 seconds (a half-open connection).
+CivetWeb has no separate limit for incomplete requests, and buffers a whole
+client frame before `serve` sees it (its own ceiling is 2 GiB), so anything
+beyond same-host runners must go through the reverse proxy below, which absorbs
+incomplete requests and caps frame sizes. On SIGTERM the producer drains each live client's queue
 and closes every client with 1001 (a client still catching up from the journal
 is closed at once and resumes from its own count).
 
@@ -566,8 +591,8 @@ answers PINGs without telling it, so `serve` sends an unsolicited PONG to a
 client after 5 seconds without a message; a bar stream (one message a minute)
 stays connected.
 
-Listening: `--listen` defaults to `127.0.0.1:8787`; port 0 picks a free port,
-logged as `serve_listening`. **`serve` has no TLS and no authentication.** A
+Listening: `--listen` defaults to `127.0.0.1:8787`; `[::1]:PORT` listens on the
+IPv6 loopback; port 0 picks a free port, logged as `serve_listening`. **`serve` has no TLS and no authentication.** A
 non-loopback address needs `--allow-remote-listen`; expose it only behind a
 reverse proxy that terminates TLS and authenticates clients (for example nginx
 or Caddy proxying `wss://` to the loopback listener), and never on a public

@@ -2,13 +2,16 @@
 """Explicit public-data soak; captures stay in the operator-selected directory."""
 
 import argparse
+import ctypes
 import hashlib
 import http.server
 import itertools
 import json
+import math
 import os
 import pathlib
 import signal
+import sqlite3
 import struct
 import subprocess
 import threading
@@ -37,6 +40,118 @@ def journal_rows(state, exact=False):
 
 
 SCRIPT_TF_MS = 60000  # the runner and batch both run --script-tf 1
+
+
+class StrategyBar(ctypes.Structure):
+    _fields_ = [
+        ("open", ctypes.c_double),
+        ("high", ctypes.c_double),
+        ("low", ctypes.c_double),
+        ("close", ctypes.c_double),
+        ("volume", ctypes.c_double),
+        ("timestamp", ctypes.c_int64),
+    ]
+
+
+class StrategyTick(ctypes.Structure):
+    _fields_ = [
+        ("timestamp", ctypes.c_int64),
+        ("sequence", ctypes.c_uint64),
+        ("price", ctypes.c_double),
+        ("quantity", ctypes.c_double),
+    ]
+
+
+def runner_bars(strategy, warmup, ledger, symbol):
+    """The runner's own tick-built bars. Its committed ledger inputs are replayed in order through
+    the observed build of the same strategy; every input must reach the state hash the runner
+    recorded for it, so this is the runner's computation, not a re-implementation. The bar the
+    strategy saw at each time event is read back through the engine observer
+    (`equivalence_source_bar`). Returns {bar open time: (o, h, l, c, v) as the runner's doubles}."""
+    library = ctypes.CDLL(str(strategy))
+    signatures = {
+        "strategy_create": ([ctypes.c_char_p], ctypes.c_void_p),
+        "strategy_free": ([ctypes.c_void_p], None),
+        "strategy_set_syminfo_timezone": ([ctypes.c_void_p, ctypes.c_char_p], None),
+        "strategy_set_chart_timezone": ([ctypes.c_void_p, ctypes.c_char_p], None),
+        "strategy_set_syminfo_session": ([ctypes.c_void_p, ctypes.c_char_p], None),
+        "strategy_set_syminfo_string": (
+            [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p],
+            ctypes.c_int,
+        ),
+        "strategy_stream_begin": (
+            [
+                ctypes.c_void_p,
+                ctypes.POINTER(StrategyBar),
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_char_p,
+            ],
+            ctypes.c_int,
+        ),
+        "strategy_stream_push_ticks": (
+            [ctypes.c_void_p, ctypes.POINTER(StrategyTick), ctypes.c_int],
+            ctypes.c_int,
+        ),
+        "strategy_stream_advance_time": ([ctypes.c_void_p, ctypes.c_int64], ctypes.c_int),
+        "strategy_stream_state_hash": ([ctypes.c_void_p], ctypes.c_uint64),
+        "strategy_stream_order_actions_clear": ([ctypes.c_void_p], None),
+        "equivalence_source_bar": (
+            [ctypes.c_void_p, ctypes.c_int64, ctypes.POINTER(StrategyBar)],
+            ctypes.c_int,
+        ),
+    }
+    for name, (arguments, result) in signatures.items():
+        getattr(library, name).argtypes = arguments
+        getattr(library, name).restype = result
+    with open(warmup) as source:
+        lines = source.read().splitlines()
+    assert lines[0] == "timestamp,open,high,low,close,volume"
+    history = []
+    for line in lines[1:]:
+        values = line.split(",")
+        history.append(StrategyBar(*(float(value) for value in values[1:]), int(values[0])))
+    array = (StrategyBar * len(history))(*history)
+    with sqlite3.connect(f"file:{ledger}?mode=ro", uri=True) as connection:
+        inputs = connection.execute(
+            "SELECT input_index, canonical_json, state_hash FROM inputs ORDER BY input_index"
+        ).fetchall()
+    assert [row[0] for row in inputs] == list(range(len(inputs))), "ledger inputs have a gap"
+    handle = library.strategy_create(None)
+    assert handle, "strategy_create failed"
+    bars = {}
+    try:
+        # The runner's defaults for a run without symbol metadata: UTC, 24x7, its --symbol label.
+        library.strategy_set_syminfo_timezone(handle, b"UTC")
+        library.strategy_set_chart_timezone(handle, b"UTC")
+        library.strategy_set_syminfo_session(handle, b"24x7")
+        assert library.strategy_set_syminfo_string(handle, b"tickerid", symbol.encode()) == 0
+        ticker = symbol.split(":", 1)[-1]
+        assert library.strategy_set_syminfo_string(handle, b"ticker", ticker.encode()) == 0
+        assert library.strategy_stream_begin(handle, array, len(history), b"1", b"1") == 0
+        library.strategy_stream_order_actions_clear(handle)
+        for index, text, recorded in inputs:
+            event = json.loads(text, parse_float=Decimal)
+            if event["type"] == "tick":
+                tick = StrategyTick(
+                    event["ts"], event["seq"], float(event["price"]), float(event["qty"])
+                )
+                assert library.strategy_stream_push_ticks(handle, ctypes.byref(tick), 1) == 0
+            else:
+                assert event["type"] == "time", event
+                assert library.strategy_stream_advance_time(handle, event["ts"]) == 0
+            library.strategy_stream_order_actions_clear(handle)
+            state = str(library.strategy_stream_state_hash(handle))
+            assert state == recorded, f"replay left the runner's state at input {index}"
+            if event["type"] == "time":
+                bar = StrategyBar()
+                assert library.equivalence_source_bar(handle, 60000, ctypes.byref(bar)) == 0
+                assert str(library.strategy_stream_state_hash(handle)) == recorded
+                values = (bar.open, bar.high, bar.low, bar.close, bar.volume)
+                assert bars.setdefault(bar.timestamp, values) == values
+    finally:
+        library.strategy_free(handle)
+    return bars
 
 
 def action_key(record, mode):
@@ -611,6 +726,8 @@ class Soak:
             str(end),
             "--output",
             str(output),
+            "--warmup",
+            str(self.directory / "warmup.csv"),
         ]
         with open(self.directory / (mode + "-export.stderr"), "w") as error:
             subprocess.run(command, stderr=error, check=True, timeout=600)
@@ -627,7 +744,25 @@ class Soak:
             )
             for row in (line.split(",") for line in lines[1:])
         ]
-        assert exported == normalized, "exported bars differ from the runner's prints-built bars"
+        assert exported == normalized, "exported bars differ from the tape's prints-built bars"
+        # The runner's own bars, value for value: the batch reads the exported CSV as doubles. The
+        # export's volume is the exact decimal sum; without a quantity grid (no qty_step) the
+        # runner sums volume in compensated doubles, which can land one ulp away.
+        volume_ulp = 0
+        built = runner_bars(
+            self.options.observed_strategy,
+            self.directory / "warmup.csv",
+            self.directory / (mode + ".sqlite3"),
+            self.venue.label,
+        )
+        for bar in exported:
+            runner = built.get(bar["ts_open"])
+            assert runner is not None, f"the runner built no bar at {bar['ts_open']}"
+            values = tuple(float(bar[key]) for key in ("o", "h", "l", "c", "v"))
+            assert values[:4] == runner[:4], f"export {bar} differs from the runner's bar {runner}"
+            if values[4] != runner[4]:
+                assert abs(values[4] - runner[4]) <= math.ulp(values[4]), (bar, runner)
+                volume_ulp += 1
         manifest = json.loads((self.directory / (mode + "-export.csv.manifest.json")).read_text())
         combined = self.directory / (mode + "-export-combined.csv")
         with open(combined, "w") as target:
@@ -646,7 +781,9 @@ class Soak:
         equal = expected == actual_actions
         self.receipt(
             f"{'PASS' if equal else 'FAIL'} {mode} export prints-built bars equal the runner's "
-            f"tick-built bars minutes={len(exported)} prints={manifest['prints']} "
+            f"tick-built bars (state-hash-proven replay, read via the observer) "
+            f"minutes={len(exported)} ohlc_exact={len(exported)} volume_one_ulp={volume_ulp} "
+            f"prints={manifest['prints']} "
             f"quiet_minutes={manifest['quiet_minutes']} "
             f"batch_over_export_actions={len(expected)} runner={len(actual_actions)}"
         )

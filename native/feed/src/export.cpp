@@ -519,10 +519,11 @@ ChainBars archive_bars(const std::string& archive, std::int64_t start, std::int6
         last_row = row->ts;
         if (!chain.anchored()) {
             if (row->ts < start) { candidate = *row; return; }
+            // This is the archive's first row: the predecessor is in the previous day's file.
             if (!candidate)
                 throw Error(20, "the archive holds no print before the start: the window's predecessor is in " +
-                                daily_name(archive, start - 1) + ", and export reads one daily file; start after the "
-                                "day's first print or export from REST within its retention");
+                                daily_name(archive, row->ts - row->ts % 86400000 - 1) + ", and export reads one daily "
+                                "file; start after the day's first print or export from REST within its retention");
             chain.anchor(*candidate);
         }
         chain.add(*row);
@@ -571,7 +572,7 @@ ChainBars archive_bars(const std::string& archive, std::int64_t start, std::int6
     if (!chain.anchored()) throw Error(20, "the archive holds no print at or after the start: the window is not inside it");
     if (!chain.fenced())
         throw Error(20, "the archive ends before the window's fence (the first print at or after the end), which is in " +
-                        daily_name(archive, (std::max(last_row, end - 1) / 86400000 + 1) * 86400000) +
+                        daily_name(archive, (last_row / 86400000 + 1) * 86400000) +
                         ", and export reads one daily file; end the window before the day's last print");
     return chain;
 }

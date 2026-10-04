@@ -389,6 +389,17 @@ class ExportMockTests(unittest.TestCase):
             expected=20,
         )
         self.assertIn(f"{SYMBOL}-aggTrades-2026-10-03.csv", result.stderr)
+        # A window reaching past the day, or starting before its first print, names the same files.
+        result = self.export(
+            day + 86400000 - 120000,
+            day + 86400000 + 600000,
+            extra=["--archive", str(archive)],
+            expected=20,
+        )
+        self.assertIn(f"{SYMBOL}-aggTrades-2026-10-03.csv", result.stderr)
+        late = self.write_archive(f"{SYMBOL}-aggTrades-2026-10-02.zip", prints[5:])
+        result = self.export(day + 60000, day + 120000, extra=["--archive", str(late)], expected=20)
+        self.assertIn(f"{SYMBOL}-aggTrades-2026-10-01.zip", result.stderr)
 
     def test_archive_outside_window_and_unsupported_venue(self):
         start, prints = self.archive_prints()

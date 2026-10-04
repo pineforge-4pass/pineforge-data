@@ -7,6 +7,7 @@
 #include <cctype>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <ctime>
 #include <exception>
 #include <filesystem>
@@ -19,8 +20,9 @@ namespace {
 constexpr std::size_t csv_limit = 64 * 1024 * 1024;
 constexpr std::string_view archive_header = "agg_trade_id,price,quantity,first_trade_id,last_trade_id,transact_time,is_buyer_maker";
 constexpr const char* bar_rule = "a print belongs to minute floor(ts/60000)*60000; open=first price, high=max, low=min, close=last, "
-    "volume=exact sum of quantities; a minute without a print has open=high=low=close=the previous close (the "
-    "runner's last warmup close before the first print) and volume 0";
+    "volume=the runner's tick volume (exact on a 1/10^k qty_step grid, else the compensated binary64 sum in print "
+    "order) as the shortest round-trip decimal; a minute without a print has open=high=low=close=the previous close "
+    "(the runner's last warmup close before the first print) and volume 0";
 Json number(std::uint64_t value) { return Json::number(std::to_string(value)); }
 Json signed_number(std::int64_t value) { return Json::number(std::to_string(value)); }
 std::string base_name(const std::string& path) { return std::filesystem::path(path).filename().string(); }
@@ -225,6 +227,84 @@ ChainBars::ChainBars(std::int64_t start, std::int64_t end) : start_(start), end_
         throw Error(23, "export requires a nonempty minute-aligned exclusive range");
     if ((end - start) / 60000 > 100000) throw Error(22, "export range exceeds 100000 minutes");
 }
+void RunnerVolume::reset(const std::optional<double>& step) {
+    *this = RunnerVolume{};
+    if (!step) return;
+    double scale = 1.0;
+    for (int places = 0; places <= 22; ++places, scale *= 10.0) {
+        if (*step != 1.0 / scale) continue;
+        divisor_ = scale;
+        places_ = places;
+        exact_ = true;
+        return;
+    }
+}
+double RunnerVolume::decimal(std::int64_t units) const {
+    if (units <= (std::int64_t{1} << 53)) return static_cast<double>(units) / divisor_;
+    // Above 2^53 the quotient units / 10^places is rounded once, to nearest even, in integer arithmetic.
+    std::uint64_t numerator = static_cast<std::uint64_t>(units), denominator = 1;
+    for (int places = 0; places < places_; ++places) denominator *= 5;
+    int exponent = -places_;
+    while (denominator <= numerator / 2) {
+        denominator *= 2;
+        ++exponent;
+    }
+    while (numerator < denominator) {
+        numerator *= 2;
+        --exponent;
+    }
+    std::uint64_t remainder = numerator - denominator, significand = 1;
+    for (int bit = 0; bit < 52; ++bit) {
+        remainder *= 2;
+        significand *= 2;
+        if (remainder >= denominator) {
+            remainder -= denominator;
+            ++significand;
+        }
+    }
+    const std::uint64_t complement = denominator - remainder;
+    if (remainder > complement || (remainder == complement && (significand & 1))) ++significand;
+    return std::ldexp(static_cast<double>(significand), exponent - 52);
+}
+void RunnerVolume::add(double quantity) {
+    const double next = sum_ + quantity;
+    if (std::isfinite(next)) compensation_ += sum_ >= quantity ? (sum_ - next) + quantity : (quantity - next) + sum_;
+    else compensation_ = 0.0;
+    sum_ = next;
+    if (!exact_) return;
+    const double rounded = std::round(quantity * divisor_);
+    if (!std::isfinite(rounded) || rounded >= std::ldexp(1.0, 63)) {
+        exact_ = false;
+        return;
+    }
+    const auto units = static_cast<std::int64_t>(rounded);
+    if (decimal(units) != quantity || units > std::numeric_limits<std::int64_t>::max() - units_) {
+        exact_ = false;
+        return;
+    }
+    units_ += units;
+}
+double RunnerVolume::value() const { return exact_ ? decimal(units_) : sum_ + compensation_; }
+
+double runner_double(const std::string& token) {
+    std::size_t used = 0;
+    double value = 0;
+    try { value = std::stod(token, &used); } catch (const std::exception&) { used = 0; }
+    if (token.empty() || used != token.size() || !std::isfinite(value)) throw Error(23, "not a finite number: " + token);
+    return value;
+}
+std::string shortest_decimal(double value) {
+    char buffer[400];
+    const auto written = std::to_chars(buffer, buffer + sizeof(buffer), value, std::chars_format::fixed);
+    if (written.ec != std::errc{}) throw Error(23, "cannot write a volume");
+    return std::string(buffer, written.ptr);
+}
+
+void ChainBars::quantity_grid(double step) {
+    if (predecessor_) throw Error(23, "the quantity grid is set before the chain's predecessor");
+    if (!std::isfinite(step) || step <= 0) throw Error(23, "--qty-step must be a positive number");
+    step_ = step;
+}
 void ChainBars::seed(const std::string& close) {
     if (predecessor_) throw Error(23, "the warmup close seeds the chain before its predecessor");
     (void)Decimal(close);
@@ -264,20 +344,20 @@ bool ChainBars::add(const Trade& trade) {
     if (!count_) {
         open_ = high_ = low_ = trade.price;
         high_value_ = low_value_ = price;
-        volume_ = Decimal("0");
+        volume_.reset(step_);
     } else {
         if (price.compare(high_value_) > 0) { high_ = trade.price; high_value_ = price; }
         if (price.compare(low_value_) < 0) { low_ = trade.price; low_value_ = price; }
     }
     close_ = trade.price;
-    volume_ = volume_.add(Decimal(trade.qty));
+    volume_.add(runner_double(trade.qty));
     ++count_;
     ++prints_;
     return false;
 }
 void ChainBars::flush() {
     if (!count_) return;
-    row(minute_, open_, high_, low_, close_, volume_.str());
+    row(minute_, open_, high_, low_, close_, shortest_decimal(volume_.value()));
     count_ = 0;
     next_ = minute_ + 60000;
 }
@@ -504,9 +584,11 @@ std::string warmup_close(const std::string& warmup, std::int64_t start) {
     return fields[4];
 }
 
-ChainBars archive_bars(const std::string& archive, std::int64_t start, std::int64_t end, const std::string& seed) {
+ChainBars archive_bars(const std::string& archive, std::int64_t start, std::int64_t end, const std::string& seed,
+                       const std::optional<double>& step) {
     ChainBars chain(start, end);
     if (!seed.empty()) chain.seed(seed);
+    if (step) chain.quantity_grid(*step);
     std::optional<Trade> candidate;
     std::int64_t last_row = -1;
     std::exception_ptr failure;
@@ -578,9 +660,11 @@ ChainBars archive_bars(const std::string& archive, std::int64_t start, std::int6
 }
 
 namespace {
-ChainBars rest_bars(const Config& config, std::string& multiplier, const std::string& seed) {
+ChainBars rest_bars(const Config& config, std::string& multiplier, const std::string& seed,
+                    const std::optional<double>& step) {
     ChainBars chain(config.start, config.end);
     if (!seed.empty()) chain.seed(seed);
+    if (step) chain.quantity_grid(*step);
     const auto now = now_ms();
     if (config.end > now) throw Error(20, "the window has not closed yet: no print at or after its end can exist");
     const auto venue = make_venue(config);
@@ -621,6 +705,13 @@ void export_bars(const Config& config, const ExportOptions& options) {
     Json source;
     std::optional<ChainBars> chain;
     const auto seed = options.warmup.empty() ? std::string() : warmup_close(options.warmup, config.start);
+    std::optional<double> step;
+    if (!options.qty_step.empty()) {
+        step = runner_double(options.qty_step);
+        if (*step <= 0) throw Error(23, "--qty-step must be a positive number");
+    }
+    RunnerVolume grid;
+    grid.reset(step);
     if (!options.archive.empty()) {
         if (config.venue != "binance" || config.market != "usdm" || config.mode != "agg-ticks")
             throw Error(23, "--archive reads the Binance USD-M daily aggTrades archive: use --venue binance --market usdm --mode agg-ticks");
@@ -630,11 +721,11 @@ void export_bars(const Config& config, const ExportOptions& options) {
         if (verified) verify_checksum(options.checksum, options.archive, digest);
         else log("warn", "archive_not_checksum_verified", file);
         if (base_name(options.archive).rfind(config.symbol + "-aggTrades-", 0) != 0) log("warn", "archive_name_not_symbol", file);
-        chain = archive_bars(options.archive, config.start, config.end, seed);
+        chain = archive_bars(options.archive, config.start, config.end, seed, step);
         source = Json::object({{"kind", Json::string("archive")}, {"file", Json::string(base_name(options.archive))},
             {"sha256", Json::string(digest)}, {"checksum_verified", Json::boolean(verified)}});
     } else {
-        chain = rest_bars(config, multiplier, seed);
+        chain = rest_bars(config, multiplier, seed, step);
         source = Json::object({{"kind", Json::string("rest")}, {"origin", Json::string(config.rest_url)}});
     }
     const auto& csv = chain->csv();
@@ -650,6 +741,8 @@ void export_bars(const Config& config, const ExportOptions& options) {
             {"price", Json::string(predecessor.price)}})},
         {"fence", Json::object({{"id", number(fence.id)}, {"ts", signed_number(fence.ts)}})},
         {"warmup_close", seed.empty() ? Json{} : Json::string(seed)},
+        {"qty_step", step ? Json::string(options.qty_step) : Json{}},
+        {"volume_rule", Json::string(grid.exact() ? "exact-decimal-grid" : "compensated-binary64")},
         {"first_id", any ? number(predecessor.id + 1) : Json{}}, {"last_id", any ? number(fence.id - 1) : Json{}},
         {"prints", number(chain->prints())}, {"bars", number(chain->bars())}, {"quiet_minutes", number(chain->quiet_minutes())},
         {"rule", Json::string(bar_rule)}, {"sha256", Json::string(sha256(csv))}});

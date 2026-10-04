@@ -30,7 +30,8 @@ struct StdoutFlags {
 void help() {
     std::cout << "pineforge-feed warmup --venue VENUE --market MARKET --symbol SYMBOL --start UTC|MS --end UTC|MS --output FILE\n"
                  "pineforge-feed export --venue VENUE --market MARKET --symbol SYMBOL --mode ticks|agg-ticks --start UTC|MS --end UTC|MS --output FILE\n"
-                 "                      [--warmup RUNNER-WARMUP.csv] [--archive DAILY.zip|DAILY.csv [--checksum DAILY.zip.CHECKSUM]] (prints-built 1m bars)\n"
+                 "                      [--warmup RUNNER-WARMUP.csv] [--qty-step RUNNER-QTY-STEP] [--archive DAILY.zip|DAILY.csv [--checksum DAILY.zip.CHECKSUM]]\n"
+                 "                      (prints-built 1m bars; volume by the runner's rule for its qty_step, none by default)\n"
                  "pineforge-feed run --venue VENUE --market MARKET --symbol SYMBOL --mode MODE --state-dir DIR [--start UTC|MS | --resume] [--output-from INDEX]\n"
                  "pineforge-feed serve --venue VENUE --market MARKET --symbol SYMBOL --mode MODE --state-dir DIR [--start UTC|MS | --resume]\n"
                  "                     [--listen HOST:PORT|[IPV6]:PORT (default 127.0.0.1:8787)] [--allow-remote-listen] [--client-queue-bytes N] [--max-clients N]\n"
@@ -123,6 +124,7 @@ int run(int argc, char** argv) {
             else if (key == "--archive") exported.archive = value;
             else if (key == "--checksum") exported.checksum = value;
             else if (key == "--warmup") exported.warmup = value;
+            else if (key == "--qty-step") exported.qty_step = value;
             else if (key == "--output-from") config.output_from = unsigned_value(value);
             else if (key == "--max-messages") config.max_messages = unsigned_value(value);
             else if (key == "--segment-bytes") config.segment_bytes = unsigned_value(value);
@@ -145,8 +147,9 @@ int run(int argc, char** argv) {
             else throw Error(23, "unknown CLI option: " + key);
         }
         gate(config, command == "warmup", seen.count("--rest-url") != 0, seen.count("--ws-url") != 0);
-        if (command != "export" && (!exported.archive.empty() || !exported.checksum.empty() || !exported.warmup.empty()))
-            throw Error(23, "--archive, --checksum and --warmup are export options");
+        if (command != "export" &&
+            (!exported.archive.empty() || !exported.checksum.empty() || !exported.warmup.empty() || !exported.qty_step.empty()))
+            throw Error(23, "--archive, --checksum, --warmup and --qty-step are export options");
         if (!config.max_queue_bytes || !config.max_replay_seconds || config.max_replay_seconds > 3600 ||
             !config.reconnect_seconds || config.reconnect_seconds > 86100)
             throw Error(23, "budgets must be positive; reconnect must precede the 24-hour connection limit");

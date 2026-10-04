@@ -7,7 +7,6 @@ import hashlib
 import http.server
 import itertools
 import json
-import math
 import os
 import pathlib
 import signal
@@ -62,7 +61,7 @@ class StrategyTick(ctypes.Structure):
     ]
 
 
-def runner_bars(strategy, warmup, ledger, symbol):
+def runner_bars(strategy, warmup, ledger, symbol, qty_step=None):
     """The runner's own tick-built bars. Its committed ledger inputs are replayed in order through
     the observed build of the same strategy; every input must reach the state hash the runner
     recorded for it, so this is the runner's computation, not a re-implementation. The bar the
@@ -78,6 +77,10 @@ def runner_bars(strategy, warmup, ledger, symbol):
         "strategy_set_syminfo_string": (
             [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p],
             ctypes.c_int,
+        ),
+        "strategy_set_syminfo_metadata": (
+            [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_double],
+            None,
         ),
         "strategy_stream_begin": (
             [
@@ -128,6 +131,9 @@ def runner_bars(strategy, warmup, ledger, symbol):
         assert library.strategy_set_syminfo_string(handle, b"tickerid", symbol.encode()) == 0
         ticker = symbol.split(":", 1)[-1]
         assert library.strategy_set_syminfo_string(handle, b"ticker", ticker.encode()) == 0
+        if qty_step:
+            # The runner's --syminfo qty_step=V, read with std::stod.
+            library.strategy_set_syminfo_metadata(handle, b"qty_step", float(qty_step))
         assert library.strategy_stream_begin(handle, array, len(history), b"1", b"1") == 0
         library.strategy_stream_order_actions_clear(handle)
         for index, text, recorded in inputs:
@@ -389,6 +395,8 @@ class Soak:
             f"http://127.0.0.1:{self.receiver.server_port}/actions/{name}",
             "--allow-insecure-http",
         ]
+        if getattr(self.options, "qty_step", None):
+            command += ["--syminfo", f"qty_step={self.options.qty_step}"]
         if cursor:
             command += ["--from-input", str(cursor)]
         return command
@@ -634,15 +642,7 @@ class Soak:
                     ",".join(str(bar[key]) for key in ("ts_open", "o", "h", "l", "c", "v")) + "\n"
                 )
         batch_actions = self.directory / (mode + "-batch-actions.jsonl")
-        subprocess.run(
-            [
-                self.options.batch_probe,
-                self.options.observed_strategy,
-                str(combined),
-                str(batch_actions),
-            ],
-            check=True,
-        )
+        subprocess.run(self.batch_command(combined, batch_actions), check=True)
         expected_actions = [
             action_key(record, mode)
             for record in rows(batch_actions)
@@ -703,6 +703,18 @@ class Soak:
             "batch_actions_equal": equal,
         }
 
+    def batch_command(self, bars, actions):
+        """The batch probe over a warmup-format CSV, with the runner's qty_step when it has one."""
+        command = [
+            self.options.batch_probe,
+            self.options.observed_strategy,
+            str(bars),
+            str(actions),
+        ]
+        if getattr(self.options, "qty_step", None):
+            command.append(self.options.qty_step)
+        return command
+
     def export_check(self, mode, normalized, actual_actions):
         """`pineforge-feed export` over the proven window, from venue REST: its prints-built bars
         must equal the bars the runner built from the same prints (the tape's minutes), value for
@@ -729,6 +741,8 @@ class Soak:
             "--warmup",
             str(self.directory / "warmup.csv"),
         ]
+        if getattr(self.options, "qty_step", None):
+            command += ["--qty-step", self.options.qty_step]
         with open(self.directory / (mode + "-export.stderr"), "w") as error:
             subprocess.run(command, stderr=error, check=True, timeout=600)
         with open(output) as source:
@@ -744,25 +758,24 @@ class Soak:
             )
             for row in (line.split(",") for line in lines[1:])
         ]
-        assert exported == normalized, "exported bars differ from the tape's prints-built bars"
-        # The runner's own bars, value for value: the batch reads the exported CSV as doubles. The
-        # export's volume is the exact decimal sum; without a quantity grid (no qty_step) the
-        # runner sums volume in compensated doubles, which can land one ulp away.
-        volume_ulp = 0
+        prices = ("ts_open", "o", "h", "l", "c")
+        assert [{key: bar[key] for key in prices} for bar in exported] == [
+            {key: bar[key] for key in prices} for bar in normalized
+        ], "exported prices differ from the tape's prints-built bars"
+        # The runner's own bars, bit for bit: every field, volume included, must be the double the
+        # runner built (the batch reads the exported CSV with the same conversion).
         built = runner_bars(
             self.options.observed_strategy,
             self.directory / "warmup.csv",
             self.directory / (mode + ".sqlite3"),
             self.venue.label,
+            getattr(self.options, "qty_step", None),
         )
         for bar in exported:
             runner = built.get(bar["ts_open"])
             assert runner is not None, f"the runner built no bar at {bar['ts_open']}"
             values = tuple(float(bar[key]) for key in ("o", "h", "l", "c", "v"))
-            assert values[:4] == runner[:4], f"export {bar} differs from the runner's bar {runner}"
-            if values[4] != runner[4]:
-                assert abs(values[4] - runner[4]) <= math.ulp(values[4]), (bar, runner)
-                volume_ulp += 1
+            assert values == runner, f"export {bar} differs from the runner's bar {runner}"
         manifest = json.loads((self.directory / (mode + "-export.csv.manifest.json")).read_text())
         combined = self.directory / (mode + "-export-combined.csv")
         with open(combined, "w") as target:
@@ -770,7 +783,7 @@ class Soak:
             target.write("\n".join(lines[1:]) + "\n")
         actions = self.directory / (mode + "-export-batch-actions.jsonl")
         subprocess.run(
-            [self.options.batch_probe, self.options.observed_strategy, str(combined), str(actions)],
+            self.batch_command(combined, actions),
             check=True,
         )
         expected = [
@@ -782,7 +795,8 @@ class Soak:
         self.receipt(
             f"{'PASS' if equal else 'FAIL'} {mode} export prints-built bars equal the runner's "
             f"tick-built bars (state-hash-proven replay, read via the observer) "
-            f"minutes={len(exported)} ohlc_exact={len(exported)} volume_one_ulp={volume_ulp} "
+            f"minutes={len(exported)} bars_bit_exact={len(exported)} "
+            f"qty_step={manifest['qty_step']} volume_rule={manifest['volume_rule']} "
             f"prints={manifest['prints']} "
             f"quiet_minutes={manifest['quiet_minutes']} "
             f"batch_over_export_actions={len(expected)} runner={len(actual_actions)}"
@@ -801,7 +815,7 @@ class Soak:
                 output.write(",".join([str(candle[0]), *candle[1]]) + "\n")
         actions = self.directory / (mode + "-kline-batch-actions.jsonl")
         subprocess.run(
-            [self.options.batch_probe, self.options.observed_strategy, str(combined), str(actions)],
+            self.batch_command(combined, actions),
             check=True,
         )
         expected = [
@@ -895,6 +909,8 @@ if __name__ == "__main__":
         "--modes", default="bars,ticks", help="bars, ticks or agg-ticks, comma-separated"
     )
     parser.add_argument("--bar-minutes", type=int, default=46)
+    # The runner's symbol quantity step (--syminfo qty_step=V); export and the batch use the same.
+    parser.add_argument("--qty-step")
     parser.add_argument("--tick-minutes", type=int, default=21)
     parser.add_argument("--restart-seconds", type=int, default=180)
     parser.add_argument(

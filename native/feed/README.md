@@ -93,7 +93,7 @@ publication without its manifest is not a qualified warmup.
 ```sh
 build-feed/pineforge-feed export --venue binance --market usdm --symbol BTCUSDT \
   --mode agg-ticks --start 2026-10-03T00:00:00Z --end 2026-10-03T03:20:00Z --output agg-bars.csv \
-  --warmup warmup.csv
+  --warmup warmup.csv  # add --qty-step V when the runner runs with --syminfo qty_step=V
 # or from a local copy of the venue's public daily aggregate-trade archive:
 build-feed/pineforge-feed export --venue binance --market usdm --symbol BTCUSDT \
   --mode agg-ticks --start 2026-10-02T00:10:00Z --end 2026-10-02T23:50:00Z --output agg-bars.csv \
@@ -106,15 +106,32 @@ must equal the forward run needs bars built the same way, not venue candles (see
 writes exactly those bars in the warmup CSV format, by the runner's tick-built
 bar rule: a print belongs to minute `floor(ts / 60000) * 60000`; open is the first
 price, high the maximum, low the minimum, close the last price, and volume the
-exact decimal sum of the quantities; a minute without a print repeats the
+runner's own tick volume (below); a minute without a print repeats the
 previous close with volume `0`, as the runner's carry-forward bar does. Before
 the window's first print that close is the runner's last warmup close, not the
 last print before `--start`: `--warmup` takes the runner's warmup CSV, whose last
 row must be the minute before `--start` (20 otherwise), and the manifest records
 it as `warmup_close`. Without `--warmup` a quiet first minute stops with 20
-rather than guess. Price tokens are the venue's own; the volume is the canonical
-exact sum. (Without a `qty_step` the runner sums tick volume in compensated
-doubles, which can land one ulp from the exact sum the export writes.)
+rather than guess. Price tokens are the venue's own.
+
+Volume is the double the runner builds, bit for bit, written as the shortest
+decimal that reads back as that double. The runner reads each quantity from
+the feed's JSON number (`std::stod`) and its rule depends on its symbol's
+quantity step (the engine's tick-volume rule):
+
+- **No quantity step (the default, and the runner's default):** the runner adds
+  the quantities in print order as a compensated (Neumaier) binary64 sum, so
+  `0.1 + 0.2 + 0.05` gives `0.35000000000000003`. Use this when the runner runs
+  without `--syminfo qty_step=...`.
+- **`--qty-step V`:** use the same value the runner gets as
+  `--syminfo qty_step=V`. A decimal step `1/10^k` (`0.001`, `0.1`, `1`) makes the
+  volume the exact sum of grid units, rounded once to the nearest double; any
+  other step (for example `0.0004`), a quantity off the grid, or overflow falls
+  back to the compensated sum, exactly as the runner does.
+
+The manifest records `qty_step` and `volume_rule` (`exact-decimal-grid` or
+`compensated-binary64`). An export made for one setting does not match a runner
+deployed with the other.
 
 Completeness is proven, never assumed: the prints must form a contiguous ID chain
 from the last print strictly before `--start` through the fence, the first print

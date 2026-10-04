@@ -4,6 +4,7 @@
 import hashlib
 import importlib
 import json
+import math
 import pathlib
 import subprocess
 import sys
@@ -14,6 +15,7 @@ import unittest
 import zipfile
 from datetime import UTC, datetime
 from decimal import Decimal, getcontext
+from fractions import Fraction
 
 # mock_venue reads the binary from sys.argv[1] at import time.
 sys.argv = [sys.argv[0], sys.argv[1]]
@@ -35,7 +37,51 @@ def canonical(value):
     return text
 
 
-def expected_bars(prints, start, end, warmup_close=None):
+def runner_volume(quantities, step=None):
+    """The runner's tick-built volume, independently (engine TickVolume): on a 1/10^k step the
+    exact grid units, correctly rounded; else, or once a quantity is off it, the compensated
+    binary64 sum in print order. Quantities are JSON number tokens, read as correctly rounded
+    doubles (the runner's std::stod)."""
+    divisor, places, exact = 1.0, 0, False
+    if step is not None:
+        scale = 1.0
+        for k in range(23):
+            if float(step) == 1.0 / scale:
+                divisor, places, exact = scale, k, True
+                break
+            scale *= 10.0
+
+    def decimal(units):
+        return units / divisor if units <= 2**53 else float(Fraction(units, 10**places))
+
+    units, total, compensation = 0, 0.0, 0.0
+    for token in quantities:
+        quantity = float(token)
+        following = total + quantity
+        if math.isfinite(following):
+            if total >= quantity:
+                compensation += (total - following) + quantity
+            else:
+                compensation += (quantity - following) + total
+        else:
+            compensation = 0.0
+        total = following
+        if not exact:
+            continue
+        scaled = quantity * divisor
+        if not math.isfinite(scaled):
+            exact = False
+            continue
+        rounded = math.floor(scaled) + (1 if scaled - math.floor(scaled) >= 0.5 else 0)
+        if rounded >= 2**63 or decimal(rounded) != quantity or rounded > 2**63 - 1 - units:
+            exact = False
+            continue
+        units += rounded
+    value = decimal(units) if exact else total + compensation
+    return canonical(Decimal(repr(value)))
+
+
+def expected_bars(prints, start, end, warmup_close=None, step=None):
     """The tick-built bar rule, independently: prints are (id, ts, price, qty) in ID order. A
     quiet first minute carries the runner's last warmup close."""
     close = warmup_close
@@ -47,9 +93,9 @@ def expected_bars(prints, start, end, warmup_close=None):
             continue
         high = max(inside, key=lambda p: Decimal(p[2]))[2]
         low = min(inside, key=lambda p: Decimal(p[2]))[2]
-        volume = sum((Decimal(p[3]) for p in inside), Decimal(0))
+        volume = runner_volume([p[3] for p in inside], step)
         close = inside[-1][2]
-        rows.append(f"{minute},{inside[0][2]},{high},{low},{close},{canonical(volume)}")
+        rows.append(f"{minute},{inside[0][2]},{high},{low},{close},{volume}")
     return "\n".join(rows) + "\n"
 
 
@@ -148,7 +194,8 @@ class ExportMockTests(unittest.TestCase):
         text = self.output.read_text()
         self.assertEqual(text, expected_bars(prints, start, start + 240000))
         self.assertIn(f"\n{start + 60000},9.90000000,9.90000000,9.90000000,9.90000000,0\n", text)
-        self.assertIn(f"\n{start},10.10000000,11.20000000,9.90000000,9.90000000,0.6\n", text)
+        volume = runner_volume(["0.10000000", "0.20000000", "0.30000000"])
+        self.assertIn(f"\n{start},10.10000000,11.20000000,9.90000000,9.90000000,{volume}\n", text)
         manifest = self.manifest()
         self.assertEqual(
             {key: manifest[key] for key in ("venue", "market", "symbol", "mode")},
@@ -220,6 +267,45 @@ class ExportMockTests(unittest.TestCase):
             self.output.read_text(), expected_bars(prints, start + 60000, start + 120000)
         )
         self.assertIsNone(self.manifest()["warmup_close"])
+
+    def test_volume_follows_the_runner_rule_for_its_qty_step(self):
+        # The engine's #319 vectors: 0.1 + 0.2 + 0.05 on step 0.1 leaves the grid (compensated
+        # 0.35000000000000003); on step 0.05 it is exact 0.35; without a step it is compensated.
+        # 0.1 x 10 + 0.3 shows a plain binary64 sum (1.2999999999999998) is not the rule.
+        start = recent_minute(30)
+        prints = [(499, start - 1, "10", "1")]
+        for index, quantity in enumerate(["0.1", "0.2", "0.05"]):
+            prints.append((500 + index, start + index, "10", quantity))
+        for index in range(10):
+            prints.append((503 + index, start + 60000 + index, "10", "0.1"))
+        prints.append((513, start + 60010, "10", "0.3"))
+        prints.append((514, start + 120000, "10", "1"))
+        server = self.server(prints)
+        end = start + 120000
+        for step, first, second, rule in (
+            (None, "0.35000000000000003", "1.3", "compensated-binary64"),
+            ("0.1", "0.35000000000000003", "1.3", "exact-decimal-grid"),
+            ("0.05", "0.35000000000000003", "1.3", "compensated-binary64"),
+            ("0.01", "0.35", "1.3", "exact-decimal-grid"),
+        ):
+            with self.subTest(step=step):
+                extra = ["--qty-step", step] if step else []
+                self.export(start, end, server, extra=extra)
+                rows = self.output.read_text().splitlines()
+                self.assertEqual(rows[1].split(",")[5], first)
+                self.assertEqual(rows[2].split(",")[5], second)
+                self.assertEqual(
+                    self.output.read_text(), expected_bars(prints, start, end, step=step)
+                )
+                manifest = self.manifest()
+                self.assertEqual((manifest["qty_step"], manifest["volume_rule"]), (step, rule))
+                self.output.unlink()
+                pathlib.Path(str(self.output) + ".manifest.json").unlink()
+        plain = 0.0
+        for quantity in [0.1] * 10 + [0.3]:
+            plain += quantity
+        self.assertEqual(plain, 1.2999999999999998)
+        self.export(start, end, server, extra=["--qty-step", "0"], expected=23)
 
     def test_rest_pages_by_from_id_and_sums_volume_exactly(self):
         start = recent_minute(40)

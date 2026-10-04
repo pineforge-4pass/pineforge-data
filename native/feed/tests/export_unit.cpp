@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cassert>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -264,10 +266,58 @@ int main() {
         chain.add({2, 60000, "5", "0.1"});
         chain.add({3, 119999, "5", "0.2"});
         assert(chain.add({4, 120000, "5", "1"}));
-        assert(chain.csv() == bar_header + "60000,5,5,5,5,0.3\n");
+        // Without a qty_step the runner's volume is the compensated binary64 sum, written shortest.
+        assert(chain.csv() == bar_header + "60000,5,5,5,5,0.30000000000000004\n");
+        ChainBars grid(60000, 120000);
+        grid.quantity_grid(0.1);
+        grid.anchor({1, 0, "5", "1"});
+        grid.add({2, 60000, "5", "0.1"});
+        grid.add({3, 119999, "5", "0.2"});
+        assert(grid.add({4, 120000, "5", "1"}));
+        assert(grid.csv() == bar_header + "60000,5,5,5,5,0.3\n");
+        ChainBars late(60000, 120000);
+        late.anchor({1, 0, "5", "1"});
+        expect(23, [&] { late.quantity_grid(0.1); });
+        ChainBars zero(60000, 120000);
+        expect(23, [&] { zero.quantity_grid(0); });
     }
     {
-        // Price tokens stay verbatim (an equal value keeps the first lexeme); volume is the exact canonical sum.
+        // The engine's tick-volume vectors (#319, tests/test_native_tick_volume.cpp).
+        const auto volume = [](std::optional<double> step, std::initializer_list<double> quantities) {
+            RunnerVolume sum;
+            sum.reset(step);
+            for (const double quantity : quantities) sum.add(quantity);
+            return std::make_pair(sum.value(), sum.exact());
+        };
+        assert(volume(0.1, {0.1, 0.2}) == std::make_pair(0.3, true));
+        assert(volume(0.1, {0.1, 0.2, 0.05}) == std::make_pair(std::strtod("0.35000000000000003", nullptr), false));
+        assert(volume(0.1, {std::nextafter(0.3, 1.0)}) == std::make_pair(std::nextafter(0.3, 1.0), false));
+        assert(volume(0.001, {4e15, 4e15, 4e15, 1, 1}) == std::make_pair(12000000000000002.0, false));
+        assert(volume(1.0, {std::ldexp(1.0, 63), 1024, 1024}) == std::make_pair(std::ldexp(1.0, 63) + 2048, false));
+        assert(volume(std::nullopt, {0.1, 0.2, 0.05}).first == std::strtod("0.35000000000000003", nullptr));
+        assert(volume(0.0004, {0.1, 0.2}) == std::make_pair(0.30000000000000004, false));
+        std::uint64_t seed = 84729531;
+        double divisor = 1.0;
+        for (int places = 0; places <= 22; ++places, divisor *= 10.0) {
+            RunnerVolume grid;
+            grid.reset(1.0 / divisor);
+            assert(grid.exact());
+            for (int sample = 0; sample < 128; ++sample) {
+                seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+                const auto units = static_cast<std::int64_t>(seed & 0x7fffffffffffffffULL);
+                const auto decimal = std::to_string(units) + "e-" + std::to_string(places);
+                assert(grid.decimal(units) == std::strtod(decimal.c_str(), nullptr));
+            }
+        }
+        assert(runner_double("0.003") == 0.003 && runner_double("84797.50") == 84797.5);
+        expect(23, [] { runner_double("1x"); });
+        expect(23, [] { runner_double(""); });
+        assert(shortest_decimal(0.30000000000000004) == "0.30000000000000004" && shortest_decimal(1e-05) == "0.00001" &&
+               shortest_decimal(3.0) == "3" && shortest_decimal(12000000000000002.0) == "12000000000000002");
+        passed("runner_volume_matches_the_engine_tick_volume_vectors");
+    }
+    {
+        // Price tokens stay verbatim (an equal value keeps the first lexeme); volume is the runner's sum.
         ChainBars chain(60000, 180000);
         chain.anchor({1, 59999, "1.0", "1"});
         chain.add({2, 60000, "2.50", "0.1"});
@@ -277,7 +327,7 @@ int main() {
         chain.add({6, 60004, "1.25", "0.000000000000000000000000000001"});
         for (std::uint64_t id = 7; id < 17; ++id) chain.add({id, 120000 + static_cast<std::int64_t>(id), "3.10", "0.1"});
         assert(chain.add({17, 180000, "3", "1"}));
-        assert(chain.csv() == bar_header + "60000,2.50,2.50,0.70,1.25,10000000000.300000000000000000000000000001\n"
+        assert(chain.csv() == bar_header + "60000,2.50,2.50,0.70,1.25,10000000000.3\n"
                                            "120000,3.10,3.10,3.10,3.10,1\n");
     }
     {

@@ -310,9 +310,10 @@ Curl answers server PING with matching-payload PONG; OKX and Bybit get their
 text keepalives. Keepalive replies are control messages: they never count as
 data. After `--silence-seconds` (default 75) without data, OKX and Bybit
 reconnect; Binance instead sends a `LIST_SUBSCRIPTIONS` probe, and a reply that
-lists the subscriptions proves the connection and its streams alive, so a quiet
-symbol no longer pays a reconnect and its REST overlap every 75 seconds (an
-empty list, or no reply within 10 seconds, reconnects). This is safe because
+lists every stream of the connection proves the connection and its streams
+alive, so a quiet symbol no longer pays a reconnect and its REST overlap every
+75 seconds (an error reply, a list missing a stream, or no reply within 10
+seconds reconnects; it is never taken for market data). This is safe because
 completeness never rests on the connection: every print is chained by ID, every
 minute behind a confirmed watermark, and every reconnect re-verifies its overlap.
 Reconnect also occurs on `serverShutdown` or an OKX `notice`, transport loss, or
@@ -380,12 +381,18 @@ with `--replay-age-seconds`, while a segment's last minute is older than that in
 venue time; a segment file goes before its checkpoint, so a crash in between
 leaves an orphan checkpoint that resume removes. The open segment and every
 segment that can hold a message of the protected window (the open minute and the
-32 closed-minute proofs the reconnect overlap re-verifies) never expire; when
-they alone exceed the budget the feed keeps them and logs
-`replay_budget_held_by_protected_window`. Resume verifies the retained journal
+32 closed-minute proofs the reconnect overlap re-verifies) never expire, nor, in
+tick modes, the segment holding the newest print (a reconnect re-reads recent
+prints from the journal, and a quiet next-print-fence stream keeps closing
+minutes without any); when they alone exceed the budget the feed keeps them
+and logs `replay_budget_held_by_protected_window`. Resume verifies the retained journal
 from its oldest checkpoint, checks every segment boundary against its
-checkpoint and the end against the cursor, and fsyncs truncation of an
-uncommitted crash tail. Every crash point of a commit, a seal and an expiry is
+checkpoint and the end against the cursor, and only then fsyncs truncation of an
+uncommitted crash tail. It removes only what a crash can leave (the empty
+successor of an interrupted seal, the oldest checkpoint of an interrupted
+expiry); any other unexpected segment or checkpoint stops with 21 and is left in
+place. Resume reads the whole retained window within `--max-replay-seconds`, so
+a very large `--replay-bytes` needs a larger budget there. Every crash point of a commit, a seal and an expiry is
 exercised by the test suite (`PINEFORGE_FEED_CRASH_AT`, a test hook that kills
 the process at a named step) and by random kills.
 
@@ -545,8 +552,11 @@ its own queue of released messages, at most `--client-queue-bytes` (default
 once); `--max-clients` (default 64). A client whose queue overflows (it reads
 slower than the stream, beyond the kernel's socket buffers) is closed with code
 1008 and the reason `slow consumer`; a client whose cursor expires while it
-catches up is closed with 4410. Neither ever blocks the producer or another
-client. A client that stops reading entirely is dropped when its blocked write
+catches up is closed with 4410 as soon as it reaches the expired segment.
+Neither ever blocks the producer or another client. A client holds a journal
+segment open only while it catches up. At start `serve` raises its open-file
+limit to the hard limit and refuses to start (23) when that is below
+`2 x --max-clients + 64`. A client that stops reading entirely is dropped when its blocked write
 times out (30 seconds). On SIGTERM the producer drains each live client's queue
 and closes every client with 1001 (a client still catching up from the journal
 is closed at once and resumes from its own count).

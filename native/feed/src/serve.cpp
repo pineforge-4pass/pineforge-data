@@ -17,6 +17,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <sys/resource.h>
 #include <unistd.h>
 
 namespace pineforge::feed {
@@ -45,6 +46,7 @@ struct Hub {
     std::set<Client*> clients;
     std::size_t connected = 0, serving = 0;
     bool stopping = false;
+    std::atomic<bool> halting{false};  // stopping, readable without the mutex by clients catching up
 
     void publish(const std::string& line) {
         const auto shared = std::make_shared<const std::string>(line);
@@ -79,6 +81,7 @@ struct Hub {
     void stop() {
         std::unique_lock<std::mutex> guard(mutex);
         stopping = true;
+        halting = true;
         changed.notify_all();
         changed.wait_for(guard, std::chrono::seconds(3), [this] { return serving == 0; });
     }
@@ -103,7 +106,7 @@ bool get_only(mg_connection* connection) {
     return false;
 }
 
-int on_status(mg_connection* connection, void* data) {
+int status_page(mg_connection* connection, void* data) {
     if (!get_only(connection)) return 405;
     auto& hub = *static_cast<Hub*>(data);
     std::string body;
@@ -121,7 +124,7 @@ int on_status(mg_connection* connection, void* data) {
 }
 
 // The complete committed prefix from index 0, the only HTTP shape the current runner accepts.
-int on_snapshot(mg_connection* connection, void* data) {
+int snapshot_page(mg_connection* connection, void* data) {
     if (!get_only(connection)) return 405;
     auto& hub = *static_cast<Hub*>(data);
     std::uint64_t published = 0, first = 0;
@@ -137,7 +140,7 @@ int on_snapshot(mg_connection* connection, void* data) {
         if (!body) return refuse(connection, 413, "the committed prefix exceeds the runner's 4 MiB HTTP snapshot bound; use /v1/stream");
         respond(connection, 200, "application/x-ndjson", *body);
         return 200;
-    } catch (const Error&) { return refuse(connection, 410, expired); }
+    } catch (const Error& failure) { return failure.code == 20 ? refuse(connection, 410, expired) : refuse(connection, 500, failure.what()); }
 }
 
 bool query_value(const std::string& query, const char* name, std::string& value) {
@@ -148,7 +151,7 @@ bool query_value(const std::string& query, const char* name, std::string& value)
     return true;
 }
 
-int on_connect(const mg_connection* constant, void* data) {
+int admit(const mg_connection* constant, void* data) {
     auto* connection = const_cast<mg_connection*>(constant);
     auto& hub = *static_cast<Hub*>(data);
     const auto* request = mg_get_request_info(connection);
@@ -185,6 +188,20 @@ int on_connect(const mg_connection* constant, void* data) {
     return 0;
 }
 
+// No exception may unwind into CivetWeb's C code: a failing request answers 500, a failing upgrade is refused.
+int on_status(mg_connection* connection, void* data) {
+    try { return status_page(connection, data); }
+    catch (...) { return refuse(connection, 500, "internal error"); }
+}
+int on_snapshot(mg_connection* connection, void* data) {
+    try { return snapshot_page(connection, data); }
+    catch (...) { return refuse(connection, 500, "internal error"); }
+}
+int on_connect(const mg_connection* connection, void* data) {
+    try { return admit(connection, data); }
+    catch (...) { return 1; }
+}
+
 bool send_close(mg_connection* connection, unsigned short code, const std::string& reason) {
     std::string payload;
     payload += static_cast<char>(code >> 8);
@@ -195,25 +212,7 @@ bool send_close(mg_connection* connection, unsigned short code, const std::strin
     return mg_websocket_write(connection, MG_WEBSOCKET_OPCODE_CONNECTION_CLOSE, payload.data(), payload.size()) > 0;
 }
 
-// One client, on its CivetWeb worker thread: the retained journal from its cursor, then live messages from
-// its bounded queue, one WebSocket text message per normalized message, and an unsolicited PONG after 5 s
-// without a message so a quiet stream never trips the runner's idle deadline.
-void on_ready(mg_connection* connection, void* data) {
-    auto& hub = *static_cast<Hub*>(data);
-    auto* client = static_cast<Client*>(mg_get_user_connection_data(connection));
-    if (!client) return;
-    {
-        std::lock_guard<std::mutex> guard(hub.mutex);
-        ++hub.serving;
-    }
-    struct Done {
-        Hub& hub;
-        ~Done() {
-            std::lock_guard<std::mutex> guard(hub.mutex);
-            --hub.serving;
-            hub.changed.notify_all();
-        }
-    } done{hub};
+void serve_client(mg_connection* connection, Hub& hub, Client* client) {
     auto last_send = std::chrono::steady_clock::now();
     // A write that cannot complete within the request timeout leaves a partial frame: the connection is dead.
     const auto send = [&](const std::string& bytes, int opcode) {
@@ -225,33 +224,55 @@ void on_ready(mg_connection* connection, void* data) {
         last_send = std::chrono::steady_clock::now();
         return true;
     };
-    JournalReader reader(hub.journal);
-    if (!reader.seek(client->next)) {
-        send_close(connection, 4410, "cursor expired: older than the retained journal");
-        return;
-    }
+    const auto expired = [&] {
+        std::lock_guard<std::mutex> guard(hub.mutex);
+        return client->next < hub.first_retained;
+    };
+    // The journal is read only while catching up: a client at the head holds no segment open.
+    std::optional<JournalReader> reader;
     for (;;) {
         std::uint64_t head = 0;
+        bool stopping = false;
         {
             std::lock_guard<std::mutex> guard(hub.mutex);
-            if (hub.stopping) { send_close(connection, 1001, "producer stopping"); return; }
+            stopping = hub.stopping;
             head = hub.published;
-            if (client->next == head) { client->live = true; break; }
+            if (!stopping && client->next == head) client->live = true;
+        }
+        if (stopping) { send_close(connection, 1001, "producer stopping"); return; }
+        if (client->live) break;
+        if (!reader) {
+            reader.emplace(hub.journal);
+            if (!reader->seek(client->next)) {
+                send_close(connection, 4410, "cursor expired: older than the retained journal");
+                return;
+            }
         }
         while (client->next < head) {
-            auto line = reader.next();
+            if (hub.halting) { send_close(connection, 1001, "producer stopping"); return; }
+            auto line = reader->next();
             if (!line) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                if (std::chrono::steady_clock::now() - last_send > std::chrono::seconds(30)) {
+                // A released line is on disk: missing means its segment expired (or the reader cannot open it).
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (!line && std::chrono::steady_clock::now() < deadline && !hub.halting) {
+                    if (expired()) {
+                        send_close(connection, 4410, "cursor expired while catching up: the journal moved past it");
+                        return;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    line = reader->next();
+                }
+                if (!line) {
+                    if (hub.halting) continue;
                     send_close(connection, 1011, "journal segment unavailable");
                     return;
                 }
-                continue;
             }
             if (!send(*line, MG_WEBSOCKET_OPCODE_TEXT)) return;
             ++client->next;
         }
     }
+    reader.reset();
     for (;;) {
         std::shared_ptr<const std::string> line;
         {
@@ -281,6 +302,32 @@ void on_ready(mg_connection* connection, void* data) {
         } else if (std::chrono::steady_clock::now() - last_send >= keepalive && !send("", MG_WEBSOCKET_OPCODE_PONG)) return;
     }
 }
+
+// One client, on its CivetWeb worker thread: the retained journal from its cursor, then live messages from
+// its bounded queue, one WebSocket text message per normalized message, and an unsolicited PONG after 5 s
+// without a message so a quiet stream never trips the runner's idle deadline. Nothing may unwind into
+// CivetWeb's C code.
+void on_ready(mg_connection* connection, void* data) {
+    auto& hub = *static_cast<Hub*>(data);
+    auto* client = static_cast<Client*>(mg_get_user_connection_data(connection));
+    if (!client) return;
+    {
+        std::lock_guard<std::mutex> guard(hub.mutex);
+        ++hub.serving;
+    }
+    struct Done {
+        Hub& hub;
+        ~Done() {
+            std::lock_guard<std::mutex> guard(hub.mutex);
+            --hub.serving;
+            hub.changed.notify_all();
+        }
+    } done{hub};
+    try { serve_client(connection, hub, client); }
+    catch (...) {
+        try { send_close(connection, 1011, "internal error"); } catch (...) {}
+    }
+}
 int on_data(mg_connection*, int, char*, std::size_t, void*) { return 1; }
 void on_close(const mg_connection*, void*) {}
 
@@ -294,9 +341,10 @@ void on_connection_close(const mg_connection* connection) {
         hub->clients.erase(client);
         --hub->connected;
     }
-    log("info", "client_disconnected", Json::object({{"next", number(client->next)}}));
+    const auto next = client->next;
     delete client;
     mg_set_user_connection_data(connection, nullptr);
+    try { log("info", "client_disconnected", Json::object({{"next", number(next)}})); } catch (...) {}
 }
 int on_log(const mg_connection*, const char* message) {
     log("warn", "http_server", Json::object({{"message", Json::string(std::string(message).substr(0, 512))}}));
@@ -339,10 +387,13 @@ public:
 
 JournalReader::~JournalReader() { if (descriptor_ >= 0) ::close(descriptor_); }
 
+// False only when the segment does not exist (expired, or not yet sealed into existence); any other failure,
+// such as running out of descriptors, is an I/O error and never passes for an expired cursor.
 bool JournalReader::open(std::uint64_t base) {
     const auto path = directory_ + "/" + segment_name(base) + ".jsonl";
     const int descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (descriptor < 0) return false;
+    if (descriptor < 0 && errno == ENOENT) return false;
+    if (descriptor < 0) throw Error(22, "cannot open a journal segment for a client");
     if (descriptor_ >= 0) ::close(descriptor_);
     descriptor_ = descriptor;
     buffer_.clear();
@@ -357,14 +408,16 @@ bool JournalReader::seek(std::uint64_t index) {
         std::uint64_t chosen = 0;
         bool found = false;
         std::error_code failure;
-        for (const auto& entry : std::filesystem::directory_iterator(directory_, failure)) {
-            const auto name = entry.path().filename().string();
+        std::filesystem::directory_iterator entries(directory_, failure), end;
+        for (; !failure && entries != end; entries.increment(failure)) {
+            const auto name = entries->path().filename().string();
             if (name.size() != 26 || name.compare(20, 6, ".jsonl") != 0) continue;
             std::uint64_t base = 0;
             if (std::from_chars(name.data(), name.data() + 20, base).ec != std::errc{}) continue;
             if (base <= index && (!found || base > chosen)) { chosen = base; found = true; }
         }
-        if (failure || !found) return false;
+        if (failure) throw Error(22, "cannot list the journal for a client");
+        if (!found) return false;
         if (!open(chosen)) continue;
         while (index_ < index) {
             auto skipped = next();
@@ -397,13 +450,13 @@ std::optional<std::string> JournalReader::next() {
 
 std::optional<std::string> snapshot_prefix(const std::string& journal, std::uint64_t published, std::size_t limit) {
     JournalReader reader(journal);
-    if (!reader.seek(0)) throw Error(22, "the snapshot prefix has expired");
+    if (!reader.seek(0)) throw Error(20, "the snapshot prefix has expired");
     std::string body;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (reader.index() < published) {
         auto line = reader.next();
         if (!line) {
-            if (std::chrono::steady_clock::now() >= deadline) throw Error(22, "a snapshot segment expired while it was read");
+            if (std::chrono::steady_clock::now() >= deadline) throw Error(20, "a snapshot segment expired while it was read");
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
@@ -434,6 +487,17 @@ std::string listen_address(const std::string& listen, bool allow_remote) {
 
 void serve_feed(Config config) {
     const auto address = listen_address(config.listen, config.allow_remote_listen);
+    // Each client holds a socket (and a journal segment while it catches up); the producer needs its own.
+    rlimit files{};
+    if (::getrlimit(RLIMIT_NOFILE, &files) == 0 && files.rlim_cur < files.rlim_max) {
+        files.rlim_cur = files.rlim_max;
+        ::setrlimit(RLIMIT_NOFILE, &files);
+        ::getrlimit(RLIMIT_NOFILE, &files);
+    }
+    const auto needed = static_cast<rlim_t>(2 * config.max_clients + 64);
+    if (files.rlim_cur != RLIM_INFINITY && files.rlim_cur < needed)
+        throw Error(23, "the open-file limit (" + std::to_string(files.rlim_cur) + ") is below " + std::to_string(needed) +
+                        " for --max-clients " + std::to_string(config.max_clients) + "; raise it or lower --max-clients");
     // Instrument metadata fixes the quantity units before the cursor binds them.
     const auto venue = make_venue(config);
     config.qty_multiplier = venue->qty_multiplier();

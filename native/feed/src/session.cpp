@@ -116,7 +116,7 @@ void FeedSession::connected() {
         if (fetched.size() != trades.size()) throw Error(20, "reconnect raw overlap is unavailable");
         for (std::size_t index = 0; index < trades.size(); ++index)
             if (!(trades[index] == fetched[index])) throw Error(21, "reconnect raw overlap changed");
-    } else if (state_.cursor().predecessor) {
+    } else if (!state_.cursor().seq && state_.cursor().predecessor) {
         const auto fetched = venue_.history(state_.cursor().predecessor->id, 1);
         if (!(fetched.front() == *state_.cursor().predecessor)) throw Error(21, "initial predecessor overlap changed");
     }
@@ -159,11 +159,12 @@ void FeedSession::put(const Trade& trade) {
     trade.validate();
     if (trade.ts < state_.cursor().start) return;
     if (state_.cursor().seq && trade.id <= state_.cursor().seq) {
-        if (state_.expired_seq(trade.id)) {
+        auto previous = state_.recent_trade(trade.id);
+        if (!previous && state_.expired_seq(trade.id)) {
             log("warn", "expired_duplicate_unverified", Json::object({{"seq", Json::number(std::to_string(trade.id))}}));
             return;
         }
-        const auto previous = state_.trade(trade.id);
+        if (!previous) previous = state_.trade(trade.id);
         if (!previous || !(*previous == trade)) throw Error(21, "duplicate raw trade conflicts with the immutable prefix");
         return;
     }
@@ -258,7 +259,8 @@ void FeedSession::closed(const Kline& kline) {
         return;
     }
     if (minute < state_.cursor().cut) {
-        const auto old = state_.bar(minute);
+        // Tick journals hold no bar lines: only the closed-minute proofs can hold this candle.
+        const auto old = state_.config().mode == "bars" ? state_.bar(minute) : state_.proof(minute);
         if (old) {
             if (!(*old == kline.bar)) throw Error(21, "already-emitted closed bar was revised");
         }
@@ -353,11 +355,12 @@ void FenceSession::put(const Trade& trade, bool healed) {
         throw Error(23, "venue matched time regressed: a print before the proven predecessor is at or after the start minute");
     }
     if (state_.cursor().seq && trade.id <= state_.cursor().seq) {
-        if (state_.expired_seq(trade.id)) {
+        auto previous = state_.recent_trade(trade.id);
+        if (!previous && state_.expired_seq(trade.id)) {
             log("warn", "expired_duplicate_unverified", Json::object({{"seq", Json::number(std::to_string(trade.id))}}));
             return;
         }
-        const auto previous = state_.trade(trade.id);
+        if (!previous) previous = state_.trade(trade.id);
         if (!previous || !(*previous == trade)) throw Error(21, "duplicate print conflicts with the immutable prefix");
         return;
     }
@@ -530,7 +533,7 @@ void FenceSession::connected() {
         if (fetched.size() != trades.size()) throw Error(20, "reconnect print overlap is unavailable");
         for (std::size_t index = 0; index < trades.size(); ++index)
             if (!(trades[index] == fetched[index])) throw Error(21, "reconnect print overlap changed");
-    } else if (state_.cursor().predecessor) {
+    } else if (!state_.cursor().seq && state_.cursor().predecessor) {
         const auto fetched = venue_.history(state_.cursor().predecessor->id, 1);
         if (fetched.empty()) throw Error(20, "initial predecessor overlap is unavailable");
         if (!(fetched.front() == *state_.cursor().predecessor)) throw Error(21, "initial predecessor overlap changed");

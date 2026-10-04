@@ -237,6 +237,9 @@ std::string HttpClient::body(const std::string& path, unsigned int weight, std::
         }
         Progress state;
         auto handle = handle_for(config_.rest_url + path, false, config_.allow_insecure, &state);
+        // The venue counts a request in the window it was sent in, not the one its response arrives in.
+        const auto sent_window = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count()) / 60000;
         Response response;
         response.limit = limit;
         option(handle.get(), CURLOPT_WRITEFUNCTION, &body_callback);
@@ -276,8 +279,7 @@ std::string HttpClient::body(const std::string& path, unsigned int weight, std::
         if (status != 200) throw Error(23, "public market-data request rejected (HTTP " + std::to_string(status) + ")");
         if (response.used_weight) {
             used_weight_ = response.used_weight;
-            used_window_ = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count()) / 60000;
+            used_window_ = sent_window;
             log("info", "rest_weight", Json::object({{"used_weight_1m", Json::number(std::to_string(response.used_weight))}}));
         }
         return std::move(response.body);
@@ -311,6 +313,7 @@ bool WebSocketPump::push(SourceMessage message) {
     return true;
 }
 void WebSocketPump::wait_for_room(std::size_t bytes) {
+    if (bytes > config_.max_queue_bytes) throw Error(22, "--max-queue-bytes is too small for one source message");
     for (;;) {
         {
             std::lock_guard<std::mutex> guard(mutex_);
@@ -374,7 +377,8 @@ void WebSocketPump::run() {
             // The marker precedes every message of this connection: the session verifies its REST
             // overlap while the subscribed data is buffered behind it.
             wait_for_room(32);
-            if (stopped() || !push({true, {}})) return;
+            if (stopped()) return;
+            if (!push({true, {}})) throw Error(22, "WebSocket queue cannot take the connection marker");
             bool subscribed = true;
             for (const auto& request : connection_.subscribe) subscribed = subscribed && send_text(handle.get(), socket, request);
             log(subscribed ? "info" : "warn", subscribed ? "websocket_connected" : "websocket_subscribe_failed");

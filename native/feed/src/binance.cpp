@@ -71,15 +71,21 @@ Trade usdm_aggregate(const Json& value) {
     trade.validate();
     return trade;
 }
-Frame binance_frame(const std::string& message) {
+Frame binance_frame(const std::string& message, const std::vector<std::string>& streams) {
     try {
         const auto envelope = parse_json(message);
         // The reply to the liveness probe: {"result":[subscribed streams],"id":N}. Without them all, reconnect.
-        if (const auto* result = envelope.find("result")) {
-            if (!envelope.find("id")) throw Error(23, "unexpected public stream reply");
-            if (result->kind != Json::Kind::Array || result->items.empty()) return Frame::Stale;
+        if (envelope.find("id") && !envelope.find("stream") && !envelope.find("e")) {
+            const auto* result = envelope.find("result");
+            if (!result || result->kind != Json::Kind::Array || result->items.empty()) return Frame::Stale;
+            for (const auto& stream : streams) {
+                bool listed = false;
+                for (const auto& item : result->items) listed = listed || (item.kind == Json::Kind::String && item.text() == stream);
+                if (!listed) return Frame::Stale;
+            }
             return Frame::Control;
         }
+        if (envelope.find("result")) throw Error(23, "unexpected public stream reply");
         const auto* wrapped = envelope.find("data");
         const auto& data = wrapped ? *wrapped : envelope;
         const auto* event = data.find("e");
@@ -87,10 +93,19 @@ Frame binance_frame(const std::string& message) {
     } catch (const std::exception&) { throw Error(23, "invalid public WebSocket JSON"); }
 }
 
+namespace {
+// A combined-stream connection whose probe reply must list every one of its streams.
+Connection combined(const std::string& prefix, const std::vector<std::string>& streams) {
+    std::string path = prefix;
+    for (const auto& stream : streams) path += (path.size() == prefix.size() ? "" : "/") + stream;
+    return {path, {}, {}, [streams](const std::string& message) { return binance_frame(message, streams); },
+            "{\"method\":\"LIST_SUBSCRIPTIONS\",\"id\":1}"};
+}
+}
 Connection BinanceSpot::connection() const {
     const auto symbol = lower(config_.symbol);
-    return {"/stream?streams=" + (config_.mode == "ticks" ? symbol + "@trade/" + symbol + "@kline_1m" : symbol + "@kline_1m"), {}, {},
-            &binance_frame, "{\"method\":\"LIST_SUBSCRIPTIONS\",\"id\":1}"};
+    if (config_.mode == "ticks") return combined("/stream?streams=", {symbol + "@trade", symbol + "@kline_1m"});
+    return combined("/stream?streams=", {symbol + "@kline_1m"});
 }
 std::vector<VenueEvent> BinanceSpot::decode(const std::string& message) const {
     try {
@@ -182,8 +197,8 @@ RestPolicy usdm_rest() {
 unsigned int usdm_kline_weight(std::size_t limit) { return limit < 100 ? 1 : limit < 500 ? 2 : limit <= 1000 ? 5 : 10; }
 Connection usdm_connection(const Config& config) {
     const auto symbol = lower(config.symbol);
-    return {"/market/stream?streams=" + (config.mode == "agg-ticks" ? symbol + "@aggTrade/" + symbol + "@kline_1m" : symbol + "@kline_1m"),
-            {}, {}, &binance_frame, "{\"method\":\"LIST_SUBSCRIPTIONS\",\"id\":1}"};
+    if (config.mode == "agg-ticks") return combined("/market/stream?streams=", {symbol + "@aggTrade", symbol + "@kline_1m"});
+    return combined("/market/stream?streams=", {symbol + "@kline_1m"});
 }
 BinanceUsdm::BinanceUsdm(const Config& config) : config_(config), http_(config, usdm_rest()) {
     // An unknown symbol is refused before any stream is opened (HTTP 400, code -1121).

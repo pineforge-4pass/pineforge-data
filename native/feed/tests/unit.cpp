@@ -59,7 +59,7 @@ struct SyntheticVenue final : Venue {
         {180000, {{180000, "12.00000000", "12.00000000", "11.00000000", "11.00000000", "0.50000000"}, 103, 104, 2, true}},
         {240000, {{240000, "12.00000000", "12.00000000", "12.00000000", "12.00000000", "0.10000000"}, 105, 105, 1, true}}
     };
-    Connection connection() const override { return {"/stream?streams=test@trade/test@kline_1m", {}, {}, &binance_frame, {}}; }
+    Connection connection() const override { return {"/stream?streams=test@trade/test@kline_1m", {}, {}, [](const std::string& message) { return binance_frame(message); }, {}}; }
     std::vector<VenueEvent> decode(const std::string&) const override { throw Error(23, "not used by deterministic unit venue"); }
     std::string kline_source() const override { return "/synthetic"; }
     std::size_t pages = 0;
@@ -115,7 +115,7 @@ struct FenceVenue final : Venue {
     std::size_t pages = 0, candle_requests = 0;
     // REST lag: the next `empty_reads` history reads return nothing, the next `short_reads` drop their last row.
     std::size_t empty_reads = 0, short_reads = 0;
-    Connection connection() const override { return {"/synthetic", {}, {}, &binance_frame, {}}; }
+    Connection connection() const override { return {"/synthetic", {}, {}, [](const std::string& message) { return binance_frame(message); }, {}}; }
     std::vector<VenueEvent> decode(const std::string&) const override { throw Error(23, "not used by deterministic unit venue"); }
     std::vector<Trade> history(std::uint64_t from, std::size_t limit) override {
         ++pages;
@@ -399,30 +399,42 @@ int main() {
         auto options = config(temporary, "bars");
         options.segment_bytes = 4096;
         options.replay_bytes = 8192;
-        std::uint64_t open = 0, first = 0, expired = 0;
+        std::uint64_t open = 0, first = 0, expired = 0, next = 0;
         std::string prefix;
         {
             State state(options);
             commit_bars(state, 120000, 300);
             open = state.durable().segment;
             first = state.first_retained();
+            next = state.durable().message_index;
             prefix = state.durable().prefix_hash;
         }
+        // An interrupted seal: the successor's checkpoint and its empty segment at the cursor's next index.
         expired = first - 1;
         std::filesystem::copy_file(checkpoint_file(temporary, first), checkpoint_file(temporary, expired));
-        std::filesystem::copy_file(checkpoint_file(temporary, open), checkpoint_file(temporary, open + 1000));
-        { std::ofstream residue(segment_file(temporary, open + 1000)); }
-        std::filesystem::copy_file(checkpoint_file(temporary, open), checkpoint_file(temporary, open + 2000));
+        std::filesystem::copy_file(checkpoint_file(temporary, open), checkpoint_file(temporary, next));
+        { std::ofstream residue(segment_file(temporary, next)); }
         options.resume = true;
         options.start = -1;
         options.output_from = first;
         {
             State resumed(options);
             assert(resumed.durable().prefix_hash == prefix && resumed.durable().segment == open && resumed.first_retained() == first);
-            assert(!std::filesystem::exists(checkpoint_file(temporary, expired)) && !std::filesystem::exists(segment_file(temporary, open + 1000)));
-            assert(!std::filesystem::exists(checkpoint_file(temporary, open + 1000)) && !std::filesystem::exists(checkpoint_file(temporary, open + 2000)));
-            commit_bars(resumed, 120000 + 300 * 60000, 2);
+            assert(!std::filesystem::exists(checkpoint_file(temporary, expired)) && !std::filesystem::exists(segment_file(temporary, next)));
+            assert(!std::filesystem::exists(checkpoint_file(temporary, next)));
         }
+        // Anything else is not a crash leftover: a segment after the cursor that is not the empty successor,
+        // or a checkpoint without its segment inside the retained range, stops 21 and is left in place.
+        std::filesystem::copy_file(checkpoint_file(temporary, open), checkpoint_file(temporary, next + 1000));
+        { std::ofstream stray(segment_file(temporary, next + 1000)); stray << "{}\n"; }
+        expect(21, [&] { State stray(options); });
+        assert(std::filesystem::exists(segment_file(temporary, next + 1000)));
+        std::filesystem::remove(segment_file(temporary, next + 1000));
+        std::filesystem::remove(checkpoint_file(temporary, next + 1000));
+        std::filesystem::copy_file(checkpoint_file(temporary, open), checkpoint_file(temporary, first + 1));
+        expect(21, [&] { State hole(options); });
+        std::filesystem::remove(checkpoint_file(temporary, first + 1));
+        { State resumed(options); commit_bars(resumed, 120000 + 300 * 60000, 2); }
         const auto saved = checkpoint_file(temporary, open) + ".saved";
         std::filesystem::rename(checkpoint_file(temporary, open), saved);
         expect(21, [&] { State missing(options); });
@@ -437,6 +449,35 @@ int main() {
         }
         expect(21, [&] { State changed(options); });
         passed("journal_rotation_and_expiry_crash_residue_recovers_or_stops_21");
+    }
+    {
+        // A quiet fence-venue tick stream: time events keep closing minutes after the last print, so age and
+        // byte retention would expire every segment holding a print; the newest print's segment stays, and a
+        // resume still has the recent prints its reconnect overlap re-reads.
+        Temporary temporary;
+        auto options = config(temporary, "ticks");
+        options.segment_bytes = 4096;
+        options.replay_bytes = 8192;
+        options.replay_age_ms = 5 * 60000;
+        {
+            State state(options);
+            state.anchor({99, 119999, "10.10000000", "0.10000000"});
+            state.stage(Trade{100, 120001, "10.10000000", "0.10000000"}.wire());
+            state.flush();
+            for (std::int64_t minute = 1; minute <= 400; ++minute) {
+                const Bar proof{120000 + (minute - 1) * 60000, "10.10000000", "10.10000000", "10.10000000", "10.10000000",
+                                minute == 1 ? "0.10000000" : "0"};
+                state.stage("{\"type\":\"time\",\"ts\":" + std::to_string(120000 + minute * 60000) + "}", proof);
+                if (minute % 5 == 0) state.flush();
+            }
+            state.flush();
+            assert(state.segments().size() > 2 && state.first_retained() == 0 && state.recent_trades().size() == 1);
+        }
+        options.resume = true;
+        options.start = -1;
+        State resumed(options);
+        assert(resumed.recent_trades().size() == 1 && resumed.recent_trades().front().id == 100 && resumed.durable().seq == 100);
+        passed("retention_keeps_the_segment_of_the_newest_print");
     }
     {
         Temporary temporary;
@@ -1032,7 +1073,7 @@ int main() {
         std::filesystem::remove(segment_file(temporary, 0));
         JournalReader expired(temporary.path + "/journal");
         assert(!expired.seek(3) && expired.seek(state.segments()[1].base));
-        expect(22, [&] { snapshot_prefix(temporary.path + "/journal", 3, 4096); });  // index 0 expired above
+        expect(20, [&] { snapshot_prefix(temporary.path + "/journal", 3, 4096); });  // index 0 expired above
         Temporary small;
         auto bounded = config(small, "bars");
         State fresh(bounded);

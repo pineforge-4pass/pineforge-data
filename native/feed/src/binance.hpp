@@ -10,7 +10,9 @@ Kline binance_kline(const Json& row, bool websocket);
 // One USD-M aggregate print: `a` is the sequence, `q` the quantity. Its raw `f..l` range is validated,
 // never expanded into imaginary raw trades.
 Trade usdm_aggregate(const Json& row);
-Frame binance_frame(const std::string& message);
+// A probe reply (a top-level `id`) proves the connection alive only if its `result` lists every stream in
+// `streams`; an error or a partial list is a lost subscription (Stale), never market data.
+Frame binance_frame(const std::string& message, const std::vector<std::string>& streams = {});
 Connection usdm_connection(const Config& config);
 unsigned int usdm_kline_weight(std::size_t limit);
 

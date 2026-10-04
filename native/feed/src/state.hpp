@@ -33,7 +33,7 @@ struct Cursor {
 // cut and emitted sequence.
 struct Segment {
     std::uint64_t base = 0, bytes = 0, seq = 0;
-    std::int64_t cut = 0;
+    std::int64_t cut = 0, last_tick_ts = -1;
 };
 std::string segment_name(std::uint64_t base);
 
@@ -65,6 +65,8 @@ class State {
     void rotate();
     void retain();
     std::size_t segment_for(std::uint64_t index) const;
+    // visit() that stops as soon as `visitor` returns false.
+    void scan(std::uint64_t from, const std::function<bool(const std::string&)>& visitor) const;
 public:
     explicit State(const Config& config);
     const Cursor& cursor() const { return cursor_; }
@@ -84,7 +86,9 @@ public:
     std::vector<std::string> flush();
     void visit(std::uint64_t from, const std::function<void(const std::string&)>& visitor) const;
     std::optional<Trade> trade(std::uint64_t id) const;
+    std::optional<Trade> recent_trade(std::uint64_t id) const;
     std::optional<Bar> bar(std::int64_t ts) const;
+    std::optional<Bar> proof(std::int64_t ts) const;
     const std::deque<Trade>& recent_trades() const { return recent_trades_; }
     const std::deque<Bar>& recent_bars() const { return recent_bars_; }
     Json status() const;

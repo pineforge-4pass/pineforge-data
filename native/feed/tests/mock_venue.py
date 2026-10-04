@@ -275,6 +275,7 @@ class MockServer(http.server.ThreadingHTTPServer):
         self.history_delay = 0.0
         self.probes = []
         self.stale_subscriptions = False
+        self.probe_reply = "full"
         self.refuse_once = None
         self.usdm_unknown_symbol = False
         self.connections = 0
@@ -661,7 +662,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     streams = (
                         [] if self.server.stale_subscriptions else query["streams"][0].split("/")
                     )
-                    send({"result": streams, "id": request["id"]})
+                    if self.server.probe_reply == "error":
+                        send({"code": 2, "msg": "synthetic refusal", "id": request["id"]})
+                    elif self.server.probe_reply == "partial":
+                        send({"result": streams[-1:], "id": request["id"]})
+                    else:
+                        send({"result": streams, "id": request["id"]})
             closed.set()
 
         reader = threading.Thread(target=read, daemon=True)
@@ -1451,6 +1457,12 @@ class FeedMockTests(unittest.TestCase):
         self.assertIn("rest_rate_limited", result.stderr)
 
     def test_replay_and_queue_budgets_stop_22(self):
+        # A queue that cannot hold even a connection marker stops at once, never waits forever.
+        server = self.server([[candle(120000)]])
+        output, result = self.run_feed(server, extra=["--max-queue-bytes", "16"], expected=22)
+        self.assertEqual(output, [])
+        self.assertIn("too small", result.stderr)
+        self.reset_state()
         server = self.server([[trade(100)]])
         output, _ = self.run_feed(server, "ticks", ["--max-queue-bytes", "64"], expected=22)
         self.assertEqual(output, [])
@@ -1558,6 +1570,22 @@ class FeedMockTests(unittest.TestCase):
         self.assertEqual([event["bar"]["ts_open"] for event in output], [120000, 180000])
         self.assertGreaterEqual(server.connections, 2)
         self.assertIn("source_subscription_lost", result.stderr)
+        # An error reply, or a list missing one of the connection's streams, also reconnects
+        # (never 23).
+        for reply, mode, script in (
+            ("error", "bars", [[candle(120000), ("pause", 2.0)], [candle(180000)]]),
+            ("partial", "ticks", [[trade(100), ("pause", 2.0)], [trade(101), trade(102)]]),
+        ):
+            with self.subTest(reply=reply):
+                self.reset_state()
+                server = self.server(script)
+                server.probe_reply = reply
+                output, result = self.run_feed(
+                    server, mode, ["--max-messages", "2", "--silence-seconds", "1"]
+                )
+                self.assertEqual(len(output), 2)
+                self.assertGreaterEqual(server.connections, 2)
+                self.assertIn("source_subscription_lost", result.stderr)
 
     def test_okx_swap_bars_confirm_flag_and_contract_units(self):
         server = self.server([[okx_candle(120000, "0"), okx_candle(180000)]], "okx")
@@ -2526,6 +2554,10 @@ class FeedMockTests(unittest.TestCase):
                     else:
                         outcomes.append("read")
                     stream.close()
+                except TimeoutError:
+                    # A silent server (a catch-up client stuck on an expired segment) is a failure.
+                    failures.append(("timeout", start))
+                    return
                 except (OSError, EOFError) as failure:
                     outcomes.append(f"transport-{type(failure).__name__}")
 

@@ -220,7 +220,7 @@ void State::initialize() {
     sync_directory(journal_dir());
     persist(cursor_);
     durable_ = cursor_;
-    segments_ = {{0, 0, 0, cursor_.start}};
+    segments_ = {{0, 0, 0, cursor_.start, -1}};
 }
 
 void State::recover() {
@@ -267,6 +267,7 @@ void State::recover() {
         for (const auto& entry : std::filesystem::directory_iterator(journal_dir())) {
             const auto name = entry.path().filename().string();
             std::uint64_t base = 0;
+            if (!name.empty() && name.front() == '.') continue;
             if (name.size() > 4 && name.compare(name.size() - 4, 4, ".tmp") == 0) { std::filesystem::remove(entry.path()); continue; }
             if (name.size() == 26 && name.compare(20, 6, ".jsonl") == 0 && parse_base(name.substr(0, 20), base)) files[base].first = true;
             else if (name.size() == 36 && name.compare(20, 16, ".checkpoint.json") == 0 && parse_base(name.substr(0, 20), base)) files[base].second = true;
@@ -274,14 +275,21 @@ void State::recover() {
         }
         std::vector<std::uint64_t> retained;
         bool removed = false;
+        std::uint64_t lowest = cursor_.segment;
+        for (const auto& [base, kinds] : files)
+            if (kinds.first) lowest = std::min(lowest, base);
         for (const auto& [base, kinds] : files) {
             if (base > cursor_.segment) {
+                // Only the successor an interrupted seal creates: at the cursor's index, and still empty.
+                if (base != cursor_.message_index || (kinds.first && std::filesystem::file_size(segment_path(base)) != 0))
+                    throw Error(21, "a journal segment after the cursor's open segment holds data the cursor does not cover");
                 std::filesystem::remove(segment_path(base));
                 std::filesystem::remove(checkpoint_path(base));
                 log("warn", "uncommitted_rotation_removed", Json::object({{"segment", number(base)}}));
                 removed = true;
             } else if (!kinds.first) {
-                if (base == cursor_.segment) throw Error(21, "the open journal segment is missing");
+                // An interrupted expiry leaves the oldest checkpoint without its segment; anything else is a hole.
+                if (base >= lowest) throw Error(21, "the retained journal has a hole: a checkpoint without its segment");
                 std::filesystem::remove(checkpoint_path(base));
                 removed = true;
             } else if (!kinds.second) throw Error(21, "a journal segment has no checkpoint");
@@ -301,7 +309,7 @@ void State::recover() {
             const auto base = retained[index];
             if (index && !same_state(reconstructed, read_checkpoint(base)))
                 throw Error(21, "durable journal segment boundary does not match its checkpoint");
-            segments_.push_back({base, reconstructed.log_bytes, reconstructed.seq, reconstructed.cut});
+            segments_.push_back({base, reconstructed.log_bytes, reconstructed.seq, reconstructed.cut, reconstructed.last_tick_ts});
             const auto path = segment_path(base);
             const auto size = std::filesystem::file_size(path);
             const bool open = index + 1 == retained.size();
@@ -317,14 +325,16 @@ void State::recover() {
                 ++reconstructed.message_index;
                 remember(event);
             });
-            if (open && ::truncate(path.c_str(), static_cast<off_t>(limit)) != 0)
-                throw Error(22, "cannot roll back an uncommitted journal tail");
         }
         if (!same_state(reconstructed, cursor_)) throw Error(21, "durable journal prefix does not match its cursor");
+        // Only a verified journal is changed: the open segment's uncommitted tail goes last.
+        if (::truncate(segment_path(cursor_.segment).c_str(), static_cast<off_t>(cursor_.log_bytes - segments_.back().bytes)) != 0)
+            throw Error(22, "cannot roll back an uncommitted journal tail");
         config_.start = cursor_.start;
         durable_ = cursor_;
     } catch (const Error&) { throw; }
     catch (const Stopped&) { throw; }
+    catch (const std::filesystem::filesystem_error&) { throw Error(22, "journal I/O failed during recovery"); }
     catch (const std::exception&) { throw Error(21, "invalid durable cursor or journal"); }
 }
 
@@ -385,8 +395,14 @@ std::vector<std::string> State::flush() {
     durable_ = cursor_;
     staged_bytes_.clear();
     auto lines = std::exchange(staged_, {});
-    if (durable_.log_bytes - segments_.back().bytes >= config_.segment_bytes) rotate();
-    retain();
+    // The lines are committed; a failed seal or expiry leaves files only resume may reconcile.
+    try {
+        if (durable_.log_bytes - segments_.back().bytes >= config_.segment_bytes) rotate();
+        retain();
+    } catch (...) {
+        unusable_ = true;
+        throw;
+    }
     return lines;
 }
 
@@ -407,7 +423,7 @@ void State::rotate() {
     crash_point("rotate-cursor");
     durable_.segment = cursor_.segment = base;
     journal_.reset(next.release());
-    segments_.push_back({base, durable_.log_bytes, durable_.seq, durable_.cut});
+    segments_.push_back({base, durable_.log_bytes, durable_.seq, durable_.cut, durable_.last_tick_ts});
     log("info", "journal_segment_sealed", Json::object({{"next_segment", number(base)}, {"segments", number(segments_.size())}}));
 }
 
@@ -419,14 +435,17 @@ void State::retain() {
         const auto oldest = segments_[0];
         const auto& next = segments_[1];
         if (next.cut >= protected_start) break;
+        // The segment holding the newest print stays: a reconnect re-reads the recent prints from the journal.
+        if (tick_mode(config_.mode) && next.seq == durable_.seq && oldest.seq < durable_.seq) break;
         const bool bytes = durable_.log_bytes - oldest.bytes > config_.replay_bytes;
         const bool age = config_.replay_age_ms && durable_.cut - next.cut > config_.replay_age_ms;
         if (!bytes && !age) break;
         if (::unlink(segment_path(oldest.base).c_str()) != 0) throw Error(22, "cannot expire a journal segment");
+        segments_.erase(segments_.begin());
+        sync_directory(journal_dir());
         crash_point("retain-segment");
         if (::unlink(checkpoint_path(oldest.base).c_str()) != 0 && errno != ENOENT) throw Error(22, "cannot expire a journal checkpoint");
         sync_directory(journal_dir());
-        segments_.erase(segments_.begin());
         log("info", "journal_segment_expired", Json::object({{"segment", number(oldest.base)},
             {"first_retained", number(segments_.front().base)}, {"reason", Json::string(bytes ? "bytes" : "age")}}));
     }
@@ -443,9 +462,12 @@ std::size_t State::segment_for(std::uint64_t index) const {
     return found == segments_.begin() ? 0 : static_cast<std::size_t>(found - segments_.begin() - 1);
 }
 
+// Ticks of the first retained segment's open minute can sit in the expired segment before it: that minute
+// is expired only when its checkpoint shows a tick of it.
 bool State::expired_minute(std::int64_t minute) const {
-    const auto cut = segments_.front().cut;
-    return first_retained() && (minute < cut || (tick_mode(config_.mode) && minute == cut));
+    const auto& first = segments_.front();
+    return first_retained() &&
+        (minute < first.cut || (tick_mode(config_.mode) && minute == first.cut && first.last_tick_ts >= first.cut));
 }
 
 std::uint64_t State::index_for_minute(std::int64_t minute) const {
@@ -456,50 +478,65 @@ std::uint64_t State::index_for_minute(std::int64_t minute) const {
 }
 
 void State::visit(std::uint64_t from, const std::function<void(const std::string&)>& visitor) const {
+    scan(from, [&](const std::string& line) { visitor(line); return true; });
+}
+
+void State::scan(std::uint64_t from, const std::function<bool(const std::string&)>& visitor) const {
     if (from > cursor_.message_index) throw Error(22, "replay cursor is unavailable");
     if (from < first_retained()) throw Error(22, "replay cursor has expired from the retained journal");
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(config_.max_replay_seconds);
+    struct Enough {};
     std::uint64_t index = durable_.message_index;
-    for (auto position = segment_for(from); position < segments_.size() && from < durable_.message_index; ++position) {
-        const auto& segment = segments_[position];
-        const bool last = position + 1 == segments_.size();
-        const auto end_bytes = last ? durable_.log_bytes : segments_[position + 1].bytes;
-        const auto end_index = last ? durable_.message_index : segments_[position + 1].base;
-        index = segment.base;
-        read_lines(segment_path(segment.base), end_bytes - segment.bytes, deadline, [&](const std::string& line) {
-            if (index >= from) visitor(line);
+    try {
+        for (auto position = segment_for(from); position < segments_.size() && from < durable_.message_index; ++position) {
+            const auto& segment = segments_[position];
+            const bool last = position + 1 == segments_.size();
+            const auto end_bytes = last ? durable_.log_bytes : segments_[position + 1].bytes;
+            const auto end_index = last ? durable_.message_index : segments_[position + 1].base;
+            index = segment.base;
+            read_lines(segment_path(segment.base), end_bytes - segment.bytes, deadline, [&](const std::string& line) {
+                if (index >= from && !visitor(line)) throw Enough{};
+                ++index;
+            });
+            if (index != end_index) throw Error(21, "verified message partition changed");
+        }
+        index = durable_.message_index;
+        for (const auto& staged : staged_) {
+            if (index >= from && !visitor(staged)) return;
             ++index;
-        });
-        if (index != end_index) throw Error(21, "verified message partition changed");
-    }
-    index = durable_.message_index;
-    for (const auto& staged : staged_) {
-        if (index >= from) visitor(staged);
-        ++index;
-    }
+        }
+    } catch (const Enough&) {}
 }
 
-std::optional<Trade> State::trade(std::uint64_t id) const {
+std::optional<Trade> State::recent_trade(std::uint64_t id) const {
     for (const auto& trade : recent_trades_) if (trade.id == id) return trade;
+    return std::nullopt;
+}
+std::optional<Trade> State::trade(std::uint64_t id) const {
+    if (const auto recent = recent_trade(id)) return recent;
     std::size_t chosen = 0;
     for (std::size_t index = 0; index < segments_.size(); ++index)
         if (segments_[index].seq < id) chosen = index;
     std::optional<Trade> found;
-    visit(segments_[chosen].base, [&](const std::string& line) {
-        if (found) return;
+    scan(segments_[chosen].base, [&](const std::string& line) {
         const auto event = parse_json(line);
         if (event.at("type").text() == "tick" && event.at("seq").integer<std::uint64_t>() == id) found = normalized_trade(event);
+        return !found;
     });
     return found;
 }
+std::optional<Bar> State::proof(std::int64_t ts) const {
+    for (const auto& bar : cursor_.proofs) if (bar.ts == ts) return bar;
+    return std::nullopt;
+}
 std::optional<Bar> State::bar(std::int64_t ts) const {
     for (const auto& bar : recent_bars_) if (bar.ts == ts) return bar;
-    for (const auto& bar : cursor_.proofs) if (bar.ts == ts) return bar;
+    if (const auto proven = proof(ts)) return proven;
     std::optional<Bar> found;
-    visit(index_for_minute(ts), [&](const std::string& line) {
-        if (found) return;
+    scan(index_for_minute(ts), [&](const std::string& line) {
         const auto event = parse_json(line);
         if (event.at("type").text() == "bar" && event.at("bar").at("ts_open").integer<std::int64_t>() == ts) found = normalized_bar(event);
+        return !found;
     });
     return found;
 }

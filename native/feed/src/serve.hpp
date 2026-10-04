@@ -25,8 +25,8 @@ public:
     std::uint64_t index() const { return index_; }
 };
 
-// The committed prefix [0, published) as JSONL, or nullopt when it exceeds `limit` bytes; throws 22 when index 0
-// has expired or a segment disappears while it is read.
+// The committed prefix [0, published) as JSONL, or nullopt when it exceeds `limit` bytes; throws 20 when index 0
+// has expired or a segment disappears while it is read, 22 on an I/O error.
 std::optional<std::string> snapshot_prefix(const std::string& journal, std::uint64_t published, std::size_t limit);
 // The listening address: loopback unless the operator explicitly allows another interface.
 std::string listen_address(const std::string& listen, bool allow_remote);

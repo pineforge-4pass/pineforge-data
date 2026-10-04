@@ -30,10 +30,10 @@ struct StdoutFlags {
 void help() {
     std::cout << "pineforge-feed warmup --venue VENUE --market MARKET --symbol SYMBOL --start UTC|MS --end UTC|MS --output FILE\n"
                  "pineforge-feed export --venue VENUE --market MARKET --symbol SYMBOL --mode ticks|agg-ticks --start UTC|MS --end UTC|MS --output FILE\n"
-                 "                      [--archive DAILY.zip|DAILY.csv [--checksum DAILY.zip.CHECKSUM]] (prints-built 1m bars)\n"
+                 "                      [--warmup RUNNER-WARMUP.csv] [--archive DAILY.zip|DAILY.csv [--checksum DAILY.zip.CHECKSUM]] (prints-built 1m bars)\n"
                  "pineforge-feed run --venue VENUE --market MARKET --symbol SYMBOL --mode MODE --state-dir DIR [--start UTC|MS | --resume] [--output-from INDEX]\n"
                  "pineforge-feed serve --venue VENUE --market MARKET --symbol SYMBOL --mode MODE --state-dir DIR [--start UTC|MS | --resume]\n"
-                 "                     [--listen HOST:PORT (default 127.0.0.1:8787)] [--allow-remote-listen] [--client-queue-bytes N] [--max-clients N]\n"
+                 "                     [--listen HOST:PORT|[IPV6]:PORT (default 127.0.0.1:8787)] [--allow-remote-listen] [--client-queue-bytes N] [--max-clients N]\n"
                  "  GET /v1/status, GET /v1/snapshot (complete prefix from index 0, at most 4 MiB), ws://HOST:PORT/v1/stream?epoch=E&from=I\n"
                  "Venues and modes:\n"
                  "  binance spot BTCUSDT        bars | ticks\n"
@@ -122,6 +122,7 @@ int run(int argc, char** argv) {
             else if (key == "--output") output = value;
             else if (key == "--archive") exported.archive = value;
             else if (key == "--checksum") exported.checksum = value;
+            else if (key == "--warmup") exported.warmup = value;
             else if (key == "--output-from") config.output_from = unsigned_value(value);
             else if (key == "--max-messages") config.max_messages = unsigned_value(value);
             else if (key == "--segment-bytes") config.segment_bytes = unsigned_value(value);
@@ -144,8 +145,8 @@ int run(int argc, char** argv) {
             else throw Error(23, "unknown CLI option: " + key);
         }
         gate(config, command == "warmup", seen.count("--rest-url") != 0, seen.count("--ws-url") != 0);
-        if (command != "export" && (!exported.archive.empty() || !exported.checksum.empty()))
-            throw Error(23, "--archive and --checksum are export options");
+        if (command != "export" && (!exported.archive.empty() || !exported.checksum.empty() || !exported.warmup.empty()))
+            throw Error(23, "--archive, --checksum and --warmup are export options");
         if (!config.max_queue_bytes || !config.max_replay_seconds || config.max_replay_seconds > 3600 ||
             !config.reconnect_seconds || config.reconnect_seconds > 86100)
             throw Error(23, "budgets must be positive; reconnect must precede the 24-hour connection limit");
@@ -163,7 +164,7 @@ int run(int argc, char** argv) {
         if (command == "export") {
             if (output.empty() || config.resume || !config.state_dir.empty() || seen.count("--output-from") || !tick_mode(config.mode) ||
                 config.start < 0 || config.end < 0)
-                throw Error(23, "export takes --mode ticks|agg-ticks, --start, --end and --output (plus --archive [--checksum])");
+                throw Error(23, "export takes --mode ticks|agg-ticks, --start, --end and --output (plus --warmup, --archive [--checksum])");
             if (!exported.checksum.empty() && exported.archive.empty()) throw Error(23, "--checksum verifies an --archive");
             exported.output = output;
             export_bars(config, exported);

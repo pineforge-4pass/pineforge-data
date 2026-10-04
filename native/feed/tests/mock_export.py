@@ -12,6 +12,7 @@ import threading
 import time
 import unittest
 import zipfile
+from datetime import UTC, datetime
 from decimal import Decimal, getcontext
 
 # mock_venue reads the binary from sys.argv[1] at import time.
@@ -34,9 +35,10 @@ def canonical(value):
     return text
 
 
-def expected_bars(prints, start, end):
-    """The tick-built bar rule, independently: prints are (id, ts, price, qty) in ID order."""
-    close = [p for p in prints if p[1] < start][-1][2]
+def expected_bars(prints, start, end, warmup_close=None):
+    """The tick-built bar rule, independently: prints are (id, ts, price, qty) in ID order. A
+    quiet first minute carries the runner's last warmup close."""
+    close = warmup_close
     rows = ["timestamp,open,high,low,close,volume"]
     for minute in range(start, end, 60000):
         inside = [p for p in prints if minute <= p[1] < minute + 60000]
@@ -164,22 +166,60 @@ class ExportMockTests(unittest.TestCase):
             (manifest["prints"], manifest["bars"], manifest["quiet_minutes"]), (6, 4, 1)
         )
 
+    def warmup(self, start, close):
+        path = self.directory / "warmup.csv"
+        path.write_text(
+            "timestamp,open,high,low,close,volume\n"
+            f"{start - 120000},9,11,8,10,1\n{start - 60000},10,10.5,9.5,{close},2\n"
+        )
+        return path
+
     def test_rest_start_survives_a_quiet_first_hour(self):
         # The first aggregate after --start lies in the second hour window: the start lookup
-        # searches forward up to the clock instead of stopping 20 after one window.
+        # searches forward up to the clock instead of stopping 20 after one window. The quiet
+        # first minutes carry the warmup close (10.2), not the predecessor's 10.10000000, as the
+        # runner carries its last warmup bar; the quiet later minute carries the last print.
         start = recent_minute(90)
+        end = start + 73 * 60000
         prints = [(499, start - 1, "10.10000000", "0.10000000")]
-        prints += synthetic(500, start + 70 * 60000, 3, 4)
+        prints += synthetic(500, start + 70 * 60000, 4, 4, quiet=(1,))
         server = self.server(prints)
-        self.export(start, start + 72 * 60000, server)
-        self.assertEqual(self.output.read_text(), expected_bars(prints, start, start + 72 * 60000))
-        self.assertEqual(self.manifest()["quiet_minutes"], 70)
+        warmup = self.warmup(start, "10.2")
+        self.export(start, end, server, extra=["--warmup", str(warmup)])
+        text = self.output.read_text()
+        self.assertEqual(text, expected_bars(prints, start, end, warmup_close="10.2"))
+        self.assertIn(f"\n{start},10.2,10.2,10.2,10.2,0\n", text)
+        last = [p for p in prints if p[1] < start + 71 * 60000][-1][2]
+        self.assertIn(f"\n{start + 71 * 60000},{last},{last},{last},{last},0\n", text)
+        manifest = self.manifest()
+        self.assertEqual((manifest["quiet_minutes"], manifest["warmup_close"]), (71, "10.2"))
         windows = [
             int(query["startTime"][0])
             for path, query in server.queries
             if path == "/fapi/v1/aggTrades" and "startTime" in query
         ]
         self.assertIn(start + 3600000, windows)
+
+    def test_quiet_first_minute_without_the_warmup_close_stops(self):
+        start = recent_minute(30)
+        prints = [(499, start - 1, "10.10000000", "0.10000000")]
+        prints += synthetic(500, start + 60000, 2, 3)
+        server = self.server(prints)
+        result = self.export(start, start + 120000, server, expected=20)
+        self.assertIn("--warmup", result.stderr)
+        warmup = self.warmup(start + 60000, "10.2")
+        result = self.export(
+            start, start + 120000, server, extra=["--warmup", str(warmup)], expected=20
+        )
+        self.assertIn("minute before the start", result.stderr)
+        warmup.write_text("timestamp,open,high,low,close,volume\n" + f"{start - 60000},1,1,1,x,1\n")
+        self.export(start, start + 120000, server, extra=["--warmup", str(warmup)], expected=23)
+        # A first minute with prints never reads the warmup close.
+        self.export(start + 60000, start + 120000, server)
+        self.assertEqual(
+            self.output.read_text(), expected_bars(prints, start + 60000, start + 120000)
+        )
+        self.assertIsNone(self.manifest()["warmup_close"])
 
     def test_rest_pages_by_from_id_and_sums_volume_exactly(self):
         start = recent_minute(40)
@@ -333,6 +373,22 @@ class ExportMockTests(unittest.TestCase):
         result = self.export(start, start + 120000, extra=["--archive", str(archive)], expected=21)
         self.assertRegex(result.stderr, "deflate|CRC-32|recorded size")
         self.assertNotIn("export_written", result.stderr)
+
+    def test_archive_day_boundaries_name_the_missing_daily_file(self):
+        # A window from 00:00 UTC has its predecessor in the previous day's file, and one to 24:00
+        # has its fence in the next day's: export reads one daily file and says which one is needed.
+        day = int(datetime(2026, 10, 2, tzinfo=UTC).timestamp() * 1000)
+        prints = synthetic(1000, day, 3, 4) + synthetic(1012, day + 86400000 - 180000, 3, 4)
+        archive = self.write_archive(f"{SYMBOL}-aggTrades-2026-10-02.csv", prints)
+        result = self.export(day, day + 120000, extra=["--archive", str(archive)], expected=20)
+        self.assertIn(f"{SYMBOL}-aggTrades-2026-10-01.csv", result.stderr)
+        result = self.export(
+            day + 86400000 - 120000,
+            day + 86400000,
+            extra=["--archive", str(archive)],
+            expected=20,
+        )
+        self.assertIn(f"{SYMBOL}-aggTrades-2026-10-03.csv", result.stderr)
 
     def test_archive_outside_window_and_unsupported_venue(self):
         start, prints = self.archive_prints()

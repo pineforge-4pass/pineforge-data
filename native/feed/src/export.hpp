@@ -9,6 +9,7 @@ struct ExportOptions {
     std::string output;    // the warmup-format CSV to write; refused if it exists
     std::string archive;   // optional: a venue daily aggregate-trade archive (.zip or extracted .csv)
     std::string checksum;  // optional: the archive's published .CHECKSUM file
+    std::string warmup;    // optional: the runner's warmup CSV, ending at the minute before the start
 };
 // Prints-built one-minute bars over [config.start, config.end), by the runner's tick-built bar rule, from venue
 // REST within its retention or from a local daily archive.
@@ -17,12 +18,14 @@ void export_bars(const Config& config, const ExportOptions& options);
 // The runner's tick-built bar rule over [start, end) on a proven print chain: anchor() takes the predecessor (the
 // last print strictly before start), add() every later print in ID order until it returns true at the fence (the
 // first print at or after end). A minute is first/max/min/last price and the exact volume sum; a minute without a
-// print repeats the previous close with volume 0. A hole stops 20, a time regression along the chain 23.
+// print repeats the previous close with volume 0. Before the window's first print that close is the runner's last
+// warmup close (seed()), as the runner carries it; without a seed a quiet first minute stops 20. A hole stops 20,
+// a time regression along the chain 23.
 class ChainBars {
     std::int64_t start_, end_, minute_ = -1, next_, last_ts_ = -1;
     std::uint64_t last_id_ = 0, count_ = 0, prints_ = 0, bars_ = 0, quiet_ = 0;
     std::optional<Trade> predecessor_, fence_;
-    std::string open_, high_, low_, close_, csv_;
+    std::string open_, high_, low_, close_, csv_, seed_;
     Decimal high_value_{"0"}, low_value_{"0"}, volume_{"0"};
     void flush();
     void carry(std::int64_t until);
@@ -30,6 +33,8 @@ class ChainBars {
              const std::string& close, const std::string& volume);
 public:
     ChainBars(std::int64_t start, std::int64_t end);
+    // The close a quiet first minute carries: the last warmup bar's close (before anchor()).
+    void seed(const std::string& close);
     void anchor(const Trade& predecessor);
     bool add(const Trade& trade);
     bool anchored() const { return predecessor_.has_value(); }
@@ -43,6 +48,7 @@ public:
     std::uint64_t prints() const { return prints_; }
     std::uint64_t bars() const { return bars_; }
     std::uint64_t quiet_minutes() const { return quiet_; }
+    const std::string& seeded_close() const { return seed_; }
 };
 // One daily-archive line, columns agg_trade_id,price,quantity,first_trade_id,last_trade_id,transact_time,
 // is_buyer_maker: nullopt for the header, which only the first line may be. A transact_time above 10^14 is
@@ -61,5 +67,7 @@ std::string file_sha256(const std::string& path);
 void verify_checksum(const std::string& checksum, const std::string& archive, const std::string& digest);
 // The window's chain from a daily aggregate-trade archive (.zip, else an extracted .csv), streamed: only the
 // predecessor candidate, the window's bars and the fence are kept.
-ChainBars archive_bars(const std::string& archive, std::int64_t start, std::int64_t end);
+ChainBars archive_bars(const std::string& archive, std::int64_t start, std::int64_t end, const std::string& seed = {});
+// The close of the warmup CSV's last row, which must be the minute before start (20 otherwise; 23 if malformed).
+std::string warmup_close(const std::string& warmup, std::int64_t start);
 }

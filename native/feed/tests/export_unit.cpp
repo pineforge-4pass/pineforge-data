@@ -229,18 +229,30 @@ int main() {
         expect(23, [&] { chain.add({506, 300050, "12.10", "0.2"}); });
     }
     {
-        // The first minute is quiet: it carries the predecessor's price; a fence exactly at the end closes the window.
+        // The first minute is quiet: it carries the warmup close, not the predecessor's price, exactly as the
+        // runner carries its last warmup bar; a later quiet minute carries the last print. A fence exactly at the
+        // end closes the window.
         ChainBars chain(180000, 420000);
+        chain.seed("9.95");
         chain.anchor({502, 179999, "9.90", "0.3"});
         assert(!chain.add({503, 240001, "12.00", "0.4"}));
         assert(chain.add({504, 420000, "11.00", "0.1"}));
-        assert(chain.csv() == bar_header + "180000,9.90,9.90,9.90,9.90,0\n240000,12.00,12.00,12.00,12.00,0.4\n"
+        assert(chain.csv() == bar_header + "180000,9.95,9.95,9.95,9.95,0\n240000,12.00,12.00,12.00,12.00,0.4\n"
                               "300000,12.00,12.00,12.00,12.00,0\n360000,12.00,12.00,12.00,12.00,0\n");
-        assert(chain.quiet_minutes() == 3 && chain.prints() == 1 && chain.bars() == 4);
+        assert(chain.quiet_minutes() == 3 && chain.prints() == 1 && chain.bars() == 4 && chain.seeded_close() == "9.95");
+    }
+    {
+        // Without the warmup close a quiet first minute is not guessed from the predecessor.
+        ChainBars chain(180000, 420000);
+        chain.anchor({502, 179999, "9.90", "0.3"});
+        expect(20, [&] { chain.add({503, 240001, "12.00", "0.4"}); });
+        ChainBars late(180000, 240000);
+        expect(23, [&] { late.seed("x"); });
     }
     {
         // A quiet window: the predecessor's ID + 1 is already the fence.
         ChainBars chain(120000, 240000);
+        chain.seed("100.5");
         chain.anchor({7, 0, "100.5", "1"});
         assert(chain.add({8, 250000, "101", "1"}));
         assert(chain.csv() == bar_header + "120000,100.5,100.5,100.5,100.5,0\n180000,100.5,100.5,100.5,100.5,0\n");
@@ -316,7 +328,9 @@ int main() {
         assert(chain.csv() == window_bars && chain.predecessor().id == 499 && chain.predecessor().price == "10.10");
         assert(chain.fence().id == 505 && chain.prints() == 5 && chain.quiet_minutes() == 1);
     }
-    assert(archive_bars(headerless, 180000, 300000).csv() == bar_header + "180000,9.90,9.90,9.90,9.90,0\n240000,12.00,12.00,11.00,11.00,0.5\n");
+    // A quiet first minute carries the warmup close it is given, and stops 20 without one.
+    assert(archive_bars(headerless, 180000, 300000, "9.95").csv() == bar_header + "180000,9.95,9.95,9.95,9.95,0\n240000,12.00,12.00,11.00,11.00,0.5\n");
+    expect(20, [&] { (void)archive_bars(headerless, 180000, 300000); });
     const auto crlf = temporary.path + "/crlf.csv";
     put_file(crlf, replaced(replaced(archive_header + rows, "\n", "\r\n"), "499,10.10,0.1,998,999,119999,true\n", "499,10.10,0.1,998,999,119999,true\r\n"));
     assert(archive_bars(crlf, 120000, 300000).csv() == window_bars);

@@ -7,6 +7,7 @@
 #include <cctype>
 #include <charconv>
 #include <chrono>
+#include <ctime>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -19,7 +20,7 @@ constexpr std::size_t csv_limit = 64 * 1024 * 1024;
 constexpr std::string_view archive_header = "agg_trade_id,price,quantity,first_trade_id,last_trade_id,transact_time,is_buyer_maker";
 constexpr const char* bar_rule = "a print belongs to minute floor(ts/60000)*60000; open=first price, high=max, low=min, close=last, "
     "volume=exact sum of quantities; a minute without a print has open=high=low=close=the previous close (the "
-    "predecessor's price before the first print) and volume 0";
+    "runner's last warmup close before the first print) and volume 0";
 Json number(std::uint64_t value) { return Json::number(std::to_string(value)); }
 Json signed_number(std::int64_t value) { return Json::number(std::to_string(value)); }
 std::string base_name(const std::string& path) { return std::filesystem::path(path).filename().string(); }
@@ -224,6 +225,11 @@ ChainBars::ChainBars(std::int64_t start, std::int64_t end) : start_(start), end_
         throw Error(23, "export requires a nonempty minute-aligned exclusive range");
     if ((end - start) / 60000 > 100000) throw Error(22, "export range exceeds 100000 minutes");
 }
+void ChainBars::seed(const std::string& close) {
+    if (predecessor_) throw Error(23, "the warmup close seeds the chain before its predecessor");
+    (void)Decimal(close);
+    seed_ = close;
+}
 void ChainBars::anchor(const Trade& predecessor) {
     predecessor.validate();
     if (predecessor_) throw Error(23, "the print chain is already anchored");
@@ -231,7 +237,7 @@ void ChainBars::anchor(const Trade& predecessor) {
     predecessor_ = predecessor;
     last_id_ = predecessor.id;
     last_ts_ = predecessor.ts;
-    close_ = predecessor.price;
+    close_ = seed_;
 }
 bool ChainBars::add(const Trade& trade) {
     if (!predecessor_ || fence_) throw Error(23, "a print chain takes its predecessor first and nothing after its fence");
@@ -276,6 +282,9 @@ void ChainBars::flush() {
     next_ = minute_ + 60000;
 }
 void ChainBars::carry(std::int64_t until) {
+    if (next_ < until && close_.empty())
+        throw Error(20, "the window's first minute has no print: the runner carries its last warmup close there; "
+                        "pass that warmup CSV with --warmup");
     for (; next_ < until; next_ += 60000, ++quiet_) row(next_, close_, close_, close_, close_, "0");
 }
 void ChainBars::row(std::int64_t minute, const std::string& open, const std::string& high, const std::string& low,
@@ -456,9 +465,50 @@ void verify_checksum(const std::string& checksum, const std::string& archive, co
     if (hash != digest) throw Error(21, "the archive's SHA-256 does not match its checksum file");
 }
 
-ChainBars archive_bars(const std::string& archive, std::int64_t start, std::int64_t end) {
+namespace {
+// The venue's daily file that holds `ts`, named like the given one (<SYMBOL>-aggTrades-YYYY-MM-DD.zip).
+std::string daily_name(const std::string& archive, std::int64_t ts) {
+    const auto seconds = static_cast<std::time_t>(ts / 1000);
+    std::tm day{};
+    char date[16];
+    if (!::gmtime_r(&seconds, &day) || !std::strftime(date, sizeof(date), "%Y-%m-%d", &day)) return "the neighbouring daily archive";
+    const auto name = base_name(archive);
+    const std::string marker = "-aggTrades-";
+    const auto at = name.find(marker);
+    if (at == std::string::npos || name.size() < at + marker.size() + 10) return std::string("the daily archive of ") + date;
+    return name.substr(0, at + marker.size()) + date + name.substr(at + marker.size() + 10);
+}
+}
+
+std::string warmup_close(const std::string& warmup, std::int64_t start) {
+    std::ifstream file(warmup, std::ios::binary);
+    if (!file) throw Error(23, "cannot open the warmup CSV " + warmup);
+    std::string line, last;
+    if (!std::getline(file, line) || line != "timestamp,open,high,low,close,volume")
+        throw Error(23, "the warmup CSV must start with timestamp,open,high,low,close,volume");
+    while (std::getline(file, line))
+        if (!line.empty()) last = line;
+    if (file.bad()) throw Error(22, "cannot read the warmup CSV " + warmup);
+    std::vector<std::string> fields;
+    for (std::size_t from = 0;;) {
+        const auto comma = last.find(',', from);
+        fields.push_back(last.substr(from, comma == std::string::npos ? std::string::npos : comma - from));
+        if (comma == std::string::npos) break;
+        from = comma + 1;
+    }
+    if (last.empty() || fields.size() != 6) throw Error(23, "the warmup CSV's last row must have six fields");
+    if (fields[0] != std::to_string(start - 60000))
+        throw Error(20, "the warmup CSV must end at the minute before the start (" + std::to_string(start - 60000) +
+                        "); its last row is " + fields[0]);
+    (void)Decimal(fields[4]);
+    return fields[4];
+}
+
+ChainBars archive_bars(const std::string& archive, std::int64_t start, std::int64_t end, const std::string& seed) {
     ChainBars chain(start, end);
+    if (!seed.empty()) chain.seed(seed);
     std::optional<Trade> candidate;
+    std::int64_t last_row = -1;
     std::exception_ptr failure;
     std::string pending;
     bool first = true;
@@ -466,9 +516,13 @@ ChainBars archive_bars(const std::string& archive, std::int64_t start, std::int6
         const auto row = archive_row(text, first);
         first = false;
         if (!row) return;
+        last_row = row->ts;
         if (!chain.anchored()) {
             if (row->ts < start) { candidate = *row; return; }
-            if (!candidate) throw Error(20, "the archive holds no print before the start: the window's predecessor is not inside it");
+            if (!candidate)
+                throw Error(20, "the archive holds no print before the start: the window's predecessor is in " +
+                                daily_name(archive, start - 1) + ", and export reads one daily file; start after the "
+                                "day's first print or export from REST within its retention");
             chain.anchor(*candidate);
         }
         chain.add(*row);
@@ -515,13 +569,17 @@ ChainBars archive_bars(const std::string& archive, std::int64_t start, std::int6
     }
     if (failure) std::rethrow_exception(failure);
     if (!chain.anchored()) throw Error(20, "the archive holds no print at or after the start: the window is not inside it");
-    if (!chain.fenced()) throw Error(20, "the archive ends before the window's fence (the first print at or after the end)");
+    if (!chain.fenced())
+        throw Error(20, "the archive ends before the window's fence (the first print at or after the end), which is in " +
+                        daily_name(archive, (std::max(last_row, end - 1) / 86400000 + 1) * 86400000) +
+                        ", and export reads one daily file; end the window before the day's last print");
     return chain;
 }
 
 namespace {
-ChainBars rest_bars(const Config& config, std::string& multiplier) {
+ChainBars rest_bars(const Config& config, std::string& multiplier, const std::string& seed) {
     ChainBars chain(config.start, config.end);
+    if (!seed.empty()) chain.seed(seed);
     const auto now = now_ms();
     if (config.end > now) throw Error(20, "the window has not closed yet: no print at or after its end can exist");
     const auto venue = make_venue(config);
@@ -561,6 +619,7 @@ void export_bars(const Config& config, const ExportOptions& options) {
     std::string multiplier = "1";
     Json source;
     std::optional<ChainBars> chain;
+    const auto seed = options.warmup.empty() ? std::string() : warmup_close(options.warmup, config.start);
     if (!options.archive.empty()) {
         if (config.venue != "binance" || config.market != "usdm" || config.mode != "agg-ticks")
             throw Error(23, "--archive reads the Binance USD-M daily aggTrades archive: use --venue binance --market usdm --mode agg-ticks");
@@ -570,11 +629,11 @@ void export_bars(const Config& config, const ExportOptions& options) {
         if (verified) verify_checksum(options.checksum, options.archive, digest);
         else log("warn", "archive_not_checksum_verified", file);
         if (base_name(options.archive).rfind(config.symbol + "-aggTrades-", 0) != 0) log("warn", "archive_name_not_symbol", file);
-        chain = archive_bars(options.archive, config.start, config.end);
+        chain = archive_bars(options.archive, config.start, config.end, seed);
         source = Json::object({{"kind", Json::string("archive")}, {"file", Json::string(base_name(options.archive))},
             {"sha256", Json::string(digest)}, {"checksum_verified", Json::boolean(verified)}});
     } else {
-        chain = rest_bars(config, multiplier);
+        chain = rest_bars(config, multiplier, seed);
         source = Json::object({{"kind", Json::string("rest")}, {"origin", Json::string(config.rest_url)}});
     }
     const auto& csv = chain->csv();
@@ -589,6 +648,7 @@ void export_bars(const Config& config, const ExportOptions& options) {
         {"predecessor", Json::object({{"id", number(predecessor.id)}, {"ts", signed_number(predecessor.ts)},
             {"price", Json::string(predecessor.price)}})},
         {"fence", Json::object({{"id", number(fence.id)}, {"ts", signed_number(fence.ts)}})},
+        {"warmup_close", seed.empty() ? Json{} : Json::string(seed)},
         {"first_id", any ? number(predecessor.id + 1) : Json{}}, {"last_id", any ? number(fence.id - 1) : Json{}},
         {"prints", number(chain->prints())}, {"bars", number(chain->bars())}, {"quiet_minutes", number(chain->quiet_minutes())},
         {"rule", Json::string(bar_rule)}, {"sha256", Json::string(sha256(csv))}});

@@ -22,6 +22,7 @@ public:
     Connection connection() const override;
     std::vector<VenueEvent> decode(const std::string& message) const override;
     std::vector<Trade> history(std::uint64_t, std::size_t) override { throw Error(23, "Bybit has no pageable trade history"); }
+    std::optional<Trade> predecessor_if_ready(std::int64_t) override { throw Error(23, "Bybit has no pageable trade history"); }
     std::vector<Kline> klines(std::int64_t start, std::int64_t end) override;
     std::string kline_source() const override { return "/v5/market/kline"; }
 };

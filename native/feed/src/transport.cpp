@@ -126,6 +126,14 @@ std::uint64_t retry_after_seconds(const std::string& value, std::int64_t now) {
     return when > now ? static_cast<std::uint64_t>(when - now) : 0;
 }
 
+std::uint64_t quota_wait_ms(std::uint64_t used, std::uint64_t used_window, unsigned int weight, std::uint64_t limit, std::int64_t now_ms) {
+    if (!limit || now_ms < 0) return 0;
+    const auto window = static_cast<std::uint64_t>(now_ms) / 60000;
+    const auto spent = window == used_window ? used : 0;
+    if (spent + weight <= limit * 9 / 10) return 0;
+    return (window + 1) * 60000 + 500 - static_cast<std::uint64_t>(now_ms);
+}
+
 void check_runtime_curl() {
     static GlobalCurl initialization;
     (void)initialization;
@@ -192,17 +200,19 @@ HttpClient::HttpClient(const Config& config, RestPolicy policy) : config_(config
                 interval == "HOUR" ? 3600000ULL : interval == "DAY" ? 86400000ULL : 0ULL;
             if (!unit || !multiple || multiple > 10000 || !ceiling || ceiling > 1000000000)
                 throw Error(23, "unsupported public rate-limit interval or ceiling");
-            // Spend at most half of each published ceiling (about 50% headroom).
-            const auto pace = (unit * multiple * 2 + ceiling - 1) / ceiling;
+            // The one-minute weight ceiling is spent by the venue's own count (X-MBX-USED-WEIGHT-1M, shared by
+            // every client on this IP); any other ceiling is paced evenly across its interval.
+            const auto pace = (unit * multiple + ceiling - 1) / ceiling;
             if (type == "REQUEST_WEIGHT") {
                 weighted = true;
-                milliseconds_per_weight_ = std::max<std::uint64_t>(milliseconds_per_weight_, pace);
                 if (interval == "MINUTE" && multiple == 1) weight_limit_ = ceiling;
+                else milliseconds_per_weight_ = std::max<std::uint64_t>(milliseconds_per_weight_, pace);
             } else milliseconds_per_request_ = std::max<std::uint64_t>(milliseconds_per_request_, pace);
         }
         if (!weighted) throw Error(23, "public request-weight ceiling is unavailable");
-        log("info", "rest_limits_verified", Json::object({{"milliseconds_per_weight", Json::number(std::to_string(milliseconds_per_weight_))},
-            {"weight_limit_1m", Json::number(std::to_string(weight_limit_))}}));
+        log("info", "rest_limits_verified", Json::object({{"weight_limit_1m", Json::number(std::to_string(weight_limit_))},
+            {"milliseconds_per_weight", Json::number(std::to_string(milliseconds_per_weight_))},
+            {"milliseconds_per_request", Json::number(std::to_string(milliseconds_per_request_))}}));
     } catch (const Error&) { throw; }
     catch (const std::exception&) { throw Error(23, "invalid public exchange rate-limit metadata"); }
 }
@@ -218,6 +228,13 @@ std::string HttpClient::body(const std::string& path, unsigned int weight, std::
     if (!limit || limit > 4 * 1024 * 1024) throw Error(22, "REST body bound exceeds 4 MiB");
     for (unsigned int attempt = 0; attempt < 4; ++attempt) {
         pause_until(next_request_);
+        const auto wait = quota_wait_ms(used_weight_, used_window_, weight, weight_limit_, std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+        if (wait && !config_.allow_insecure) {
+            log("warn", "rest_quota_wait", Json::object({{"used_weight_1m", Json::number(std::to_string(used_weight_))},
+                {"weight_limit_1m", Json::number(std::to_string(weight_limit_))}, {"wait_ms", Json::number(std::to_string(wait))}}));
+            pause_for(std::chrono::milliseconds(wait));
+        }
         Progress state;
         auto handle = handle_for(config_.rest_url + path, false, config_.allow_insecure, &state);
         Response response;
@@ -257,12 +274,11 @@ std::string HttpClient::body(const std::string& path, unsigned int weight, std::
             continue;
         }
         if (status != 200) throw Error(23, "public market-data request rejected (HTTP " + std::to_string(status) + ")");
-        if (response.used_weight) log("info", "rest_weight", Json::object({{"used_weight_1m", Json::number(std::to_string(response.used_weight))}}));
-        // The venue's used-weight header covers every client on this IP: past half the ceiling, wait for the window.
-        if (weight_limit_ && response.used_weight >= weight_limit_ / 2) {
-            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() % 60000;
-            next_request_ = std::max(next_request_, std::chrono::steady_clock::now() + std::chrono::milliseconds(60500 - elapsed));
-            log("warn", "rest_shared_quota_pause");
+        if (response.used_weight) {
+            used_weight_ = response.used_weight;
+            used_window_ = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count()) / 60000;
+            log("info", "rest_weight", Json::object({{"used_weight_1m", Json::number(std::to_string(response.used_weight))}}));
         }
         return std::move(response.body);
     }
@@ -283,13 +299,26 @@ WebSocketPump::~WebSocketPump() {
     ready_.notify_all();
     if (worker_.joinable()) worker_.join();
 }
-void WebSocketPump::push(SourceMessage message) {
+// False when the message does not fit the queue now; one message larger than the whole budget stops 22.
+bool WebSocketPump::push(SourceMessage message) {
     std::lock_guard<std::mutex> guard(mutex_);
     const auto bytes = message.text.size() + 32;
-    if (bytes > config_.max_queue_bytes - std::min(queue_bytes_, config_.max_queue_bytes)) throw Error(22, "WebSocket healing buffer overrun");
+    if (bytes > config_.max_queue_bytes) throw Error(22, "one source message exceeds --max-queue-bytes");
+    if (bytes > config_.max_queue_bytes - std::min(queue_bytes_, config_.max_queue_bytes)) return false;
     queue_bytes_ += bytes;
     queue_.push_back(std::move(message));
     ready_.notify_one();
+    return true;
+}
+void WebSocketPump::wait_for_room(std::size_t bytes) {
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            if (queue_bytes_ + bytes <= config_.max_queue_bytes) return;
+        }
+        if (stopped()) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
 }
 bool WebSocketPump::try_take(SourceMessage& message) {
     std::lock_guard<std::mutex> guard(mutex_);
@@ -344,20 +373,33 @@ void WebSocketPump::run() {
             curl_easy_getinfo(handle.get(), CURLINFO_ACTIVESOCKET, &socket);
             // The marker precedes every message of this connection: the session verifies its REST
             // overlap while the subscribed data is buffered behind it.
-            push({true, {}});
+            wait_for_room(32);
+            if (stopped() || !push({true, {}})) return;
             bool subscribed = true;
             for (const auto& request : connection_.subscribe) subscribed = subscribed && send_text(handle.get(), socket, request);
             log(subscribed ? "info" : "warn", subscribed ? "websocket_connected" : "websocket_subscribe_failed");
             const auto birth = std::chrono::steady_clock::now();
-            auto last_data = birth, message_birth = birth, last_ping = birth;
+            auto last_data = birth, message_birth = birth, last_ping = birth, probe_sent = birth;
             std::string message;
-            bool assembling = false, heard = false;
+            bool assembling = false, heard = false, probing = false, backpressure = false;
             std::uint64_t frame_offset = 0;
             while (subscribed && !stopped()) {
                 const auto now = std::chrono::steady_clock::now();
-                // Keepalive replies are control messages: they cannot hide a silent data stream.
-                if (now - birth >= std::chrono::seconds(config_.reconnect_seconds) || now - last_data > std::chrono::seconds(75) ||
-                    (assembling && now - message_birth > std::chrono::seconds(30))) break;
+                if (now - birth >= std::chrono::seconds(config_.reconnect_seconds) || (assembling && now - message_birth > std::chrono::seconds(30))) break;
+                // Keepalive replies are control messages: they cannot hide a silent data stream. A venue with a
+                // probe proves the connection and its subscriptions instead of paying a reconnect; completeness
+                // never rests on the connection (chain IDs, watermarks and the reconnect overlap prove it).
+                if (now - last_data > std::chrono::seconds(config_.silence_seconds)) {
+                    if (connection_.probe.empty()) break;
+                    if (!probing) {
+                        if (!send_text(handle.get(), socket, connection_.probe)) break;
+                        probing = true;
+                        probe_sent = now;
+                    } else if (now - probe_sent > std::chrono::seconds(10)) {
+                        log("warn", "source_probe_unanswered");
+                        break;
+                    }
+                }
                 if (!connection_.ping.empty() && now - last_ping >= std::chrono::seconds(config_.keepalive_seconds)) {
                     if (!send_text(handle.get(), socket, connection_.ping)) break;
                     last_ping = now;
@@ -387,11 +429,27 @@ void WebSocketPump::run() {
                 assembling = false;
                 // A connection counts as established only once the venue answers on it.
                 if (!heard) { heard = true; failures = 0; }
-                if (kind == Frame::Control) { message.clear(); continue; }
+                if (kind == Frame::Stale) { log("warn", "source_subscription_lost"); break; }
+                if (kind == Frame::Control) {
+                    // A probe reply restarts the silence clock: the connection and subscriptions are alive.
+                    if (probing) { probing = false; last_data = now; log("info", "source_probe_answered"); }
+                    message.clear();
+                    continue;
+                }
                 last_data = now;
-                push({false, std::move(message)});
+                probing = false;
+                // A full queue (the session is busy healing a long outage) drops this connection instead of
+                // stopping: everything from here on is healed from REST after the reconnect's overlap check.
+                if (!push({false, std::move(message)})) { backpressure = true; break; }
                 message.clear();
                 if (kind == Frame::Retire) { log("info", "source_retiring_reconnect"); break; }
+            }
+            if (backpressure && !stopped()) {
+                log("warn", "websocket_backpressure_reconnect", Json::object({{"max_queue_bytes", Json::number(std::to_string(config_.max_queue_bytes))}}));
+                handle.reset();
+                wait_for_room(config_.max_queue_bytes - config_.max_queue_bytes / 4);
+                next_attempt = std::chrono::steady_clock::now();
+                continue;
             }
             if (!stopped()) {
                 log("warn", "websocket_reconnect");

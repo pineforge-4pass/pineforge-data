@@ -28,6 +28,14 @@ def rows(path, exact=False):
         ]
 
 
+def journal_rows(state, exact=False):
+    """The feed's retained durable journal: segment files in message-index order."""
+    result = []
+    for path in sorted((pathlib.Path(state) / "journal").glob("*.jsonl")):
+        result += rows(path, exact)
+    return result
+
+
 SCRIPT_TF_MS = 60000  # the runner and batch both run --script-tf 1
 
 
@@ -387,7 +395,7 @@ class Soak:
                 json.loads(line, parse_float=str, parse_int=str) for line in source if line.strip()
             ]
         assert len(tape) == cursor, "capture/runner cursor mismatch"
-        durable = rows(self.directory / (mode + "-state/events.jsonl"), True)
+        durable = journal_rows(self.directory / (mode + "-state"), True)
         assert tape == durable, "restart changed normalized prefix or message boundaries"
         self.receipt(f"PASS {mode} restart without gap or duplicate messages={cursor}")
         if mode == "bars":
@@ -546,6 +554,9 @@ class Soak:
         )
         if mode != "bars" and not self.venue.candle_is_print_sum:
             self.kline_batch(mode, normalized, actual_actions, len(differing))
+        exported = None
+        if mode != "bars" and getattr(self.options, "export", False):
+            exported = self.export_check(mode, normalized, actual_actions)
         if mode != "bars":
             name = mode + "-replay"
             completed = subprocess.run(
@@ -568,6 +579,7 @@ class Soak:
             ]
             self.receipt(f"PASS {mode} same-print runner replay actions equal actions={len(raw)}")
         return {
+            "export": exported,
             "duration_seconds": duration,
             "messages": cursor,
             "minutes": len(normalized),
@@ -575,6 +587,71 @@ class Soak:
             "actions_after_last_proven_minute": trailing,
             "batch_actions_equal": equal,
         }
+
+    def export_check(self, mode, normalized, actual_actions):
+        """`pineforge-feed export` over the proven window, from venue REST: its prints-built bars
+        must equal the bars the runner built from the same prints (the tape's minutes), value for
+        value, and the batch over the exported CSV must equal the runner's actions."""
+        end = normalized[-1]["ts_open"] + 60000
+        output = self.directory / (mode + "-export.csv")
+        command = [
+            self.options.feed,
+            "export",
+            "--venue",
+            self.venue.venue,
+            "--market",
+            self.venue.market,
+            "--symbol",
+            self.venue.symbol,
+            "--mode",
+            mode,
+            "--start",
+            str(self.cut),
+            "--end",
+            str(end),
+            "--output",
+            str(output),
+        ]
+        with open(self.directory / (mode + "-export.stderr"), "w") as error:
+            subprocess.run(command, stderr=error, check=True, timeout=600)
+        with open(output) as source:
+            lines = source.read().splitlines()
+        assert lines[0] == "timestamp,open,high,low,close,volume"
+        exported = [
+            dict(
+                zip(
+                    ("ts_open", "o", "h", "l", "c", "v"),
+                    [int(row[0]), *(Decimal(v) for v in row[1:])],
+                    strict=True,
+                )
+            )
+            for row in (line.split(",") for line in lines[1:])
+        ]
+        assert exported == normalized, "exported bars differ from the runner's prints-built bars"
+        manifest = json.loads((self.directory / (mode + "-export.csv.manifest.json")).read_text())
+        combined = self.directory / (mode + "-export-combined.csv")
+        with open(combined, "w") as target:
+            target.write((self.directory / "warmup.csv").read_text())
+            target.write("\n".join(lines[1:]) + "\n")
+        actions = self.directory / (mode + "-export-batch-actions.jsonl")
+        subprocess.run(
+            [self.options.batch_probe, self.options.observed_strategy, str(combined), str(actions)],
+            check=True,
+        )
+        expected = [
+            action_key(record, mode)
+            for record in rows(actions)
+            if record["origin_input_index"] >= 200
+        ]
+        equal = expected == actual_actions
+        self.receipt(
+            f"{'PASS' if equal else 'FAIL'} {mode} export prints-built bars equal the runner's "
+            f"tick-built bars minutes={len(exported)} prints={manifest['prints']} "
+            f"quiet_minutes={manifest['quiet_minutes']} "
+            f"batch_over_export_actions={len(expected)} runner={len(actual_actions)}"
+        )
+        assert equal, "the batch over the exported bars differs from the runner"
+        return {"minutes": len(exported), "prints": manifest["prints"], "actions": len(expected)}
 
     def kline_batch(self, mode, normalized, actual_actions, kline_differs):
         """Information, not a gate: the same strategy over Binance klines instead of the bars built
@@ -683,4 +760,7 @@ if __name__ == "__main__":
     parser.add_argument("--bar-minutes", type=int, default=46)
     parser.add_argument("--tick-minutes", type=int, default=21)
     parser.add_argument("--restart-seconds", type=int, default=180)
+    parser.add_argument(
+        "--export", action="store_true", help="also check `pineforge-feed export` over tick windows"
+    )
     raise SystemExit(Soak(parser.parse_args()).run())

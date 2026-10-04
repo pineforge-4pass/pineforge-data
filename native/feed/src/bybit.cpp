@@ -23,7 +23,7 @@ RestPolicy bybit_rest() {
     policy.throttled = [](const std::string& body) { return body.find("\"retCode\":10006") != std::string::npos; };
     // Bybit answers HTTP 403 for its roughly ten-minute IP rate ban: a restart after the ban recovers.
     policy.rejected = [](long status, const std::string&) {
-        if (status == 403) throw Error(20, "Bybit IP rate ban (HTTP 403); restart after the venue's ban window");
+        if (status == 403) throw Error(20, "Bybit IP rate ban or regional block (HTTP 403); restart with a backoff above ten minutes");
     };
     // Server timeout and server error: the venue asks to retry.
     policy.transient = [](long, const std::string& body) {
@@ -106,7 +106,7 @@ Json Bybit::result(const std::string& path) {
 }
 Connection Bybit::connection() const {
     return {"/v5/public/" + category(config_), {"{\"op\":\"subscribe\",\"args\":[\"kline.1." + config_.symbol + "\"]}"},
-            "{\"op\":\"ping\"}", &bybit_frame};
+            "{\"op\":\"ping\"}", &bybit_frame, {}};
 }
 std::vector<VenueEvent> Bybit::decode(const std::string& message) const {
     try {

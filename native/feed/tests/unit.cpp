@@ -3,6 +3,10 @@
 #include "bybit.hpp"
 #include "okx.hpp"
 #include "session.hpp"
+#if PINEFORGE_FEED_SERVE
+#include "serve.hpp"
+#endif
+#include <algorithm>
 #include <cassert>
 #include <cstdlib>
 #include <filesystem>
@@ -55,7 +59,7 @@ struct SyntheticVenue final : Venue {
         {180000, {{180000, "12.00000000", "12.00000000", "11.00000000", "11.00000000", "0.50000000"}, 103, 104, 2, true}},
         {240000, {{240000, "12.00000000", "12.00000000", "12.00000000", "12.00000000", "0.10000000"}, 105, 105, 1, true}}
     };
-    Connection connection() const override { return {"/stream?streams=test@trade/test@kline_1m", {}, {}, &binance_frame}; }
+    Connection connection() const override { return {"/stream?streams=test@trade/test@kline_1m", {}, {}, &binance_frame, {}}; }
     std::vector<VenueEvent> decode(const std::string&) const override { throw Error(23, "not used by deterministic unit venue"); }
     std::string kline_source() const override { return "/synthetic"; }
     std::size_t pages = 0;
@@ -71,6 +75,7 @@ struct SyntheticVenue final : Venue {
         return result;
     }
     std::uint64_t first_trade_id(std::int64_t minute) override { return static_cast<std::uint64_t>(bars.at(minute).first); }
+    std::optional<Trade> predecessor_if_ready(std::int64_t) override { throw Error(23, "kline-range venue"); }
     // REST rows carry no x=true and no f..L, exactly like the venue's klines endpoint.
     std::vector<Kline> klines(std::int64_t start, std::int64_t end) override {
         std::vector<Kline> result;
@@ -110,7 +115,7 @@ struct FenceVenue final : Venue {
     std::size_t pages = 0, candle_requests = 0;
     // REST lag: the next `empty_reads` history reads return nothing, the next `short_reads` drop their last row.
     std::size_t empty_reads = 0, short_reads = 0;
-    Connection connection() const override { return {"/synthetic", {}, {}, &binance_frame}; }
+    Connection connection() const override { return {"/synthetic", {}, {}, &binance_frame, {}}; }
     std::vector<VenueEvent> decode(const std::string&) const override { throw Error(23, "not used by deterministic unit venue"); }
     std::vector<Trade> history(std::uint64_t from, std::size_t limit) override {
         ++pages;
@@ -147,6 +152,30 @@ struct FenceVenue final : Venue {
     VenueEvent tick(std::uint64_t id) const { return {VenueEvent::Kind::Trade, trades.at(id), {}}; }
     VenueEvent close(std::int64_t minute) const { return {VenueEvent::Kind::Kline, {}, candles.at(minute)}; }
 };
+std::string segment_file(const Temporary& temporary, std::uint64_t base) {
+    return temporary.path + "/journal/" + segment_name(base) + ".jsonl";
+}
+std::string checkpoint_file(const Temporary& temporary, std::uint64_t base) {
+    return temporary.path + "/journal/" + segment_name(base) + ".checkpoint.json";
+}
+// Contiguous synthetic minutes from `first`, each staged with its proof and committed in batches of `batch`.
+void commit_bars(State& state, std::int64_t first, std::size_t count, std::size_t batch = 7) {
+    for (std::size_t index = 0; index < count; ++index) {
+        const Bar bar{first + static_cast<std::int64_t>(index) * 60000, "10.00000000", "10.50000000", "9.50000000", "10.25000000", "1.00000000"};
+        state.stage(bar.wire(), bar);
+        if ((index + 1) % batch == 0) state.flush();
+    }
+    state.flush();
+}
+std::vector<std::uint64_t> journal_bases(const Temporary& temporary, const char* suffix) {
+    std::vector<std::uint64_t> bases;
+    for (const auto& entry : std::filesystem::directory_iterator(temporary.path + "/journal")) {
+        const auto name = entry.path().filename().string();
+        if (name.size() > 20 && name.substr(20) == suffix) bases.push_back(std::stoull(name.substr(0, 20)));
+    }
+    std::sort(bases.begin(), bases.end());
+    return bases;
+}
 std::vector<std::string> kinds(const std::vector<std::string>& lines) {
     std::vector<std::string> result;
     for (const auto& line : lines) {
@@ -271,14 +300,14 @@ int main() {
             second.resume = true;
             expect(22, [&] { State locked(second); });
         }
-        { std::ofstream tail(temporary.path + "/events.jsonl", std::ios::app); tail << "uncommitted-torn-tail"; }
+        { std::ofstream tail(segment_file(temporary, 0), std::ios::app); tail << "uncommitted-torn-tail"; }
         options.resume = true;
         options.start = -1;
         options.output_from = 2;
         {
             State state(options);
             assert(state.cursor().epoch == epoch);
-            assert(std::filesystem::file_size(temporary.path + "/events.jsonl") == state.cursor().log_bytes);
+            assert(std::filesystem::file_size(segment_file(temporary, 0)) == state.cursor().log_bytes);
             std::vector<std::string> output;
             FeedSession session(state, venue, [&](const auto& line) { output.push_back(line); });
             session.connected();
@@ -289,7 +318,7 @@ int main() {
             assert(parse_json(output.back()).at("type").text() == "time");
         }
         {
-            std::fstream corrupt(temporary.path + "/events.jsonl", std::ios::in | std::ios::out);
+            std::fstream corrupt(segment_file(temporary, 0), std::ios::in | std::ios::out);
             corrupt.seekp(0);
             corrupt << 'X';
         }
@@ -309,15 +338,105 @@ int main() {
         passed("historical_ticks_require_closed_watermark_next_id_fence_and_rest_reconciliation");
     }
     {
+        // Segments seal at --segment-bytes; sealed segments beyond --replay-bytes expire oldest first, but never
+        // the open segment or one holding a protected minute (the 32 closed-minute proofs and the open minute).
         Temporary temporary;
         auto options = config(temporary, "bars");
-        options.max_log_bytes = 4;
-        State state(options);
-        SyntheticVenue venue;
-        FeedSession session(state, venue, [](const auto&) {});
-        expect(22, [&] { session.ingest(venue.close(120000)); });
-        assert(state.cursor().message_index == 0);
-        passed("bounded_replay_budget_stops_before_commit");
+        options.segment_bytes = 4096;
+        options.replay_bytes = 8192;
+        std::string epoch, prefix;
+        std::uint64_t first = 0;
+        {
+            State state(options);
+            commit_bars(state, 120000, 400);
+            epoch = state.durable().epoch;
+            prefix = state.durable().prefix_hash;
+            first = state.first_retained();
+            assert(state.durable().message_index == 400 && first > 0 && state.segments().size() >= 2);
+            assert(journal_bases(temporary, ".jsonl") == journal_bases(temporary, ".checkpoint.json"));
+            assert(journal_bases(temporary, ".jsonl").front() == first && journal_bases(temporary, ".jsonl").back() == state.durable().segment);
+            // The retained bytes stay within the budget plus the open segment.
+            assert(state.durable().log_bytes - state.segments().front().bytes <= options.replay_bytes + options.segment_bytes);
+            // The protected window: every proof minute is still readable.
+            std::vector<std::int64_t> minutes;
+            state.visit(state.first_retained(), [&](const std::string& line) { minutes.push_back(normalized_bar(parse_json(line)).ts); });
+            assert(minutes.front() <= state.durable().proofs.front().ts && minutes.back() == 120000 + 399 * 60000);
+            for (std::size_t index = 1; index < minutes.size(); ++index) assert(minutes[index] == minutes[index - 1] + 60000);
+            expect(22, [&] { state.visit(0, [](const auto&) {}); });
+            assert(state.bar(120000 + 399 * 60000) && state.bar(state.durable().proofs.front().ts));
+        }
+        options.resume = true;
+        options.start = -1;
+        expect(22, [&] { State replay_from_origin(options); });
+        options.output_from = first;
+        {
+            State resumed(options);
+            assert(resumed.durable().epoch == epoch && resumed.durable().prefix_hash == prefix && resumed.first_retained() == first);
+            assert(resumed.recent_bars().size() == 32 && resumed.durable().message_index == 400);
+            commit_bars(resumed, 120000 + 400 * 60000, 3);
+        }
+        options.output_from = first - 1;
+        expect(22, [&] { State expired(options); });
+        options.output_from = first;
+        { State exact(options); assert(exact.durable().message_index == 403); }
+        // Retention by venue time: with an age limit, segments older than it expire once outside the protected window.
+        Temporary aged;
+        auto timed = config(aged, "bars");
+        timed.segment_bytes = 4096;
+        timed.replay_bytes = 1ULL << 30;
+        timed.replay_age_ms = 60 * 60000;
+        State state(timed);
+        commit_bars(state, 120000, 300);
+        assert(state.first_retained() > 0);
+        assert(state.durable().cut - state.segments().front().cut <= timed.replay_age_ms + 40 * 60000);
+        passed("journal_segments_rotate_expire_by_bytes_and_age_and_resume");
+    }
+    {
+        // Crash residue of every rotation and expiry step is recognised: files after the cursor's open segment
+        // (an interrupted rotation) and a checkpoint without its segment (an interrupted expiry) are removed; a
+        // segment without its checkpoint, or a changed checkpoint, stops 21.
+        Temporary temporary;
+        auto options = config(temporary, "bars");
+        options.segment_bytes = 4096;
+        options.replay_bytes = 8192;
+        std::uint64_t open = 0, first = 0, expired = 0;
+        std::string prefix;
+        {
+            State state(options);
+            commit_bars(state, 120000, 300);
+            open = state.durable().segment;
+            first = state.first_retained();
+            prefix = state.durable().prefix_hash;
+        }
+        expired = first - 1;
+        std::filesystem::copy_file(checkpoint_file(temporary, first), checkpoint_file(temporary, expired));
+        std::filesystem::copy_file(checkpoint_file(temporary, open), checkpoint_file(temporary, open + 1000));
+        { std::ofstream residue(segment_file(temporary, open + 1000)); }
+        std::filesystem::copy_file(checkpoint_file(temporary, open), checkpoint_file(temporary, open + 2000));
+        options.resume = true;
+        options.start = -1;
+        options.output_from = first;
+        {
+            State resumed(options);
+            assert(resumed.durable().prefix_hash == prefix && resumed.durable().segment == open && resumed.first_retained() == first);
+            assert(!std::filesystem::exists(checkpoint_file(temporary, expired)) && !std::filesystem::exists(segment_file(temporary, open + 1000)));
+            assert(!std::filesystem::exists(checkpoint_file(temporary, open + 1000)) && !std::filesystem::exists(checkpoint_file(temporary, open + 2000)));
+            commit_bars(resumed, 120000 + 300 * 60000, 2);
+        }
+        const auto saved = checkpoint_file(temporary, open) + ".saved";
+        std::filesystem::rename(checkpoint_file(temporary, open), saved);
+        expect(21, [&] { State missing(options); });
+        std::filesystem::rename(saved, checkpoint_file(temporary, open));
+        {
+            std::string text;
+            { std::ifstream input(checkpoint_file(temporary, open)); text.assign(std::istreambuf_iterator<char>(input), {}); }
+            const auto position = text.find("\"verified_cut\":");
+            text[position + 15] = text[position + 15] == '1' ? '2' : '1';
+            std::ofstream output(checkpoint_file(temporary, open), std::ios::trunc);
+            output << text;
+        }
+        expect(21, [&] { State changed(options); });
+        passed("journal_rotation_and_expiry_crash_residue_recovers_or_stops_21");
     }
     {
         Temporary temporary;
@@ -353,7 +472,7 @@ int main() {
         options.resume = true;
         State recovered(options);
         assert(recovered.cursor().message_index == 0);
-        assert(std::filesystem::file_size(temporary.path + "/events.jsonl") == 0);
+        assert(std::filesystem::file_size(segment_file(temporary, 0)) == 0);
         passed("failed_cursor_write_rolls_back_uncommitted_message_on_resume");
     }
     {
@@ -439,22 +558,28 @@ int main() {
         const Bar bar{120000, "10.10000000", "11.20000000", "9.90000000", "9.90000000", "0.60000000"};
         state.stage(bar.wire(), bar);
         assert(state.staged() == 1 && state.cursor().message_index == 1 && state.durable().message_index == 0);
-        assert(std::filesystem::file_size(temporary.path + "/events.jsonl") == 0);
+        assert(std::filesystem::file_size(segment_file(temporary, 0)) == 0);
         std::size_t seen = 0;
         state.visit(0, [&](const auto&) { ++seen; });
         assert(seen == 1 && state.bar(120000));
         const auto lines = state.flush();
         assert(lines.size() == 1 && state.staged() == 0 && state.durable().message_index == 1);
-        assert(std::filesystem::file_size(temporary.path + "/events.jsonl") == lines.front().size() + 1);
+        assert(std::filesystem::file_size(segment_file(temporary, 0)) == lines.front().size() + 1);
         passed("group_commit_stages_then_persists_before_publication");
     }
     {
         Temporary temporary;
-        { std::ofstream empty(temporary.path + "/events.jsonl"); }
+        std::filesystem::create_directories(temporary.path + "/journal");
+        { std::ofstream empty(segment_file(temporary, 0)); }
+        { std::ofstream checkpoint(checkpoint_file(temporary, 0)); checkpoint << "{}"; }
         { State state(config(temporary, "bars")); assert(state.durable().message_index == 0); }
         Temporary second;
-        { std::ofstream used(second.path + "/events.jsonl"); used << "x\n"; }
+        std::filesystem::create_directories(second.path + "/journal");
+        { std::ofstream used(segment_file(second, 0)); used << "x\n"; }
         expect(23, [&] { State state(config(second, "bars")); });
+        Temporary legacy;
+        { std::ofstream old(legacy.path + "/events.jsonl"); }
+        expect(23, [&] { State state(config(legacy, "bars")); });
         passed("crashed_initialization_without_cursor_is_reinitialized");
     }
 
@@ -886,6 +1011,52 @@ int main() {
         expect(23, [&] { make_session(state, venue, [](const auto&) {}); });
         passed("aggregate_mode_needs_a_next_print_fence_venue");
     }
+#if PINEFORGE_FEED_SERVE
+    {
+        // The serve reader follows the journal across segments by message index, as the producer appends.
+        Temporary temporary;
+        auto options = config(temporary, "bars");
+        options.segment_bytes = 4096;
+        options.replay_bytes = 1ULL << 30;
+        State state(options);
+        commit_bars(state, 120000, 120);
+        JournalReader reader(temporary.path + "/journal");
+        assert(reader.seek(37) && reader.index() == 37);
+        std::vector<std::int64_t> minutes;
+        while (reader.index() < 120) minutes.push_back(normalized_bar(parse_json(*reader.next())).ts);
+        assert(minutes.size() == 83 && minutes.front() == 120000 + 37 * 60000 && minutes.back() == 120000 + 119 * 60000);
+        assert(!reader.next());
+        commit_bars(state, 120000 + 120 * 60000, 60);
+        assert(normalized_bar(parse_json(*reader.next())).ts == 120000 + 120 * 60000);
+        assert(state.segments().size() > 2);
+        std::filesystem::remove(segment_file(temporary, 0));
+        JournalReader expired(temporary.path + "/journal");
+        assert(!expired.seek(3) && expired.seek(state.segments()[1].base));
+        expect(22, [&] { snapshot_prefix(temporary.path + "/journal", 3, 4096); });  // index 0 expired above
+        Temporary small;
+        auto bounded = config(small, "bars");
+        State fresh(bounded);
+        commit_bars(fresh, 120000, 40);
+        const auto full = snapshot_prefix(small.path + "/journal", 40, 1ULL << 22);
+        assert(full && std::count(full->begin(), full->end(), '\n') == 40);
+        assert(!snapshot_prefix(small.path + "/journal", 40, full->size() - 1) && snapshot_prefix(small.path + "/journal", 40, full->size()));
+        assert(listen_address("localhost:0", false) == "127.0.0.1:0" && listen_address("127.0.0.2:8787", false) == "127.0.0.2:8787");
+        expect(23, [] { listen_address("0.0.0.0:8787", false); });
+        assert(listen_address("0.0.0.0:8787", true) == "0.0.0.0:8787");
+        for (const auto* invalid : {"8787", "127.0.0.1:", "127.0.0.1:70000", "[::1]:8787", "example.com:80"})
+            expect(23, [&] { listen_address(invalid, true); });
+        passed("serve_journal_reader_follows_segments_and_listen_is_loopback_by_default");
+    }
+#endif
+    // The one-minute weight ceiling is spent by the venue's own count, up to 90%, then the next window.
+    assert(quota_wait_ms(2000, 100, 20, 2400, 100 * 60000 + 1000) == 0);
+    assert(quota_wait_ms(2150, 100, 20, 2400, 100 * 60000 + 1000) == 59500);
+    assert(quota_wait_ms(2150, 99, 20, 2400, 100 * 60000 + 1000) == 0);
+    assert(quota_wait_ms(0, 0, 20, 0, 1000) == 0);
+    assert(binance_frame(R"({"result":["testusdt@kline_1m"],"id":1})") == Frame::Control);
+    assert(binance_frame(R"({"result":[],"id":1})") == Frame::Stale);
+    expect(23, [] { binance_frame(R"({"result":[]})"); });
+    passed("rest_weight_quota_and_liveness_probe_replies");
     assert(retry_after_seconds("120", 0) == 120);
     assert(retry_after_seconds("Wed, 21 Oct 2015 07:28:00 GMT", 1445412475) == 5);
     assert(retry_after_seconds("Wed, 21 Oct 2015 07:28:00 GMT", 1445412490) == 0);

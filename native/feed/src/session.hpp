@@ -85,6 +85,8 @@ std::vector<Trade> settled_prints(Venue& venue, const Config& config, const std:
 void reconcile_fenced(const Aggregate& prints, const Kline& candle);
 
 std::unique_ptr<Session> make_session(State& state, Venue& venue, std::function<void(const std::string&)> output);
+// The source loop shared by run and serve: group-commit every queued source message, publish, then report.
+void stream(const Config& config, Venue& venue, Session& session, const std::function<void()>& committed);
 void run_feed(Config config);
 void warmup(const Config& config, const std::string& output);
 }

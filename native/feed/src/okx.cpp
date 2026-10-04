@@ -119,7 +119,7 @@ Connection Okx::connection() const {
     const auto subscribe = "{\"op\":\"subscribe\",\"args\":[" + argument("candle1m") +
         (config_.mode == "ticks" ? "," + argument("trades-all") : std::string()) + "]}";
     // Business endpoint: trades-all and candles live there. The text keepalive must precede 30 s idle.
-    return {"/ws/v5/business", {subscribe}, "ping", &okx_frame};
+    return {"/ws/v5/business", {subscribe}, "ping", &okx_frame, {}};
 }
 std::vector<VenueEvent> Okx::decode(const std::string& message) const {
     try {

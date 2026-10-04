@@ -89,7 +89,8 @@ void Session::ingest(const VenueEvent& event) {
 }
 void Session::replay() {
     if (!replayed_) {
-        if (state_.config().resume) state_.visit(state_.config().output_from, output_);
+        // serve publishes only new messages; its clients read the retained journal by index themselves.
+        if (state_.config().resume && !state_.config().serve) state_.visit(state_.config().output_from, output_);
         replayed_ = true;
     }
     log("info", "overlap_verified", state_.status());
@@ -97,7 +98,7 @@ void Session::replay() {
 
 FeedSession::FeedSession(State& state, Venue& venue, std::function<void(const std::string&)> output)
     : Session(state, venue, std::move(output)) {
-    if (state_.config().mode == "ticks") state_.visit(0, [&](const std::string& line) {
+    if (state_.config().mode == "ticks") state_.visit(state_.index_for_minute(state_.cursor().cut), [&](const std::string& line) {
         const auto event = parse_json(line);
         if (event.at("type").text() == "tick") {
             const auto trade = normalized_trade(event);
@@ -125,7 +126,7 @@ void FeedSession::connected() {
                                             [&](const auto& rows) { return same_bars(rows, proofs); });
         if (fetched.size() != proofs.size()) throw Error(20, "reconnect closed-bar overlap is unavailable");
         std::map<std::int64_t, Aggregate> verified;
-        if (state_.config().mode == "ticks") state_.visit(0, [&](const std::string& line) {
+        if (state_.config().mode == "ticks") state_.visit(state_.index_for_minute(proofs.front().ts), [&](const std::string& line) {
             const auto event = parse_json(line);
             if (event.at("type").text() != "tick") return;
             const auto trade = normalized_trade(event);
@@ -158,6 +159,10 @@ void FeedSession::put(const Trade& trade) {
     trade.validate();
     if (trade.ts < state_.cursor().start) return;
     if (state_.cursor().seq && trade.id <= state_.cursor().seq) {
+        if (state_.expired_seq(trade.id)) {
+            log("warn", "expired_duplicate_unverified", Json::object({{"seq", Json::number(std::to_string(trade.id))}}));
+            return;
+        }
         const auto previous = state_.trade(trade.id);
         if (!previous || !(*previous == trade)) throw Error(21, "duplicate raw trade conflicts with the immutable prefix");
         return;
@@ -247,6 +252,11 @@ void FeedSession::closed(const Kline& kline) {
     const auto minute = kline.bar.ts;
     watermark_ = std::max(watermark_, minute + 60000);
     if (minute < state_.cursor().start) return;
+    if (minute < state_.cursor().cut && state_.expired_minute(minute)) {
+        // Retention dropped this minute: an old duplicate can no longer be compared with what was emitted.
+        log("warn", "expired_duplicate_unverified", Json::object({{"minute", Json::number(std::to_string(minute))}}));
+        return;
+    }
     if (minute < state_.cursor().cut) {
         const auto old = state_.bar(minute);
         if (old) {
@@ -254,7 +264,7 @@ void FeedSession::closed(const Kline& kline) {
         }
         if (state_.config().mode == "ticks") {
             Aggregate reconstructed;
-            state_.visit(0, [&](const std::string& line) {
+            state_.visit(state_.index_for_minute(minute), [&](const std::string& line) {
                 const auto event = parse_json(line);
                 if (event.at("type").text() == "tick") {
                     const auto trade = normalized_trade(event);
@@ -313,7 +323,7 @@ void reconcile_fenced(const Aggregate& prints, const Kline& candle) {
 
 FenceSession::FenceSession(State& state, Venue& venue, std::function<void(const std::string&)> output)
     : Session(state, venue, std::move(output)) {
-    state_.visit(0, [&](const std::string& line) {
+    state_.visit(state_.index_for_minute(state_.cursor().cut), [&](const std::string& line) {
         const auto event = parse_json(line);
         if (event.at("type").text() == "tick") {
             const auto trade = normalized_trade(event);
@@ -343,6 +353,10 @@ void FenceSession::put(const Trade& trade, bool healed) {
         throw Error(23, "venue matched time regressed: a print before the proven predecessor is at or after the start minute");
     }
     if (state_.cursor().seq && trade.id <= state_.cursor().seq) {
+        if (state_.expired_seq(trade.id)) {
+            log("warn", "expired_duplicate_unverified", Json::object({{"seq", Json::number(std::to_string(trade.id))}}));
+            return;
+        }
         const auto previous = state_.trade(trade.id);
         if (!previous || !(*previous == trade)) throw Error(21, "duplicate print conflicts with the immutable prefix");
         return;
@@ -453,6 +467,10 @@ void FenceSession::candle(const Kline& kline) {
     const auto minute = kline.bar.ts;
     watermark_ = std::max(watermark_, minute + 60000);
     if (minute < state_.cursor().start) return;
+    if (minute < state_.cursor().cut && state_.expired_minute(minute)) {
+        log("warn", "expired_duplicate_unverified", Json::object({{"minute", Json::number(std::to_string(minute))}}));
+        return;
+    }
     if (minute < state_.cursor().cut) {
         for (const auto& proof : state_.cursor().proofs)
             if (proof.ts == minute) {
@@ -462,7 +480,7 @@ void FenceSession::candle(const Kline& kline) {
         // Older than the retained proofs: rebuild that minute from the journal, where the candle is a sum.
         if (!venue_.candle_is_print_sum()) return;
         Aggregate rebuilt;
-        state_.visit(0, [&](const std::string& line) {
+        state_.visit(state_.index_for_minute(minute), [&](const std::string& line) {
             const auto event = parse_json(line);
             if (event.at("type").text() != "tick") return;
             const auto trade = normalized_trade(event);
@@ -537,26 +555,35 @@ std::unique_ptr<Session> make_session(State& state, Venue& venue, std::function<
     return std::make_unique<FeedSession>(state, venue, std::move(output));
 }
 
+void stream(const Config& config, Venue& venue, Session& session, const std::function<void()>& committed) {
+    WebSocketPump pump(config, venue.connection());
+    for (;;) {
+        auto message = pump.take();
+        try {
+            // Group commit: verify every source message already queued (bounded), then persist once.
+            for (std::size_t taken = 1;; ++taken) {
+                if (message.connected) session.connected();
+                else for (const auto& event : venue.decode(message.text)) session.stage(event);
+                if (taken >= 1024 || !pump.try_take(message)) break;
+            }
+        } catch (const Error&) {
+            session.salvage();
+            if (committed) committed();
+            throw;
+        }
+        session.publish();
+        if (committed) committed();
+    }
+}
+
 void run_feed(Config config) {
     // Instrument metadata fixes the quantity units before the cursor binds them.
     const auto venue = make_venue(config);
     config.qty_multiplier = venue->qty_multiplier();
     State state(config);
     try {
-        WebSocketPump pump(config, venue->connection());
         const auto session = make_session(state, *venue, &output_line);
-        for (;;) {
-            auto message = pump.take();
-            try {
-                // Group commit: verify every source message already queued (bounded), then persist once.
-                for (std::size_t taken = 1;; ++taken) {
-                    if (message.connected) session->connected();
-                    else for (const auto& event : venue->decode(message.text)) session->stage(event);
-                    if (taken >= 1024 || !pump.try_take(message)) break;
-                }
-            } catch (const Error&) { session->salvage(); throw; }
-            session->publish();
-        }
+        stream(config, *venue, *session, {});
     } catch (const Stopped&) { log("info", "stopped", state.status()); }
     catch (...) { log("error", "verified_cursor_retained", state.status()); throw; }
 }

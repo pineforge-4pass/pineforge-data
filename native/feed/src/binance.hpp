@@ -22,6 +22,8 @@ public:
     std::vector<VenueEvent> decode(const std::string& message) const override;
     std::vector<Trade> history(std::uint64_t from, std::size_t limit = 1000) override;
     std::uint64_t first_trade_id(std::int64_t minute) override;
+    // Binance spot ticks close minutes on the kline ID range, never on a next-print fence.
+    std::optional<Trade> predecessor_if_ready(std::int64_t) override { throw Error(23, "Binance spot has no next-print fence"); }
     std::vector<Kline> klines(std::int64_t start, std::int64_t end) override;
     std::string kline_source() const override { return "/api/v3/klines"; }
 };
@@ -31,6 +33,9 @@ public:
 class BinanceUsdm final : public Venue {
     Config config_;
     HttpClient http_;
+    mutable std::int64_t newest_ = -1;  // newest venue time decoded from the WebSocket (main thread only)
+    std::int64_t quiet_until_ = -1;     // [start, quiet_until_) is settled and holds no aggregate
+    std::uint64_t first_aggregate(std::int64_t minute);
 public:
     explicit BinanceUsdm(const Config& config);
     Connection connection() const override { return usdm_connection(config_); }

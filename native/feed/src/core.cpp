@@ -9,6 +9,9 @@
 #include <chrono>
 #include <climits>
 #include <condition_variable>
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <deque>
 #include <fcntl.h>
@@ -161,6 +164,19 @@ void output_line(std::string_view line) {
         if (written <= 0) throw Error(22, "stdout unavailable; replay from the consumer's committed message index");
         offset += static_cast<std::size_t>(written);
     }
+}
+
+void crash_point(const char* name) {
+    static const std::string target = [] {
+        const char* value = std::getenv("PINEFORGE_FEED_CRASH_AT");
+        return std::string(value ? value : "");
+    }();
+    if (target.empty()) return;
+    static std::atomic<unsigned long> passes{0};
+    const auto colon = target.find(':');
+    if (target.compare(0, colon, name) != 0 || std::strlen(name) != (colon == std::string::npos ? target.size() : colon)) return;
+    const auto wanted = colon == std::string::npos ? 1UL : std::strtoul(target.c_str() + colon + 1, nullptr, 10);
+    if (++passes == wanted) ::raise(SIGKILL);
 }
 
 void atomic_file(const std::string& path, std::string_view bytes) {

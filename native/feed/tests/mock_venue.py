@@ -3,6 +3,7 @@
 injection."""
 
 import base64
+import contextlib
 import copy
 import email.utils
 import fcntl
@@ -12,6 +13,7 @@ import json
 import os
 import pathlib
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -19,7 +21,9 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.parse
+import urllib.request
 from types import SimpleNamespace
 
 from public_e2e import Soak, action_key, proven_actions
@@ -267,6 +271,10 @@ class MockServer(http.server.ThreadingHTTPServer):
         self.exchange_info_bytes = 0
         self.pings = []
         self.okx_time_lookup_skip = 0
+        self.instrument_reads = 0
+        self.history_delay = 0.0
+        self.probes = []
+        self.stale_subscriptions = False
         self.refuse_once = None
         self.usdm_unknown_symbol = False
         self.connections = 0
@@ -300,6 +308,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlsplit(self.path)
         query = urllib.parse.parse_qs(parsed.query)
+        if parsed.path == "/api/v3/historicalTrades" and self.server.history_delay:
+            time.sleep(self.server.history_delay)
         with self.server.lock:
             self.server.requests.append(parsed.path)
             self.server.queries.append((parsed.path, query))
@@ -508,7 +518,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         server = self.server
         if path == "/api/v5/public/instruments":
             match = query["instId"][0] == server.instrument["instId"]
-            return 200, {"code": "0", "msg": "", "data": [server.instrument] if match else []}
+            body = {"code": "0", "msg": "", "data": [dict(server.instrument)] if match else []}
+            # Counted once the answer is built (under the server lock): scripts can wait on the
+            # feed's reads.
+            server.instrument_reads += 1
+            return 200, body
         if path == "/api/v5/market/history-trades":
             limit = int(query["limit"][0])
             if query.get("type") == ["2"]:
@@ -619,26 +633,58 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.server.venue in ("okx", "bybit"):
             self.subscribed(script)
             return
-        self.connection.settimeout(3)
+        lock, closed, ponged = threading.Lock(), threading.Event(), threading.Event()
+
+        def send(payload, opcode=1, final=True):
+            with lock:
+                frame(self.connection, payload, opcode, final)
+
+        def read():
+            # Client frames while the script runs: PONG replies, and liveness probes (answered).
+            self.connection.settimeout(0.1)
+            while not closed.is_set():
+                try:
+                    opcode, payload = receive(self.connection)
+                except TimeoutError:
+                    continue
+                except (EOFError, ConnectionResetError, OSError):
+                    break
+                if opcode == 8:
+                    break
+                if opcode == 10:
+                    self.server.pongs.append(payload)
+                    ponged.set()
+                elif opcode == 1:
+                    request = json.loads(payload)
+                    with self.server.lock:
+                        self.server.probes.append(request)
+                    streams = (
+                        [] if self.server.stale_subscriptions else query["streams"][0].split("/")
+                    )
+                    send({"result": streams, "id": request["id"]})
+            closed.set()
+
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
         for action in script:
             if isinstance(action, dict):
-                frame(self.connection, action)
+                send(action)
             elif action[0] == "pause":
                 time.sleep(action[1])
             elif action[0] == "ping":
-                frame(self.connection, action[1], opcode=9)
-                opcode, payload = receive(self.connection)
-                assert opcode == 10 and payload == action[1]
-                self.server.pongs.append(payload)
+                ponged.clear()
+                send(action[1], opcode=9)
+                assert ponged.wait(3) and self.server.pongs[-1] == action[1]
             elif action[0] == "fragment":
                 payload = json.dumps(action[1], separators=(",", ":")).encode()
                 middle = len(payload) // 2
-                frame(self.connection, payload[:middle], final=False)
-                frame(self.connection, payload[middle:], opcode=0)
+                with lock:
+                    frame(self.connection, payload[:middle], final=False)
+                    frame(self.connection, payload[middle:], opcode=0)
             elif action[0] == "binary":
-                frame(self.connection, action[1], opcode=2)
+                send(action[1], opcode=2)
             elif action[0] == "raw":
-                frame(self.connection, action[1])
+                send(action[1])
             elif action[0] == "revise_trade":
                 with self.server.lock:
                     row = list(self.server.trades[action[1]])
@@ -649,6 +695,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     row = list(self.server.bars[action[1]])
                     row[4] = "0.70000000"
                     self.server.bars[action[1]] = tuple(row)
+            elif action[0] == "add_aggregate":
+                with self.server.lock:
+                    self.server.aggregates[action[1]] = action[2]
             elif action[0] == "lag_rest":
                 # The REST row trails the WebSocket close, then catches up.
                 with self.server.lock:
@@ -661,17 +710,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
                 threading.Timer(action[2], restore).start()
             elif action[0] == "close":
-                frame(self.connection, b"", opcode=8)
+                send(b"", opcode=8)
+                closed.set()
+                reader.join(timeout=5)
                 self.close_connection = True
                 return
-        self.connection.settimeout(0.1)
-        while True:
-            try:
-                receive(self.connection)
-            except TimeoutError:
-                continue
-            except (EOFError, ConnectionResetError):
-                break
+        reader.join()
         self.close_connection = True
 
     def subscribed(self, script):
@@ -740,6 +784,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif action[0] == "set_instrument":
                 with self.server.lock:
                     self.server.instrument = dict(self.server.instrument, **action[1])
+            elif action[0] == "wait_instrument_reads":
+                deadline = time.monotonic() + 15
+                while True:
+                    with self.server.lock:
+                        if self.server.instrument_reads >= action[1]:
+                            break
+                    if time.monotonic() > deadline:
+                        self.server.errors.append(f"instrument reads never reached {action[1]}")
+                        break
+                    time.sleep(0.005)
             elif action[0] == "okx_unconfirm":
                 # REST trails the WebSocket confirm of this minute for a moment.
                 with self.server.lock:
@@ -770,6 +824,158 @@ VENUES = {
 
 def sequence(output):
     return [event["seq"] if event["type"] == "tick" else ("time", event["ts"]) for event in output]
+
+
+def journal_lines(state):
+    """The retained normalized journal: segment files in message-index order."""
+    lines = []
+    for path in sorted((pathlib.Path(state) / "journal").glob("*.jsonl")):
+        lines += path.read_text().splitlines()
+    return lines
+
+
+def minute_bars(count):
+    """Synthetic contiguous one-minute bars from 120000, in the mock's BARS tuple shape."""
+    return {
+        120000 + index * 60000: (
+            "10.00000000",
+            "10.50000000",
+            "9.50000000",
+            "10.25000000",
+            f"{index % 7 + 1}.00000000",
+            0,
+            0,
+            1,
+        )
+        for index in range(count)
+    }
+
+
+def bar_message(minute, bars):
+    opening, high, low, close, volume, _first, _last, count = bars[minute]
+    row = {
+        "t": minute,
+        "T": minute + 59999,
+        "s": "TESTUSDT",
+        "i": "1m",
+        "f": 1,
+        "L": 1,
+        "o": opening,
+        "h": high,
+        "l": low,
+        "c": close,
+        "v": volume,
+        "n": count,
+        "x": True,
+    }
+    return {
+        "stream": "testusdt@kline_1m",
+        "data": {"e": "kline", "E": minute + 60000, "s": "TESTUSDT", "k": row},
+    }
+
+
+def bar_line(minute, bars):
+    opening, high, low, close, volume = bars[minute][:5]
+    return (
+        f'{{"type":"bar","bar":{{"ts_open":{minute},"o":{opening},"h":{high},"l":{low},'
+        f'"c":{close},"v":{volume}}}}}'
+    )
+
+
+class StreamClient:
+    """A minimal RFC 6455 client for the serve endpoint: masked frames out, PING answered."""
+
+    def __init__(self, port, path, receive_buffer=None, timeout=15):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if receive_buffer:
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, receive_buffer)
+        self.socket.settimeout(timeout)
+        self.socket.connect(("127.0.0.1", port))
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.socket.sendall(
+            (
+                f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\n"
+                f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+                "Sec-WebSocket-Version: 13\r\n\r\n"
+            ).encode()
+        )
+        self.buffer = b""
+        while b"\r\n\r\n" not in self.buffer:
+            self.fill()
+        head, self.buffer = self.buffer.split(b"\r\n\r\n", 1)
+        self.status = int(head.split(b" ")[1])
+        self.body = b""
+        if self.status != 101:
+            length = 0
+            for line in head.split(b"\r\n")[1:]:
+                name, _, value = line.partition(b":")
+                if name.strip().lower() == b"content-length":
+                    length = int(value)
+            while len(self.buffer) < length:
+                self.fill()
+            self.body = self.buffer[:length]
+
+    def fill(self):
+        chunk = self.socket.recv(65536)
+        if not chunk:
+            raise EOFError
+        self.buffer += chunk
+
+    def exact(self, size):
+        while len(self.buffer) < size:
+            self.fill()
+        result, self.buffer = self.buffer[:size], self.buffer[size:]
+        return result
+
+    def send(self, opcode, payload=b""):
+        mask = os.urandom(4)
+        header = bytes([128 | opcode, 128 | len(payload)])
+        self.socket.sendall(header + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+    def message(self):
+        """("text", str), ("pong", b""), or ("close", code, reason)."""
+        while True:
+            first, second = self.exact(2)
+            size = second & 127
+            if size == 126:
+                size = struct.unpack("!H", self.exact(2))[0]
+            elif size == 127:
+                size = struct.unpack("!Q", self.exact(8))[0]
+            payload = self.exact(size)
+            opcode = first & 15
+            if opcode == 1:
+                return ("text", payload.decode())
+            if opcode == 10:
+                return ("pong", payload)
+            if opcode == 9:
+                self.send(10, payload)
+                continue
+            if opcode == 8:
+                code = struct.unpack("!H", payload[:2])[0] if len(payload) >= 2 else None
+                return ("close", code, payload[2:].decode())
+            raise AssertionError(f"unexpected opcode {opcode}")
+
+    def texts(self, count):
+        result = []
+        while len(result) < count:
+            kind, *rest = self.message()
+            if kind == "text":
+                result.append(rest[0])
+            elif kind == "close":
+                raise AssertionError(f"closed early: {rest}")
+        return result
+
+    def close(self):
+        with contextlib.suppress(OSError):
+            self.socket.close()
+
+
+def http_get(port, path):
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=10) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as failure:
+        return failure.code, failure.read()
 
 
 class FeedMockTests(unittest.TestCase):
@@ -877,10 +1083,8 @@ class FeedMockTests(unittest.TestCase):
         cursor = self.directory / "state" / "cursor.json"
         if cursor.exists():
             saved = json.loads(cursor.read_text())["cursor"]
-            self.assertEqual(
-                saved["message_index"],
-                len((cursor.parent / "events.jsonl").read_text().splitlines()),
-            )
+            first = int(sorted((cursor.parent / "journal").glob("*.jsonl"))[0].name[:20])
+            self.assertEqual(saved["message_index"], first + len(journal_lines(cursor.parent)))
         return output, result
 
     def test_bars_hole_is_healed_behind_closed_watermark(self):
@@ -1247,12 +1451,6 @@ class FeedMockTests(unittest.TestCase):
         self.assertIn("rest_rate_limited", result.stderr)
 
     def test_replay_and_queue_budgets_stop_22(self):
-        server = self.server([[candle(120000)]])
-        output, _ = self.run_feed(server, extra=["--max-log-bytes", "4"], expected=22)
-        self.assertEqual(output, [])
-        import shutil
-
-        shutil.rmtree(self.directory / "state")
         server = self.server([[trade(100)]])
         output, _ = self.run_feed(server, "ticks", ["--max-queue-bytes", "64"], expected=22)
         self.assertEqual(output, [])
@@ -1284,7 +1482,7 @@ class FeedMockTests(unittest.TestCase):
     def test_changed_committed_journal_is_refused(self):
         server = self.server([[candle(120000)], [candle(180000)]])
         self.run_feed(server, extra=["--max-messages", "1"])
-        journal = self.directory / "state" / "events.jsonl"
+        journal = sorted((self.directory / "state" / "journal").glob("*.jsonl"))[0]
         journal.write_text(journal.read_text().replace("10.10000000", "10.20000000"))
         output, _ = self.run_feed(server, resume=True, expected=21)
         self.assertEqual(output, [])
@@ -1300,6 +1498,66 @@ class FeedMockTests(unittest.TestCase):
             for path, query in server.queries
             if path == "/api/v5/market/history-trades" and query.get("type") == ["1"]
         ]
+
+    def test_long_outage_drops_the_connection_and_heals_instead_of_stopping_22(self):
+        # The session heals a long hole slowly (REST pages take time) while the venue keeps
+        # sending: the reader's bounded queue fills, so the connection is dropped and everything
+        # after it is healed by ID
+        # from REST once the reconnect's overlap check passes. Exit 22 is gone; the tape is exact.
+        count = 2400
+        trades = {99: TRADES[99]}
+        for offset in range(count):
+            trades[100 + offset] = (120001 + offset * 20, "10.00000000", "0.00000001")
+
+        def push(identifier):
+            matched, price, quantity = trades[identifier]
+            data = {
+                "e": "trade",
+                "E": matched + 1,
+                "s": "TESTUSDT",
+                "t": identifier,
+                "p": price,
+                "q": quantity,
+                "T": matched,
+                "m": False,
+            }
+            return {"stream": "testusdt@trade", "data": data}
+
+        # The first connection floods from print 1300 while 100..1299 heal; later ones carry
+        # the venue's head.
+        flood = [push(identifier) for identifier in range(1300, 100 + count)]
+        head = [push(identifier) for identifier in range(100 + count - 50, 100 + count)]
+        server = self.server([flood, head])
+        server.trades = trades
+        server.history_delay = 0.4
+        output, result = self.run_feed(
+            server, "ticks", ["--max-messages", str(count), "--max-queue-bytes", "16384"]
+        )
+        self.assertEqual([event["seq"] for event in output], list(range(100, 100 + count)))
+        self.assertIn("websocket_backpressure_reconnect", result.stderr)
+        self.assertGreaterEqual(server.connections, 2)
+
+    def test_quiet_binance_stream_is_probed_not_reconnected(self):
+        server = self.server([[candle(120000), ("pause", 3.5), candle(180000)]])
+        output, result = self.run_feed(
+            server, extra=["--max-messages", "2", "--silence-seconds", "1"]
+        )
+        self.assertEqual([event["bar"]["ts_open"] for event in output], [120000, 180000])
+        self.assertEqual(server.connections, 1)
+        self.assertGreaterEqual(len(server.probes), 2)
+        self.assertEqual(server.probes[0], {"method": "LIST_SUBSCRIPTIONS", "id": 1})
+        self.assertIn("source_probe_answered", result.stderr)
+        # A probe reply without the subscriptions is a lost subscription: reconnect with the
+        # overlap check.
+        self.reset_state()
+        server = self.server([[candle(120000), ("pause", 2.0)], [candle(180000)]])
+        server.stale_subscriptions = True
+        output, result = self.run_feed(
+            server, extra=["--max-messages", "2", "--silence-seconds", "1"]
+        )
+        self.assertEqual([event["bar"]["ts_open"] for event in output], [120000, 180000])
+        self.assertGreaterEqual(server.connections, 2)
+        self.assertIn("source_subscription_lost", result.stderr)
 
     def test_okx_swap_bars_confirm_flag_and_contract_units(self):
         server = self.server([[okx_candle(120000, "0"), okx_candle(180000)]], "okx")
@@ -1524,6 +1782,104 @@ class FeedMockTests(unittest.TestCase):
         )
         self.assertNotIn('"code":20', result.stderr)
 
+    def test_usdm_quiet_start_waits_for_the_first_aggregate(self):
+        # No aggregate at or after --start for longer than the hour the venue searches at once:
+        # the feed waits,
+        # anchors nothing, and then proves the predecessor by searching forward hour by hour.
+        late = 120000 + 61 * 60000
+        quiet = {
+            minute: (
+                "10.10000000",
+                "10.10000000",
+                "10.10000000",
+                "10.10000000",
+                "0.00000000",
+                0,
+                0,
+                0,
+            )
+            for minute in range(120000, late, 60000)
+        }
+        quiet[late] = (
+            "12.00000000",
+            "12.00000000",
+            "12.00000000",
+            "12.00000000",
+            "0.40000000",
+            0,
+            0,
+            1,
+        )
+        row = {
+            "T": late + 1,
+            "p": "12.00000000",
+            "q": "0.40000000",
+            "nq": "0.40000000",
+            "f": 1010,
+            "l": 1012,
+        }
+        nxt = {
+            "T": late + 60001,
+            "p": "12.00000000",
+            "q": "0.10000000",
+            "nq": "0.10000000",
+            "f": 1013,
+            "l": 1013,
+        }
+
+        def closing(minute):
+            opening, high, low, close, volume = quiet[minute][:5]
+            return candle(
+                120000,
+                t=minute,
+                T=minute + 59999,
+                o=opening,
+                h=high,
+                l=low,
+                c=close,
+                v=volume,
+                f=-1,
+                L=-1,
+                n=0,
+            )
+
+        server = self.server(
+            [
+                [
+                    closing(120000),
+                    closing(180000),
+                    # Longer than the venue's predecessor retries: a blind anchor would stop 20.
+                    ("pause", 3.0),
+                    (
+                        "add_aggregate",
+                        500,
+                        (row["T"], row["p"], row["q"], row["nq"], row["f"], row["l"]),
+                    ),
+                    (
+                        "add_aggregate",
+                        501,
+                        (nxt["T"], nxt["p"], nxt["q"], nxt["nq"], nxt["f"], nxt["l"]),
+                    ),
+                    aggregate(500, a=500, **row),
+                    closing(late),
+                    aggregate(501, a=501, **nxt),
+                ]
+            ],
+            "usdm",
+        )
+        server.aggregates = {499: AGGREGATES[499]}
+        server.bars = quiet
+        output, result = self.run_feed(server, "agg-ticks", ["--max-messages", "63"])
+        minutes = [("time", minute + 60000) for minute in range(120000, late, 60000)]
+        self.assertEqual(sequence(output), [*minutes, 500, ("time", late + 60000)])
+        self.assertNotIn('"code":20', result.stderr)
+        windows = [
+            int(query["startTime"][0])
+            for path, query in server.queries
+            if path == "/fapi/v1/aggTrades" and "startTime" in query
+        ]
+        self.assertIn(120000 + 3600000, windows)
+
     def test_bybit_http_403_is_a_retryable_rate_ban(self):
         server = self.server([[bybit_push(bybit_row(120000, True))]], "bybit")
         server.fail_status = 403
@@ -1534,17 +1890,37 @@ class FeedMockTests(unittest.TestCase):
 
     def test_okx_changed_contract_multiplier_stops_21_on_reconnect(self):
         notice = {"event": "notice", "code": "64008", "msg": "upgrade", "connId": "mock"}
-        server = self.server(
-            [
-                # The pause lets the first connection's instrument check and its bar finish first.
-                [okx_candle(120000), ("pause", 1.0), ("set_instrument", {"ctVal": "0.1"}), notice],
-                [okx_candle(180000)],
-            ],
-            "okx",
-        )
-        output, result = self.run_feed(server, expected=21)
-        self.assertEqual([event["bar"]["ts_open"] for event in output], [120000])
-        self.assertIn("contract multiplier changed", result.stderr)
+        for mode, first, emitted in (
+            ("bars", okx_candle(120000), [120000]),
+            ("ticks", okx_trades(100, 101), [100, 101]),
+        ):
+            with self.subTest(mode=mode):
+                self.reset_state()
+                server = self.server(
+                    [
+                        # Two instrument reads answered (startup, then the first connection's
+                        # re-check)
+                        # before the instrument changes: no timing assumption.
+                        [
+                            ("wait_instrument_reads", 2),
+                            first,
+                            ("set_instrument", {"ctVal": "0.1"}),
+                            notice,
+                        ],
+                        [okx_candle(180000)],
+                    ],
+                    "okx",
+                )
+                output, result = self.run_feed(server, mode, expected=21)
+                self.assertEqual(
+                    [
+                        event["bar"]["ts_open"] if mode == "bars" else event["seq"]
+                        for event in output
+                    ],
+                    emitted,
+                )
+                self.assertIn("contract multiplier changed", result.stderr)
+                self.assertEqual(server.instrument_reads, 3)
 
     def test_okx_websocket_and_rest_lexemes_differ_but_overlap_values_match(self):
         notice = {"event": "notice", "code": "64008", "msg": "upgrade", "connId": "mock"}
@@ -1895,6 +2271,345 @@ class FeedMockTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertIn("Coinbase is deferred", result.stderr)
         self.assertFalse((self.directory / "state").exists())
+
+    def serve(self, server, mode="bars", extra=(), resume=False, environment=None):
+        command = self.command(server, mode, [*extra, "--listen", "127.0.0.1:0"], resume)
+        command[1] = "serve"
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=dict(os.environ, **(environment or {})),
+        )
+        records, ready = [], threading.Event()
+
+        def read():
+            for line in process.stderr:
+                records.append(json.loads(line))
+                if records[-1]["event"] == "serve_listening":
+                    ready.set()
+            ready.set()
+
+        threading.Thread(target=read, daemon=True).start()
+
+        def cleanup():
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+        self.addCleanup(cleanup)
+        self.assertTrue(ready.wait(15))
+        listening = [record for record in records if record["event"] == "serve_listening"]
+        self.assertTrue(listening, records)
+        return process, listening[0]["port"], records
+
+    def status(self, port):
+        code, body = http_get(port, "/v1/status")
+        self.assertEqual(code, 200, body)
+        return json.loads(body)
+
+    def wait_status(self, port, predicate, timeout=20):
+        deadline = time.monotonic() + timeout
+        status = None
+        while time.monotonic() < deadline:
+            status = self.status(port)
+            if predicate(status):
+                return status
+            time.sleep(0.05)
+        self.fail(f"status never satisfied the condition: {status}")
+
+    def stop(self, process, expected=0):
+        process.send_signal(signal.SIGTERM)
+        self.assertEqual(process.wait(timeout=30), expected)
+
+    def test_serve_streams_from_cursor_with_status_snapshot_and_keepalive(self):
+        server = self.server([[candle(240000)]])
+        process, port, records = self.serve(server)
+        status = self.wait_status(port, lambda status: status["retained"]["next_index"] == 3)
+        journal = journal_lines(self.directory / "state")
+        self.assertEqual(len(journal), 3)
+        self.assertEqual(status["retained"]["first_index"], 0)
+        self.assertEqual(status["source"]["venue"], "binance")
+        self.assertEqual(status["source"]["mode"], "bars")
+        self.assertEqual(status["last"]["verified_cut"], 300000)
+        self.assertEqual(status["clients"], 0)
+        code, body = http_get(port, "/v1/snapshot")
+        self.assertEqual((code, body.decode().splitlines()), (200, journal))
+        epoch = status["epoch"]
+        client = StreamClient(port, f"/v1/stream?epoch={epoch}&from=0")
+        self.assertEqual(client.status, 101)
+        self.assertEqual(client.texts(3), journal)
+        # A quiet stream: an unsolicited PONG within 5 s keeps the runner's 15 s idle deadline
+        # alive.
+        started = time.monotonic()
+        self.assertEqual(client.message()[0], "pong")
+        self.assertLess(time.monotonic() - started, 6.5)
+        self.assertEqual(client.message()[0], "pong")
+        self.assertLess(time.monotonic() - started, 12)
+        tail = StreamClient(port, f"/v1/stream?epoch={epoch}&from=2")
+        self.assertEqual(tail.texts(1), journal[2:])
+        self.assertEqual(self.status(port)["clients"], 2)
+        for path, expected in (
+            (f"/v1/stream?epoch={'0' * 64}&from=0", 409),
+            (f"/v1/stream?epoch={epoch}&from=4", 416),
+            (f"/v1/stream?epoch={epoch}", 400),
+            (f"/v1/stream?epoch={epoch}&from=-1", 400),
+        ):
+            with self.subTest(path=path):
+                refused = StreamClient(port, path)
+                self.assertEqual(refused.status, expected, refused.body)
+                self.assertIn("error", json.loads(refused.body))
+                refused.close()
+        self.stop(process)
+        while True:
+            kind, *rest = client.message()
+            if kind == "close":
+                self.assertEqual(rest[0], 1001)
+                break
+        self.assertTrue(any(record["event"] == "client_refused" for record in records))
+
+    def test_serve_expired_cursor_and_snapshot_fail_explicitly(self):
+        server = self.server([[]])
+        server.bars = minute_bars(300)
+        script = []
+        for index in range(300):
+            script += [bar_message(120000 + index * 60000, server.bars), ("pause", 0.002)]
+        server.scripts = [script]
+        process, port, _ = self.serve(
+            server, extra=["--segment-bytes", "4096", "--replay-bytes", "8192"]
+        )
+        status = self.wait_status(port, lambda status: status["retained"]["next_index"] == 300)
+        first = status["retained"]["first_index"]
+        self.assertGreater(first, 0)
+        expired = StreamClient(port, f"/v1/stream?epoch={status['epoch']}&from={first - 1}")
+        self.assertEqual(expired.status, 410)
+        self.assertIn("cursor expired", json.loads(expired.body)["error"])
+        code, body = http_get(port, "/v1/snapshot")
+        self.assertEqual(code, 410)
+        self.assertIn("expired", json.loads(body)["error"])
+        client = StreamClient(port, f"/v1/stream?epoch={status['epoch']}&from={first}")
+        expected = [bar_line(120000 + index * 60000, server.bars) for index in range(first, 300)]
+        self.assertEqual(client.texts(300 - first), expected)
+        self.assertEqual(journal_lines(self.directory / "state")[-len(expected) :], expected)
+        self.stop(process)
+
+    def test_serve_resume_after_producer_sigkill_reconnects_at_the_cursor(self):
+        server = self.server([[]])
+        server.bars = minute_bars(20)
+        server.scripts = [
+            [bar_message(120000 + 9 * 60000, server.bars)],
+            [bar_message(120000 + 19 * 60000, server.bars)],
+        ]
+        expected = [bar_line(120000 + index * 60000, server.bars) for index in range(20)]
+        process, port, _ = self.serve(server)
+        status = self.wait_status(port, lambda status: status["retained"]["next_index"] == 10)
+        epoch = status["epoch"]
+        client = StreamClient(port, f"/v1/stream?epoch={epoch}&from=0")
+        received = client.texts(6)
+        client.close()
+        process.send_signal(signal.SIGKILL)
+        process.wait(timeout=10)
+        process, port, _ = self.serve(server, resume=True)
+        status = self.wait_status(port, lambda status: status["retained"]["next_index"] == 20)
+        self.assertEqual(status["epoch"], epoch)
+        resumed = StreamClient(port, f"/v1/stream?epoch={epoch}&from={len(received)}")
+        received += resumed.texts(20 - len(received))
+        self.assertEqual(received, expected)
+        self.assertEqual(journal_lines(self.directory / "state"), expected)
+        self.stop(process)
+
+    def test_serve_slow_client_is_closed_with_a_reason_and_never_blocks_others(self):
+        # A burst well beyond the kernel's socket buffers plus the client queue: a client that
+        # stops reading overflows its own queue and is closed with a reason; the producer and a
+        # reading client never wait.
+        server = self.server([[]])
+        count = 70000
+        server.bars = minute_bars(count)
+        last = 120000 + (count - 1) * 60000
+        server.scripts = [
+            [bar_message(120000, server.bars), ("pause", 2.0), bar_message(last, server.bars)]
+        ]
+        process, port, _ = self.serve(server, extra=["--client-queue-bytes", "1048576"])
+        status = self.wait_status(port, lambda status: status["retained"]["next_index"] >= 1)
+        path = f"/v1/stream?epoch={status['epoch']}&from=0"
+        stuck = StreamClient(port, path, receive_buffer=4096, timeout=60)
+        self.assertEqual(stuck.texts(1), [bar_line(120000, server.bars)])
+        received = []
+
+        def consume():
+            stream = StreamClient(port, path, timeout=60)
+            received.extend(stream.texts(count))
+            stream.close()
+
+        reader = threading.Thread(target=consume, daemon=True)
+        reader.start()
+        self.wait_status(port, lambda status: status["retained"]["next_index"] == count, timeout=60)
+        reader.join(timeout=60)
+        self.assertEqual(len(received), count)
+        self.assertEqual(received[-1], bar_line(last, server.bars))
+        lines, closed = 1, None
+        while closed is None:
+            kind, *rest = stuck.message()
+            if kind == "text":
+                self.assertEqual(rest[0], bar_line(120000 + lines * 60000, server.bars))
+                lines += 1
+            elif kind == "close":
+                closed = rest
+        self.assertEqual(closed[0], 1008)
+        self.assertIn("slow consumer", closed[1])
+        self.assertLess(lines, count)
+        self.assertIsNone(process.poll())
+        self.stop(process)
+
+    def test_serve_fanout_stress_clients_connect_and_disconnect_during_rotation(self):
+        server = self.server([[]])
+        count = 1500
+        server.bars = minute_bars(count)
+        script = [bar_message(120000, server.bars), ("pause", 1.0)]
+        for index in range(1, count):
+            script += [bar_message(120000 + index * 60000, server.bars), ("pause", 0.002)]
+        server.scripts = [script]
+        expected = [bar_line(120000 + index * 60000, server.bars) for index in range(count)]
+        process, port, _ = self.serve(
+            server,
+            extra=[
+                "--segment-bytes",
+                "4096",
+                "--replay-bytes",
+                "16384",
+                "--client-queue-bytes",
+                "8192",
+            ],
+        )
+        status = self.wait_status(port, lambda status: status["retained"]["next_index"] >= 1)
+        epoch, outcomes, failures = status["epoch"], [], []
+        finished = threading.Event()
+
+        def client(seed):
+            import random
+
+            chooser = random.Random(seed)
+            while not finished.is_set():
+                try:
+                    current = self.status(port)["retained"]
+                    start = chooser.randint(current["first_index"], current["next_index"])
+                    slow = chooser.random() < 0.2
+                    stream = StreamClient(
+                        port,
+                        f"/v1/stream?epoch={epoch}&from={start}",
+                        receive_buffer=4096 if slow else None,
+                    )
+                    if stream.status == 410:
+                        outcomes.append("expired-at-handshake")
+                        stream.close()
+                        continue
+                    if stream.status != 101:
+                        failures.append(("status", stream.status, stream.body))
+                        return
+                    index, wanted = start, chooser.randint(1, 120)
+                    while index < start + wanted and index < count:
+                        kind, *rest = stream.message()
+                        if kind == "pong":
+                            continue
+                        if kind == "close":
+                            if rest[0] not in (1008, 4410, 1001):
+                                failures.append(("close", rest))
+                            outcomes.append(f"closed-{rest[0]}")
+                            break
+                        if rest[0] != expected[index]:
+                            failures.append(("line", index, rest[0][:80]))
+                            return
+                        index += 1
+                        if slow:
+                            time.sleep(0.01)
+                    else:
+                        outcomes.append("read")
+                    stream.close()
+                except (OSError, EOFError) as failure:
+                    outcomes.append(f"transport-{type(failure).__name__}")
+
+        threads = [threading.Thread(target=client, args=(seed,), daemon=True) for seed in range(12)]
+        for thread in threads:
+            thread.start()
+        self.wait_status(port, lambda status: status["retained"]["next_index"] == count, timeout=60)
+        finished.set()
+        for thread in threads:
+            thread.join(timeout=30)
+        self.assertEqual(failures, [])
+        self.assertGreater(outcomes.count("read"), 10)
+        last = self.status(port)
+        self.assertGreater(last["retained"]["first_index"], 0)
+        self.assertEqual(
+            journal_lines(self.directory / "state"), expected[last["retained"]["first_index"] :]
+        )
+        self.stop(process)
+
+    def test_serve_listens_on_loopback_unless_remote_is_explicit(self):
+        server = self.server([[]])
+        command = self.command(server, extra=["--listen", "0.0.0.0:0"])
+        command[1] = "serve"
+        result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 23)
+        self.assertIn("--allow-remote-listen", result.stderr)
+        self.assertEqual(server.requests, [])
+        result = subprocess.run(
+            self.command(server, extra=["--listen", "127.0.0.1:0"]),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 23)
+        self.assertIn("serve options", result.stderr)
+
+    def test_rotation_and_expiry_crash_points_resume_with_an_exact_tape(self):
+        count = 200
+        bars = minute_bars(count)
+        script = []
+        for index in range(count):
+            script += [bar_message(120000 + index * 60000, bars), ("pause", 0.004)]
+        expected = [bar_line(120000 + index * 60000, bars) for index in range(count)]
+        journal = ["--segment-bytes", "4096", "--replay-bytes", "8192"]
+        for point in (
+            "commit-append",
+            "commit-cursor",
+            "rotate-checkpoint",
+            "rotate-segment",
+            "rotate-cursor",
+            "retain-segment",
+        ):
+            with self.subTest(point=point):
+                self.reset_state()
+                server = self.server([script])
+                server.bars = bars
+                crashed = subprocess.run(
+                    self.command(server, extra=journal),
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=dict(os.environ, PINEFORGE_FEED_CRASH_AT=point + ":3"),
+                )
+                self.assertEqual(crashed.returncode, -signal.SIGKILL, crashed.stderr[-500:])
+                received = crashed.stdout.splitlines()
+                saved = json.loads((self.directory / "state" / "cursor.json").read_text())["cursor"]
+                self.assertGreaterEqual(saved["message_index"], len(received))
+                remaining = count - saved["message_index"]
+                self.assertGreater(remaining, 0)
+                output, result = self.run_feed(
+                    server,
+                    extra=[
+                        *journal,
+                        *("--output-from", str(len(received)), "--max-messages", str(remaining)),
+                    ],
+                    resume=True,
+                )
+                self.assertEqual(len(output), count - len(received))
+                received += result.stdout.splitlines()
+                self.assertEqual(received, expected)
+                if point == "retain-segment":
+                    self.assertIn("expired_duplicate_unverified", result.stderr)
+                retained = journal_lines(self.directory / "state")
+                self.assertEqual(retained, expected[count - len(retained) :])
 
     def warmup(self, server):
         port = server.server_address[1]

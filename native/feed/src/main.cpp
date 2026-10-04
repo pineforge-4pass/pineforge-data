@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "session.hpp"
 #include "transport.hpp"
+#if PINEFORGE_FEED_SERVE
+#include "serve.hpp"
+#endif
 #include <algorithm>
 #include <charconv>
 #include <chrono>
@@ -26,6 +29,9 @@ struct StdoutFlags {
 void help() {
     std::cout << "pineforge-feed warmup --venue VENUE --market MARKET --symbol SYMBOL --start UTC|MS --end UTC|MS --output FILE\n"
                  "pineforge-feed run --venue VENUE --market MARKET --symbol SYMBOL --mode MODE --state-dir DIR [--start UTC|MS | --resume] [--output-from INDEX]\n"
+                 "pineforge-feed serve --venue VENUE --market MARKET --symbol SYMBOL --mode MODE --state-dir DIR [--start UTC|MS | --resume]\n"
+                 "                     [--listen HOST:PORT (default 127.0.0.1:8787)] [--allow-remote-listen] [--client-queue-bytes N] [--max-clients N]\n"
+                 "  GET /v1/status, GET /v1/snapshot (complete prefix from index 0, at most 4 MiB), ws://HOST:PORT/v1/stream?epoch=E&from=I\n"
                  "Venues and modes:\n"
                  "  binance spot BTCUSDT        bars | ticks\n"
                  "  binance usdm BTCUSDT        bars | agg-ticks (aggregate prints, not raw trades; bars can\n"
@@ -33,7 +39,8 @@ void help() {
                  "  okx spot BTC-USDT           bars | ticks\n"
                  "  okx swap BTC-USDT-SWAP      bars | ticks (linear swaps; base quantities)\n"
                  "  bybit spot|linear BTCUSDT   bars\n"
-                 "Limits: --max-messages N --max-log-bytes N --max-replay-seconds N --max-queue-bytes N --reconnect-seconds N --keepalive-seconds N\n"
+                 "Journal: --segment-bytes N --replay-bytes N --replay-age-seconds N\n"
+                 "Limits: --max-messages N --max-replay-seconds N --max-queue-bytes N --reconnect-seconds N --keepalive-seconds N --silence-seconds N\n"
                  "Testing/public origins: --rest-url ORIGIN --ws-url ORIGIN [--allow-insecure-http (loopback only)]\n";
 }
 // Venue, market and mode gates are checked before any network access.
@@ -88,7 +95,7 @@ int run(int argc, char** argv) {
         if (argc == 2 && std::string(argv[1]) == "--version") { check_runtime_curl(); std::cout << "pineforge-feed 0.1.0\n"; return 0; }
         if (argc < 2) throw Error(23, "choose warmup or run; see --help");
         const std::string command = argv[1];
-        if (command != "run" && command != "warmup") throw Error(23, "only warmup and run are implemented");
+        if (command != "run" && command != "warmup" && command != "serve") throw Error(23, "choose warmup, run or serve; see --help");
         Config config;
         std::string output;
         std::set<std::string> seen;
@@ -97,6 +104,7 @@ int run(int argc, char** argv) {
             if (!seen.insert(key).second) throw Error(23, "duplicate CLI option: " + key);
             if (key == "--resume") { config.resume = true; continue; }
             if (key == "--allow-insecure-http") { config.allow_insecure = true; continue; }
+            if (key == "--allow-remote-listen") { config.allow_remote_listen = true; continue; }
             if (index + 1 >= argc) throw Error(23, "CLI option needs a value: " + key);
             const std::string value = argv[++index];
             if (key == "--venue") config.venue = value;
@@ -109,21 +117,37 @@ int run(int argc, char** argv) {
             else if (key == "--output") output = value;
             else if (key == "--output-from") config.output_from = unsigned_value(value);
             else if (key == "--max-messages") config.max_messages = unsigned_value(value);
-            else if (key == "--max-log-bytes") config.max_log_bytes = unsigned_value(value);
+            else if (key == "--segment-bytes") config.segment_bytes = unsigned_value(value);
+            else if (key == "--replay-bytes") config.replay_bytes = unsigned_value(value);
+            else if (key == "--replay-age-seconds") {
+                const auto seconds = unsigned_value(value);
+                if (seconds > 10ULL * 366 * 86400) throw Error(23, "--replay-age-seconds is at most ten years");
+                config.replay_age_ms = static_cast<std::int64_t>(seconds) * 1000;
+            }
+            else if (key == "--listen") config.listen = value;
+            else if (key == "--client-queue-bytes") config.client_queue_bytes = unsigned_value(value);
+            else if (key == "--max-clients") config.max_clients = unsigned_value(value);
             else if (key == "--max-replay-seconds") config.max_replay_seconds = unsigned_value(value);
             else if (key == "--max-queue-bytes") config.max_queue_bytes = unsigned_value(value);
             else if (key == "--reconnect-seconds") config.reconnect_seconds = unsigned_value(value);
             else if (key == "--keepalive-seconds") config.keepalive_seconds = unsigned_value(value);
+            else if (key == "--silence-seconds") config.silence_seconds = unsigned_value(value);
             else if (key == "--rest-url") config.rest_url = value;
             else if (key == "--ws-url") config.ws_url = value;
             else throw Error(23, "unknown CLI option: " + key);
         }
         gate(config, command == "warmup", seen.count("--rest-url") != 0, seen.count("--ws-url") != 0);
-        if (!config.max_log_bytes || !config.max_queue_bytes || !config.max_replay_seconds || config.max_replay_seconds > 3600 ||
+        if (!config.max_queue_bytes || !config.max_replay_seconds || config.max_replay_seconds > 3600 ||
             !config.reconnect_seconds || config.reconnect_seconds > 86100)
             throw Error(23, "budgets must be positive; reconnect must precede the 24-hour connection limit");
+        if (config.segment_bytes < 4096 || config.segment_bytes > (1ULL << 30) || config.replay_bytes / 2 < config.segment_bytes)
+            throw Error(23, "--segment-bytes must be 4096..1 GiB and --replay-bytes at least twice --segment-bytes");
+        // A client queue holds at least one atomic message (at most 4096 bytes).
+        if (config.client_queue_bytes < 4096 || config.client_queue_bytes > (1ULL << 30) || !config.max_clients || config.max_clients > 1024)
+            throw Error(23, "--client-queue-bytes must be 4096..1 GiB and --max-clients 1..1024");
         // OKX closes a connection after 30 s without traffic; Bybit recommends a ping every 20 s.
         if (!config.keepalive_seconds || config.keepalive_seconds > 25) throw Error(23, "--keepalive-seconds must be 1..25");
+        if (!config.silence_seconds || config.silence_seconds > 75) throw Error(23, "--silence-seconds must be 1..75");
         check_runtime_curl();
         validate_origin(config.rest_url, false, config.allow_insecure);
         validate_origin(config.ws_url, true, config.allow_insecure);
@@ -131,7 +155,17 @@ int run(int argc, char** argv) {
             if (output.empty() || config.resume || !config.state_dir.empty() || seen.count("--output-from") || seen.count("--mode"))
                 throw Error(23, "warmup requires --output and does not accept run-state options");
             warmup(config, output);
+        } else if (command == "serve") {
+            if (config.state_dir.empty() || seen.count("--end") || !output.empty() || seen.count("--output-from"))
+                throw Error(23, "serve requires --state-dir; clients choose their own cursor (from=I), so --output-from is refused");
+#if PINEFORGE_FEED_SERVE
+            serve_feed(config);
+#else
+            throw Error(23, "this build has no serve subcommand (configured with PINEFORGE_FEED_SERVE=OFF)");
+#endif
         } else {
+            if (seen.count("--listen") || config.allow_remote_listen || seen.count("--client-queue-bytes") || seen.count("--max-clients"))
+                throw Error(23, "--listen, --allow-remote-listen, --client-queue-bytes and --max-clients are serve options");
             if (config.state_dir.empty() || seen.count("--end") || !output.empty() || (!config.resume && seen.count("--output-from")))
                 throw Error(23, "run requires --state-dir; --output-from requires --resume");
             const auto flags = ::fcntl(STDOUT_FILENO, F_GETFL);

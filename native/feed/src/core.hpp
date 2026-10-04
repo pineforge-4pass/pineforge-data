@@ -27,6 +27,9 @@ std::int64_t timestamp(const std::string& token);
 void write_all(int descriptor, std::string_view bytes);
 void output_line(std::string_view line);
 void atomic_file(const std::string& path, std::string_view bytes);
+// Test hook for crash-safety probes: PINEFORGE_FEED_CRASH_AT=NAME[:N] kills the process with SIGKILL at the
+// N-th (default first) pass through the named durable step. Unset, it does nothing.
+void crash_point(const char* name);
 
 class Decimal {
     std::string coefficient_;
@@ -89,11 +92,21 @@ struct Config {
     std::int64_t start = -1, end = -1;
     bool resume = false, allow_insecure = false;
     std::uint64_t output_from = 0, max_messages = 0;
-    std::uint64_t max_log_bytes = 256 * 1024 * 1024;
+    // Journal segments seal at segment_bytes; sealed segments expire beyond replay_bytes retained bytes or,
+    // when replay_age_ms is set, beyond that much venue time.
+    std::uint64_t segment_bytes = 16 * 1024 * 1024;
+    std::uint64_t replay_bytes = 256 * 1024 * 1024;
+    std::int64_t replay_age_ms = 0;
     std::uint64_t max_replay_seconds = 60;
     std::size_t max_queue_bytes = 16 * 1024 * 1024;
     std::uint64_t reconnect_seconds = 23 * 3600 + 55 * 60;
     std::uint64_t keepalive_seconds = 20;
+    std::uint64_t silence_seconds = 75;  // data silence before a probe (or, without one, a reconnect)
+    // serve: the same producer publishes to WebSocket clients instead of stdout.
+    bool serve = false, allow_remote_listen = false;
+    std::string listen = "127.0.0.1:8787";
+    std::size_t client_queue_bytes = 1024 * 1024;
+    std::size_t max_clients = 64;
 };
 // Raw ticks and USD-M aggregate prints share the tick/time journal grammar.
 inline bool tick_mode(const std::string& mode) { return mode == "ticks" || mode == "agg-ticks"; }

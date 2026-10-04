@@ -16,7 +16,8 @@ template<class Function> Function load(void* library, const char* name) {
 
 int main(int argc, char** argv) {
     try {
-        if (argc != 4) throw std::runtime_error("usage: batch-probe observed-strategy.so bars.csv actions.jsonl");
+        if (argc != 4 && argc != 5)
+            throw std::runtime_error("usage: batch-probe observed-strategy.so bars.csv actions.jsonl [qty_step]");
         std::ifstream input(argv[2]);
         if (!input) throw std::runtime_error("cannot open batch input");
         std::string line;
@@ -45,6 +46,9 @@ int main(int argc, char** argv) {
         auto error = load<decltype(&strategy_get_last_error)>(library, "strategy_get_last_error");
         auto strategy = create(nullptr);
         if (!strategy || retain(strategy)) throw std::runtime_error("cannot retain batch execution receipts");
+        // The runner's --syminfo qty_step=V, read the same way (std::stod).
+        if (argc == 5) load<decltype(&strategy_set_syminfo_metadata)>(library, "strategy_set_syminfo_metadata")(
+            strategy, "qty_step", std::stod(argv[4]));
         pf_report_t report{};
         run(strategy, bars.data(), static_cast<int>(bars.size()), "1", "1", 0, 4, PF_MAGNIFIER_ENDPOINTS, &report);
         const auto* failure = error(strategy);

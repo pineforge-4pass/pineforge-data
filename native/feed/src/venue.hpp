@@ -13,14 +13,17 @@ struct VenueEvent {
     Kline kline;
 };
 // How the WebSocket reader treats one complete text message. Control messages (subscription
-// acknowledgements, keepalive replies) prove liveness but are not queued; Retire queues the message,
-// then reconnects.
-enum class Frame { Data, Control, Retire };
+// acknowledgements, keepalive and probe replies) prove liveness but are not queued; Retire queues the
+// message, then reconnects; Stale (a probe reply without the subscriptions) reconnects without queuing.
+enum class Frame { Data, Control, Retire, Stale };
 struct Connection {
     std::string path;                    // appended to the WebSocket origin
     std::vector<std::string> subscribe;  // text frames sent after every handshake
     std::string ping;                    // venue text keepalive; empty when curl's PONG suffices
     std::function<Frame(const std::string&)> classify;  // runs on the reader thread: no shared state
+    // A request whose Control reply proves the connection and its subscriptions are alive (Binance
+    // LIST_SUBSCRIPTIONS): a quiet stream is probed instead of reconnected. Empty: silence reconnects.
+    std::string probe;
 };
 // How a tick minute is proven complete before its `time` event.
 // KlineIdRange: the closed kline names the minute's raw-ID range and count (Binance spot).
@@ -46,13 +49,14 @@ public:
         return previous.front();
     }
     // The same predecessor, but only once the venue holds a print at or after `minute`: nullopt while it
-    // holds none, without waiting or stopping (a quiet start). Fence venues override it.
-    virtual std::optional<Trade> predecessor_if_ready(std::int64_t minute) {
-        try { return predecessor(minute); }
-        catch (const Error& failure) { if (failure.code == 20) return std::nullopt; throw; }
-    }
+    // holds none, without waiting or stopping (a quiet start). Every venue states its own answer: a default
+    // that mapped stops to "not ready" would wait silently on an unavailable predecessor.
+    virtual std::optional<Trade> predecessor_if_ready(std::int64_t minute) = 0;
     // Re-checks instrument metadata that fixes the stream's units; a change stops 21. Called on connect.
     virtual void reverify() {}
+    // The newest venue time the caller knows of without a WebSocket (export passes the clock): bounds a
+    // start lookup that searches forward through time windows (USD-M).
+    virtual void horizon(std::int64_t) {}
     // Contiguous closed one-minute candles in [start, end), ascending.
     virtual std::vector<Kline> klines(std::int64_t start, std::int64_t end) = 0;
     virtual TickProof tick_proof() const { return TickProof::KlineIdRange; }

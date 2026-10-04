@@ -15,6 +15,10 @@ void check_runtime_curl();
 void validate_origin(const std::string& origin, bool websocket, bool allow_insecure);
 void pause_for(std::chrono::milliseconds duration);
 std::uint64_t retry_after_seconds(const std::string& value, std::int64_t now);
+// Milliseconds to wait before a request of `weight`: none while the venue-reported use of the current
+// one-minute window (`used`, reported in window `used_window`) leaves room under 90% of `limit`; otherwise
+// until the next window opens (500 ms margin).
+std::uint64_t quota_wait_ms(std::uint64_t used, std::uint64_t used_window, unsigned int weight, std::uint64_t limit, std::int64_t now_ms);
 
 // A venue's public REST contract: allowlisted paths and how requests are paced.
 struct RestPolicy {
@@ -38,6 +42,7 @@ class HttpClient {
     RestPolicy policy_;
     std::chrono::steady_clock::time_point next_request_{};
     std::uint64_t weight_limit_ = 0, milliseconds_per_weight_ = 0, milliseconds_per_request_ = 0;
+    std::uint64_t used_weight_ = 0, used_window_ = 0;  // the venue's X-MBX-USED-WEIGHT-1M and its minute
 public:
     HttpClient(const Config& config, RestPolicy policy);
     std::string body(const std::string& path, unsigned int weight, std::size_t limit = 1024 * 1024);
@@ -59,7 +64,8 @@ class WebSocketPump {
     std::exception_ptr failure_;
     std::thread worker_;
     bool stopped() const;
-    void push(SourceMessage message);
+    bool push(SourceMessage message);
+    void wait_for_room(std::size_t bytes);
     void run();
 public:
     WebSocketPump(const Config& config, Connection connection);

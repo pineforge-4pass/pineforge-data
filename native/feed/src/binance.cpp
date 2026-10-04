@@ -71,9 +71,21 @@ Trade usdm_aggregate(const Json& value) {
     trade.validate();
     return trade;
 }
-Frame binance_frame(const std::string& message) {
+Frame binance_frame(const std::string& message, const std::vector<std::string>& streams) {
     try {
         const auto envelope = parse_json(message);
+        // The reply to the liveness probe: {"result":[subscribed streams],"id":N}. Without them all, reconnect.
+        if (envelope.find("id") && !envelope.find("stream") && !envelope.find("e")) {
+            const auto* result = envelope.find("result");
+            if (!result || result->kind != Json::Kind::Array || result->items.empty()) return Frame::Stale;
+            for (const auto& stream : streams) {
+                bool listed = false;
+                for (const auto& item : result->items) listed = listed || (item.kind == Json::Kind::String && item.text() == stream);
+                if (!listed) return Frame::Stale;
+            }
+            return Frame::Control;
+        }
+        if (envelope.find("result")) throw Error(23, "unexpected public stream reply");
         const auto* wrapped = envelope.find("data");
         const auto& data = wrapped ? *wrapped : envelope;
         const auto* event = data.find("e");
@@ -81,9 +93,19 @@ Frame binance_frame(const std::string& message) {
     } catch (const std::exception&) { throw Error(23, "invalid public WebSocket JSON"); }
 }
 
+namespace {
+// A combined-stream connection whose probe reply must list every one of its streams.
+Connection combined(const std::string& prefix, const std::vector<std::string>& streams) {
+    std::string path = prefix;
+    for (const auto& stream : streams) path += (path.size() == prefix.size() ? "" : "/") + stream;
+    return {path, {}, {}, [streams](const std::string& message) { return binance_frame(message, streams); },
+            "{\"method\":\"LIST_SUBSCRIPTIONS\",\"id\":1}"};
+}
+}
 Connection BinanceSpot::connection() const {
     const auto symbol = lower(config_.symbol);
-    return {"/stream?streams=" + (config_.mode == "ticks" ? symbol + "@trade/" + symbol + "@kline_1m" : symbol + "@kline_1m"), {}, {}, &binance_frame};
+    if (config_.mode == "ticks") return combined("/stream?streams=", {symbol + "@trade", symbol + "@kline_1m"});
+    return combined("/stream?streams=", {symbol + "@kline_1m"});
 }
 std::vector<VenueEvent> BinanceSpot::decode(const std::string& message) const {
     try {
@@ -175,8 +197,8 @@ RestPolicy usdm_rest() {
 unsigned int usdm_kline_weight(std::size_t limit) { return limit < 100 ? 1 : limit < 500 ? 2 : limit <= 1000 ? 5 : 10; }
 Connection usdm_connection(const Config& config) {
     const auto symbol = lower(config.symbol);
-    return {"/market/stream?streams=" + (config.mode == "agg-ticks" ? symbol + "@aggTrade/" + symbol + "@kline_1m" : symbol + "@kline_1m"),
-            {}, {}, &binance_frame};
+    if (config.mode == "agg-ticks") return combined("/market/stream?streams=", {symbol + "@aggTrade", symbol + "@kline_1m"});
+    return combined("/market/stream?streams=", {symbol + "@kline_1m"});
 }
 BinanceUsdm::BinanceUsdm(const Config& config) : config_(config), http_(config, usdm_rest()) {
     // An unknown symbol is refused before any stream is opened (HTTP 400, code -1121).
@@ -199,10 +221,16 @@ std::vector<VenueEvent> BinanceUsdm::decode(const std::string& message) const {
             if (wrapped && !(aggregates && type == "aggTrade" && config_.mode == "agg-ticks") && !(klines && type == "kline"))
                 throw Error(23, "unsupported USD-M stream event");
             if (data.at("s").text() != config_.symbol) throw Error(23, "public stream symbol changed");
-            if (type == "aggTrade") return {{VenueEvent::Kind::Trade, usdm_aggregate(data), {}}};
+            if (type == "aggTrade") {
+                const auto trade = usdm_aggregate(data);
+                newest_ = std::max(newest_, trade.ts);
+                return {{VenueEvent::Kind::Trade, trade, {}}};
+            }
             const auto& row = data.at("k");
             if (row.at("s").text() != config_.symbol) throw Error(23, "kline symbol changed");
-            return {{VenueEvent::Kind::Kline, {}, binance_kline(row, true)}};
+            const auto kline = binance_kline(row, true);
+            newest_ = std::max(newest_, kline.bar.ts + 59999);
+            return {{VenueEvent::Kind::Kline, {}, kline}};
         }
         if (type == "serverShutdown") return {};
         log("warn", "unknown_stream_event", Json::object({{"stream", Json::string(stream)}, {"type", Json::string(type)}}));
@@ -224,31 +252,38 @@ std::vector<Trade> BinanceUsdm::history(std::uint64_t from, std::size_t limit) {
     }
     return trades;
 }
-namespace {
-// The first aggregate at or after the start, searched over the next hour (the venue's longest time window),
-// so a quiet start minute still has a fence; 0 when none is visible yet.
-std::uint64_t first_aggregate(HttpClient& http, const std::string& symbol, std::int64_t minute) {
-    const auto response = http.get("/fapi/v1/aggTrades?symbol=" + symbol + "&startTime=" + std::to_string(minute) +
-        "&endTime=" + std::to_string(minute + 3599999) + "&limit=1", 20);
-    const auto& rows = array(response, 1);
-    if (rows.empty()) return 0;
-    const auto first = usdm_aggregate(rows.front());
-    if (first.ts < minute || first.ts >= minute + 3600000) throw Error(20, "initial aggregate fence is unavailable or ambiguous");
-    return first.id;
-}
+// The first aggregate at or after the start, searched hour window by hour window (the venue's longest time
+// window) up to the newest venue time seen on the WebSocket, so a quiet start of any length within the 48-hour
+// history finds its fence; 0 when none is visible yet. A window that ended two minutes before that venue time
+// is settled (REST trails the WebSocket by seconds) and is not read again.
+std::uint64_t BinanceUsdm::first_aggregate(std::int64_t minute) {
+    for (auto window = std::max(minute, quiet_until_);; window += 3600000) {
+        if (window - minute >= retention_ms()) throw Error(20, "no aggregate within the venue's 48-hour history after the start minute");
+        const auto response = http_.get("/fapi/v1/aggTrades?symbol=" + config_.symbol + "&startTime=" + std::to_string(window) +
+            "&endTime=" + std::to_string(window + 3599999) + "&limit=1", 20);
+        const auto& rows = array(response, 1);
+        if (!rows.empty()) {
+            const auto first = usdm_aggregate(rows.front());
+            if (first.ts < window || first.ts >= window + 3600000) throw Error(20, "initial aggregate fence is unavailable or ambiguous");
+            return first.id;
+        }
+        if (window + 3600000 + 120000 <= newest_) quiet_until_ = window + 3600000;
+        if (window + 3600000 > newest_) return 0;
+    }
 }
 std::uint64_t BinanceUsdm::first_trade_id(std::int64_t minute) {
     for (unsigned int attempt = 0; attempt < 3; ++attempt) {
         if (attempt) pause_for(std::chrono::milliseconds(500 * attempt));
-        if (const auto first = first_aggregate(http_, config_.symbol, minute)) return first;
+        if (const auto first = first_aggregate(minute)) return first;
     }
     throw Error(20, "no aggregate after the start minute is available yet");
 }
 std::optional<Trade> BinanceUsdm::predecessor_if_ready(std::int64_t minute) {
-    const auto first = first_aggregate(http_, config_.symbol, minute);
+    const auto first = first_aggregate(minute);
     if (!first) return std::nullopt;
+    if (first <= 1) throw Error(20, "raw predecessor cannot be proven");
     const auto previous = history(first - 1, 1);
-    if (first <= 1 || previous.empty() || previous.front().id != first - 1) throw Error(20, "raw predecessor is unavailable");
+    if (previous.empty() || previous.front().id != first - 1) throw Error(20, "raw predecessor is unavailable");
     return previous.front();
 }
 std::vector<Kline> BinanceUsdm::klines(std::int64_t start, std::int64_t end) {

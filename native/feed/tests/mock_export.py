@@ -165,8 +165,8 @@ class ExportMockTests(unittest.TestCase):
         )
 
     def test_rest_start_survives_a_quiet_first_hour(self):
-        # The first aggregate after --start lies in the second hour window: the start lookup searches
-        # forward up to the clock instead of stopping 20 after one window.
+        # The first aggregate after --start lies in the second hour window: the start lookup
+        # searches forward up to the clock instead of stopping 20 after one window.
         start = recent_minute(90)
         prints = [(499, start - 1, "10.10000000", "0.10000000")]
         prints += synthetic(500, start + 70 * 60000, 3, 4)

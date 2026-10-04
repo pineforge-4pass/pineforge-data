@@ -57,6 +57,7 @@ struct Hub {
             // A client that cannot keep up is cut off; it never slows the producer or another client.
             if (shared->size() > config.client_queue_bytes - std::min(client->queue_bytes, config.client_queue_bytes)) {
                 client->slow = true;
+                log("warn", "client_slow", Json::object({{"next", number(client->next)}, {"queued_bytes", number(client->queue_bytes)}}));
                 continue;
             }
             client->queue_bytes += shared->size();
@@ -328,7 +329,9 @@ void on_ready(mg_connection* connection, void* data) {
         try { send_close(connection, 1011, "internal error"); } catch (...) {}
     }
 }
-int on_data(mg_connection*, int, char*, std::size_t, void*) { return 1; }
+// The protocol has no client messages: any data frame (CivetWeb reads frames only after the ready handler has
+// returned, i.e. after serve's close) ends the connection instead of being read on.
+int on_data(mg_connection*, int, char*, std::size_t, void*) { return 0; }
 void on_close(const mg_connection*, void*) {}
 
 // Every connection end, handshake failures included, releases its client.
@@ -356,9 +359,12 @@ class Server {
 public:
     Server(Hub& hub, const std::string& address) {
         mg_init_library(0);
-        const auto threads = std::to_string(hub.config.max_clients + 4);
+        // CivetWeb is thread-per-connection and every streaming client holds its worker. 16 spare workers serve
+        // status, snapshots and new upgrades; a request that is not complete within 10 s (a half-open
+        // connection) is dropped, which also bounds a blocked write to a dead client.
+        const auto threads = std::to_string(hub.config.max_clients + 16);
         const char* options[] = {"listening_ports", address.c_str(), "num_threads", threads.c_str(),
-                                 "request_timeout_ms", "30000", "websocket_timeout_ms", "10000",
+                                 "request_timeout_ms", "10000", "websocket_timeout_ms", "10000",
                                  "enable_websocket_ping_pong", "yes", "enable_keep_alive", "no", nullptr};
         mg_callbacks callbacks{};
         callbacks.log_message = &on_log;
@@ -452,14 +458,10 @@ std::optional<std::string> snapshot_prefix(const std::string& journal, std::uint
     JournalReader reader(journal);
     if (!reader.seek(0)) throw Error(20, "the snapshot prefix has expired");
     std::string body;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (reader.index() < published) {
+        // Every published line is on disk before it is published: a missing one means its segment expired.
         auto line = reader.next();
-        if (!line) {
-            if (std::chrono::steady_clock::now() >= deadline) throw Error(20, "a snapshot segment expired while it was read");
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
-        }
+        if (!line) throw Error(20, "a snapshot segment expired while it was read");
         if (line->size() + 1 > limit - body.size()) return std::nullopt;
         body += *line;
         body += '\n';
@@ -469,17 +471,26 @@ std::optional<std::string> snapshot_prefix(const std::string& journal, std::uint
 
 std::string listen_address(const std::string& listen, bool allow_remote) {
     const auto colon = listen.rfind(':');
-    if (colon == std::string::npos || colon + 1 == listen.size()) throw Error(23, "--listen takes HOST:PORT");
+    if (colon == std::string::npos || colon + 1 == listen.size()) throw Error(23, "--listen takes HOST:PORT or [IPV6]:PORT");
     auto host = listen.substr(0, colon);
     const auto port = listen.substr(colon + 1);
     unsigned int value = 0;
     if (port.find_first_not_of("0123456789") != std::string::npos ||
         std::from_chars(port.data(), port.data() + port.size(), value).ec != std::errc{} || value > 65535)
         throw Error(23, "--listen port must be 0..65535");
-    if (host == "localhost") host = "127.0.0.1";
-    in_addr parsed{};
-    if (::inet_pton(AF_INET, host.c_str(), &parsed) != 1) throw Error(23, "--listen host must be an IPv4 address or localhost");
-    const bool loopback = (ntohl(parsed.s_addr) >> 24) == 127;
+    bool loopback = false;
+    if (host.size() > 2 && host.front() == '[' && host.back() == ']') {
+        in6_addr parsed{};
+        if (::inet_pton(AF_INET6, host.substr(1, host.size() - 2).c_str(), &parsed) != 1)
+            throw Error(23, "--listen host must be an IPv4 address, [IPV6] or localhost");
+        loopback = IN6_IS_ADDR_LOOPBACK(&parsed);
+    } else {
+        if (host == "localhost") host = "127.0.0.1";
+        in_addr parsed{};
+        if (::inet_pton(AF_INET, host.c_str(), &parsed) != 1)
+            throw Error(23, "--listen host must be an IPv4 address, [IPV6] or localhost");
+        loopback = (ntohl(parsed.s_addr) >> 24) == 127;
+    }
     if (!loopback && !allow_remote)
         throw Error(23, "--listen on a non-loopback address needs --allow-remote-listen; serve has no TLS or authentication");
     return host + ":" + std::to_string(value);

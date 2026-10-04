@@ -1084,7 +1084,12 @@ int main() {
         assert(listen_address("localhost:0", false) == "127.0.0.1:0" && listen_address("127.0.0.2:8787", false) == "127.0.0.2:8787");
         expect(23, [] { listen_address("0.0.0.0:8787", false); });
         assert(listen_address("0.0.0.0:8787", true) == "0.0.0.0:8787");
-        for (const auto* invalid : {"8787", "127.0.0.1:", "127.0.0.1:70000", "[::1]:8787", "example.com:80"})
+        // The IPv6 loopback is loopback; any other IPv6 address needs --allow-remote-listen.
+        assert(listen_address("[::1]:8787", false) == "[::1]:8787");
+        expect(23, [] { listen_address("[::]:8787", false); });
+        assert(listen_address("[::]:8787", true) == "[::]:8787");
+        for (const auto* invalid : {"8787", "127.0.0.1:", "127.0.0.1:70000", "[::1", "[]:80", "[127.0.0.1]:80", "::1:8787",
+                                    "example.com:80"})
             expect(23, [&] { listen_address(invalid, true); });
         passed("serve_journal_reader_follows_segments_and_listen_is_loopback_by_default");
     }

@@ -2300,8 +2300,10 @@ class FeedMockTests(unittest.TestCase):
         self.assertIn("Coinbase is deferred", result.stderr)
         self.assertFalse((self.directory / "state").exists())
 
-    def serve(self, server, mode="bars", extra=(), resume=False, environment=None):
-        command = self.command(server, mode, [*extra, "--listen", "127.0.0.1:0"], resume)
+    def serve(
+        self, server, mode="bars", extra=(), resume=False, environment=None, listen="127.0.0.1:0"
+    ):
+        command = self.command(server, mode, [*extra, "--listen", listen], resume)
         command[1] = "serve"
         process = subprocess.Popen(
             command,
@@ -2458,7 +2460,7 @@ class FeedMockTests(unittest.TestCase):
         server.scripts = [
             [bar_message(120000, server.bars), ("pause", 2.0), bar_message(last, server.bars)]
         ]
-        process, port, _ = self.serve(server, extra=["--client-queue-bytes", "1048576"])
+        process, port, records = self.serve(server, extra=["--client-queue-bytes", "1048576"])
         status = self.wait_status(port, lambda status: status["retained"]["next_index"] >= 1)
         path = f"/v1/stream?epoch={status['epoch']}&from=0"
         stuck = StreamClient(port, path, receive_buffer=4096, timeout=60)
@@ -2472,10 +2474,11 @@ class FeedMockTests(unittest.TestCase):
 
         reader = threading.Thread(target=consume, daemon=True)
         reader.start()
-        self.wait_status(port, lambda status: status["retained"]["next_index"] == count, timeout=60)
-        reader.join(timeout=60)
-        self.assertEqual(len(received), count)
-        self.assertEqual(received[-1], bar_line(last, server.bars))
+        # The stuck client reads again once it is cut off, well inside the 10 s write bound.
+        deadline = time.monotonic() + 60
+        while not any(record["event"] == "client_slow" for record in records):
+            self.assertLess(time.monotonic(), deadline, "the stuck client was never cut off")
+            time.sleep(0.01)
         lines, closed = 1, None
         while closed is None:
             kind, *rest = stuck.message()
@@ -2487,6 +2490,16 @@ class FeedMockTests(unittest.TestCase):
         self.assertEqual(closed[0], 1008)
         self.assertIn("slow consumer", closed[1])
         self.assertLess(lines, count)
+        # After serve's close, a client frame ends the connection instead of being read on.
+        stuck.socket.settimeout(5)
+        stuck.send(1, b"after close")
+        with self.assertRaises((EOFError, ConnectionResetError)):
+            while True:
+                stuck.message()
+        stuck.close()
+        reader.join(timeout=60)
+        self.assertEqual(len(received), count)
+        self.assertEqual(received[-1], bar_line(last, server.bars))
         self.assertIsNone(process.poll())
         self.stop(process)
 
@@ -2576,6 +2589,59 @@ class FeedMockTests(unittest.TestCase):
             journal_lines(self.directory / "state"), expected[last["retained"]["first_index"] :]
         )
         self.stop(process)
+
+    def test_serve_half_open_requests_never_starve_status_or_a_runner(self):
+        # Eight connections that never finish their request on a listener for four clients:
+        # status and a runner's upgrade still get a worker at once, and each incomplete request
+        # is dropped within the 10 s request timeout.
+        server = self.server([[candle(240000)]])
+        process, port, _ = self.serve(server, extra=["--max-clients", "4"])
+        status = self.wait_status(port, lambda status: status["retained"]["next_index"] == 3)
+        stalled = []
+        for _ in range(8):
+            connection = socket.create_connection(("127.0.0.1", port), timeout=20)
+            self.addCleanup(connection.close)
+            connection.sendall(b"GET /v1/status HTTP/1.1\r\nHost: x\r\nX-Slow: ")
+            stalled.append(connection)
+        time.sleep(0.5)
+        started = time.monotonic()
+        self.assertEqual(self.status(port)["epoch"], status["epoch"])
+        runner = StreamClient(port, f"/v1/stream?epoch={status['epoch']}&from=0", timeout=5)
+        self.assertEqual(runner.status, 101)
+        self.assertEqual(len(runner.texts(3)), 3)
+        self.assertLess(time.monotonic() - started, 5)
+        runner.close()
+        for connection in stalled:
+            connection.settimeout(max(started + 15 - time.monotonic(), 0.1))
+            with contextlib.suppress(ConnectionResetError):
+                while connection.recv(4096):
+                    pass
+        self.assertLess(time.monotonic() - started, 15)
+        self.assertIsNone(process.poll())
+        self.stop(process)
+
+    def test_serve_accepts_the_ipv6_loopback(self):
+        try:
+            with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+                probe.bind(("::1", 0))
+        except OSError:
+            self.skipTest("this host has no IPv6 loopback")
+        server = self.server([[candle(240000)]])
+        process, port, _ = self.serve(server, listen="[::1]:0")
+        deadline = time.monotonic() + 20
+        while True:
+            with urllib.request.urlopen(f"http://[::1]:{port}/v1/status", timeout=10) as response:
+                body = json.loads(response.read())
+            if body["retained"]["next_index"] == 3:
+                break
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
+        self.stop(process)
+        command = self.command(server, extra=["--listen", "[::]:0"])
+        command[1] = "serve"
+        result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 23)
+        self.assertIn("--allow-remote-listen", result.stderr)
 
     def test_serve_listens_on_loopback_unless_remote_is_explicit(self):
         server = self.server([[]])

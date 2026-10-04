@@ -69,7 +69,7 @@ if(PINEFORGE_FEED_SERVE)
   FetchContent_MakeAvailable(civetweb)
   add_library(pineforge_feed_civetweb STATIC "${civetweb_SOURCE_DIR}/src/civetweb.c")
   target_include_directories(pineforge_feed_civetweb SYSTEM PUBLIC "${civetweb_SOURCE_DIR}/include")
-  target_compile_definitions(pineforge_feed_civetweb PRIVATE NO_SSL NO_CGI NO_FILES NO_CACHING
+  target_compile_definitions(pineforge_feed_civetweb PRIVATE NO_SSL NO_CGI NO_FILES NO_CACHING STOP_FLAG_NEEDS_LOCK
     PUBLIC USE_WEBSOCKET)
   set_target_properties(pineforge_feed_civetweb PROPERTIES C_STANDARD 99)
   target_compile_options(pineforge_feed_civetweb PRIVATE -w)
@@ -100,4 +100,8 @@ if(BUILD_TESTING)
   set_tests_properties(feed-mock-export PROPERTIES TIMEOUT 300)
   add_test(NAME feed-mock COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/mock_venue.py $<TARGET_FILE:pineforge-feed>)
   set_tests_properties(feed-mock PROPERTIES TIMEOUT 420)
+  if(PINEFORGE_FEED_SANITIZER STREQUAL "thread")
+    set_tests_properties(feed-unit feed-export-unit feed-mock feed-mock-export PROPERTIES ENVIRONMENT
+      "TSAN_OPTIONS=halt_on_error=1 suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/tsan.supp")
+  endif()
 endif()

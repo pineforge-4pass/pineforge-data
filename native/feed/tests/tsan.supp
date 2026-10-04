@@ -1,0 +1,5 @@
+# ThreadSanitizer suppressions for the feed's TSan suite; nothing in the feed's own code is suppressed.
+# CivetWeb 1.16 (built with STOP_FLAG_NEEDS_LOCK): STOP_FLAG_ASSIGN passes the flag's current value to its
+# compare-and-swap loop with a plain read, which races benignly with the atomic reads of mg_stop and the
+# master thread during shutdown.
+race:STOP_FLAG_ASSIGN

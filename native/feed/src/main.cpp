@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "export.hpp"
 #include "session.hpp"
 #include "transport.hpp"
 #if PINEFORGE_FEED_SERVE
@@ -28,6 +29,8 @@ struct StdoutFlags {
 };
 void help() {
     std::cout << "pineforge-feed warmup --venue VENUE --market MARKET --symbol SYMBOL --start UTC|MS --end UTC|MS --output FILE\n"
+                 "pineforge-feed export --venue VENUE --market MARKET --symbol SYMBOL --mode ticks|agg-ticks --start UTC|MS --end UTC|MS --output FILE\n"
+                 "                      [--archive DAILY.zip|DAILY.csv [--checksum DAILY.zip.CHECKSUM]] (prints-built 1m bars)\n"
                  "pineforge-feed run --venue VENUE --market MARKET --symbol SYMBOL --mode MODE --state-dir DIR [--start UTC|MS | --resume] [--output-from INDEX]\n"
                  "pineforge-feed serve --venue VENUE --market MARKET --symbol SYMBOL --mode MODE --state-dir DIR [--start UTC|MS | --resume]\n"
                  "                     [--listen HOST:PORT (default 127.0.0.1:8787)] [--allow-remote-listen] [--client-queue-bytes N] [--max-clients N]\n"
@@ -95,9 +98,11 @@ int run(int argc, char** argv) {
         if (argc == 2 && std::string(argv[1]) == "--version") { check_runtime_curl(); std::cout << "pineforge-feed 0.1.0\n"; return 0; }
         if (argc < 2) throw Error(23, "choose warmup or run; see --help");
         const std::string command = argv[1];
-        if (command != "run" && command != "warmup" && command != "serve") throw Error(23, "choose warmup, run or serve; see --help");
+        if (command != "run" && command != "warmup" && command != "serve" && command != "export")
+            throw Error(23, "choose warmup, export, run or serve; see --help");
         Config config;
         std::string output;
+        ExportOptions exported;
         std::set<std::string> seen;
         for (int index = 2; index < argc; ++index) {
             const std::string key = argv[index];
@@ -115,6 +120,8 @@ int run(int argc, char** argv) {
             else if (key == "--start") config.start = timestamp(value);
             else if (key == "--end") config.end = timestamp(value);
             else if (key == "--output") output = value;
+            else if (key == "--archive") exported.archive = value;
+            else if (key == "--checksum") exported.checksum = value;
             else if (key == "--output-from") config.output_from = unsigned_value(value);
             else if (key == "--max-messages") config.max_messages = unsigned_value(value);
             else if (key == "--segment-bytes") config.segment_bytes = unsigned_value(value);
@@ -137,6 +144,8 @@ int run(int argc, char** argv) {
             else throw Error(23, "unknown CLI option: " + key);
         }
         gate(config, command == "warmup", seen.count("--rest-url") != 0, seen.count("--ws-url") != 0);
+        if (command != "export" && (!exported.archive.empty() || !exported.checksum.empty()))
+            throw Error(23, "--archive and --checksum are export options");
         if (!config.max_queue_bytes || !config.max_replay_seconds || config.max_replay_seconds > 3600 ||
             !config.reconnect_seconds || config.reconnect_seconds > 86100)
             throw Error(23, "budgets must be positive; reconnect must precede the 24-hour connection limit");
@@ -151,7 +160,14 @@ int run(int argc, char** argv) {
         check_runtime_curl();
         validate_origin(config.rest_url, false, config.allow_insecure);
         validate_origin(config.ws_url, true, config.allow_insecure);
-        if (command == "warmup") {
+        if (command == "export") {
+            if (output.empty() || config.resume || !config.state_dir.empty() || seen.count("--output-from") || !tick_mode(config.mode) ||
+                config.start < 0 || config.end < 0)
+                throw Error(23, "export takes --mode ticks|agg-ticks, --start, --end and --output (plus --archive [--checksum])");
+            if (!exported.checksum.empty() && exported.archive.empty()) throw Error(23, "--checksum verifies an --archive");
+            exported.output = output;
+            export_bars(config, exported);
+        } else if (command == "warmup") {
             if (output.empty() || config.resume || !config.state_dir.empty() || seen.count("--output-from") || seen.count("--mode"))
                 throw Error(23, "warmup requires --output and does not accept run-state options");
             warmup(config, output);

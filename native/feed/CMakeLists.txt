@@ -70,7 +70,7 @@ if(PINEFORGE_FEED_SERVE)
   add_library(pineforge_feed_civetweb STATIC "${civetweb_SOURCE_DIR}/src/civetweb.c")
   target_include_directories(pineforge_feed_civetweb SYSTEM PUBLIC "${civetweb_SOURCE_DIR}/include")
   target_compile_definitions(pineforge_feed_civetweb PRIVATE NO_SSL NO_CGI NO_FILES NO_CACHING STOP_FLAG_NEEDS_LOCK
-    USE_IPV6 PUBLIC USE_WEBSOCKET)
+    USE_IPV6 REENTRANT_TIME PUBLIC USE_WEBSOCKET)
   set_target_properties(pineforge_feed_civetweb PROPERTIES C_STANDARD 99)
   target_compile_options(pineforge_feed_civetweb PRIVATE -w)
   target_link_libraries(pineforge_feed_civetweb PUBLIC Threads::Threads ${CMAKE_DL_LIBS})

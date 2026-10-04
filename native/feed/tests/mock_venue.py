@@ -2316,7 +2316,11 @@ class FeedMockTests(unittest.TestCase):
 
         def read():
             for line in process.stderr:
-                records.append(json.loads(line))
+                try:
+                    records.append(json.loads(line))
+                except ValueError:
+                    # A sanitizer report, kept so that a failure shows it.
+                    records.append({"event": "raw", "line": line})
                 if records[-1]["event"] == "serve_listening":
                     ready.set()
             ready.set()

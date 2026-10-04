@@ -2,6 +2,7 @@
 #pragma once
 #include "transport.hpp"
 #include "venue.hpp"
+#include <algorithm>
 
 namespace pineforge::feed {
 Trade binance_trade(const Json& trade, bool websocket);
@@ -43,6 +44,7 @@ public:
     std::vector<Trade> history(std::uint64_t from, std::size_t limit = 1000) override;
     std::uint64_t first_trade_id(std::int64_t minute) override;
     std::optional<Trade> predecessor_if_ready(std::int64_t minute) override;
+    void horizon(std::int64_t ts) override { newest_ = std::max(newest_, ts); }
     std::vector<Kline> klines(std::int64_t start, std::int64_t end) override;
     TickProof tick_proof() const override { return TickProof::NextPrintFence; }
     std::int64_t retention_ms() const override { return 48LL * 3600000; }

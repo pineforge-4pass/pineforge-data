@@ -164,6 +164,23 @@ class ExportMockTests(unittest.TestCase):
             (manifest["prints"], manifest["bars"], manifest["quiet_minutes"]), (6, 4, 1)
         )
 
+    def test_rest_start_survives_a_quiet_first_hour(self):
+        # The first aggregate after --start lies in the second hour window: the start lookup searches
+        # forward up to the clock instead of stopping 20 after one window.
+        start = recent_minute(90)
+        prints = [(499, start - 1, "10.10000000", "0.10000000")]
+        prints += synthetic(500, start + 70 * 60000, 3, 4)
+        server = self.server(prints)
+        self.export(start, start + 72 * 60000, server)
+        self.assertEqual(self.output.read_text(), expected_bars(prints, start, start + 72 * 60000))
+        self.assertEqual(self.manifest()["quiet_minutes"], 70)
+        windows = [
+            int(query["startTime"][0])
+            for path, query in server.queries
+            if path == "/fapi/v1/aggTrades" and "startTime" in query
+        ]
+        self.assertIn(start + 3600000, windows)
+
     def test_rest_pages_by_from_id_and_sums_volume_exactly(self):
         start = recent_minute(40)
         prints = synthetic(1000, start - 60000, 6, 700, quiet=(2,))

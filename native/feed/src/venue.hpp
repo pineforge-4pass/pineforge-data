@@ -54,6 +54,9 @@ public:
     virtual std::optional<Trade> predecessor_if_ready(std::int64_t minute) = 0;
     // Re-checks instrument metadata that fixes the stream's units; a change stops 21. Called on connect.
     virtual void reverify() {}
+    // The newest venue time the caller knows of without a WebSocket (export passes the clock): bounds a
+    // start lookup that searches forward through time windows (USD-M).
+    virtual void horizon(std::int64_t) {}
     // Contiguous closed one-minute candles in [start, end), ascending.
     virtual std::vector<Kline> klines(std::int64_t start, std::int64_t end) = 0;
     virtual TickProof tick_proof() const { return TickProof::KlineIdRange; }

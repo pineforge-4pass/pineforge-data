@@ -525,6 +525,7 @@ ChainBars rest_bars(const Config& config, std::string& multiplier) {
     const auto now = now_ms();
     if (config.end > now) throw Error(20, "the window has not closed yet: no print at or after its end can exist");
     const auto venue = make_venue(config);
+    venue->horizon(now);
     multiplier = venue->qty_multiplier();
     const auto window = venue->retention_ms();
     if (window && now - config.start > window)

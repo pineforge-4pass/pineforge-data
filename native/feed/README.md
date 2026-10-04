@@ -115,8 +115,9 @@ from the last print strictly before `--start` through the fence, the first print
 at or after `--end`. A hole, a missing fence (the window has not closed yet), or
 a start outside the venue's REST history (USD-M 48 hours) stops with 20 and
 writes nothing; time running backwards along the chain stops with 23. From REST
-the chain is paged by ID (Binance 1000, OKX 100 per page); a USD-M start needs an
-aggregate within the hour after it.
+the chain is paged by ID (Binance 1000, OKX 100 per page); a USD-M start is found
+by searching hour windows forward from `--start` up to the present (within the
+48-hour history), so a quiet first hour is not a stop.
 
 `--archive` reads the Binance USD-M daily `aggTrades` archive as published (the
 `.zip`, inflated in-process and CRC-checked, or the extracted `.csv`, with or
@@ -448,9 +449,12 @@ Linux test machine (ext4 root), committing each message separately (three
 fsyncs per print) sustained about 120 messages/s. With group commit, the
 loopback bench (synthetic contiguous prints through the real binary and the
 mock venue, wall time including startup) ran 30,000 prints at 5,811, 11,212 and
-10,842 messages/s in three runs on the same machine. The busiest BTCUSDT minute
-of a recent 89-day sample averaged 655 prints/s, about one ninth of the slowest
-run.
+10,842 messages/s in three runs on the same machine under load; with the
+segmented journal, on an idle machine, 30,000 prints ran at about 42,000
+messages/s, and through `serve` one client received a 30,000-print burst at about
+19,000 messages/s (eight clients at once, about 17,000 each). The busiest BTCUSDT
+minute of a recent 89-day sample averaged 655 prints/s, about one ninth of the
+slowest run.
 
 ### Retention per mode
 

@@ -29,6 +29,7 @@ from .release_contract import (
     DEFAULT_RELEASE_IMAGE,
     RELEASE_ENTRYPOINT,
     ReleaseContractError,
+    normalize_release_version,
     parse_release_report,
     release_environment,
     release_response,
@@ -535,6 +536,9 @@ class BacktestService:
             await self.cache.trim()
             try:
                 report = parse_release_report(stdout.decode("utf-8", "replace"))
+                release_version = normalize_release_version(
+                    os.environ.get("PINEFORGE_RELEASE_VERSION")
+                )
             except ReleaseContractError as exc:
                 raise BacktestServiceError(
                     "invalid_release_response",
@@ -545,7 +549,7 @@ class BacktestService:
             return ExecutionResult(
                 report,
                 {
-                    "release_version": os.environ.get("PINEFORGE_RELEASE_VERSION", "unknown"),
+                    "release_version": release_version,
                     "engine_version": os.environ.get("PINEFORGE_ENGINE_VERSION", "unknown"),
                     "codegen_version": os.environ.get("PINEFORGE_CODEGEN_VERSION", "unknown"),
                     "hub_commit": os.environ.get("PINEFORGE_HUB_COMMIT", "unknown"),

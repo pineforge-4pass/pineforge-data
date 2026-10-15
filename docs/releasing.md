@@ -174,13 +174,13 @@ uploaded completion snapshot. A previously verified target never emits a later
 failed/superseded/progress receipt; local incidents still record those errors.
 
 The required hub `RELEASE_RECEIPT_POLICY.data` entry is checked into
-[`receipt-policy.json`](../tests/fixtures/release_chain/receipt-policy.json).
+[`receipt-policy.json`](https://github.com/pineforge-4pass/pineforge-data/blob/main/tests/fixtures/release_chain/receipt-policy.json).
 Both CI and E2E inventories include Python 3.11/3.12/3.13, Release contract,
 Docker runtime, Database E2E, Distribution and release/ready, with zero approved
 skips. The reporting workflow is `pineforge-release.yml`, artifact
 `release-receipt-data`, base `main`; deploy uses `release.yml` and the inventory
 above. A complete synthetic verified receipt is in
-[`sample-release-receipt.json`](../tests/fixtures/release_chain/sample-release-receipt.json).
+[`sample-release-receipt.json`](https://github.com/pineforge-4pass/pineforge-data/blob/main/tests/fixtures/release_chain/sample-release-receipt.json).
 `tests/test_consumer_receipt.py` builds it through the real coordinator builder
 and validates it with the hub's field, GitHub-check, identity, artifact and
 signal checks vendored in `tests/hub_receipt_validator.py`. The sibling hub repo

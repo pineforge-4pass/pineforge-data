@@ -14,6 +14,7 @@ from pineforge_data import (
     ReleaseContractError,
 )
 from pineforge_data.release_contract import (
+    normalize_release_version,
     parse_release_report,
     release_environment,
     write_release_inputs,
@@ -84,3 +85,42 @@ def test_server_image_and_python_runtime_share_the_release_pin() -> None:
     dockerfile = (root / "docker/server.Dockerfile").read_text(encoding="utf-8")
 
     assert f"PINEFORGE_RELEASE_IMAGE={DEFAULT_RELEASE_IMAGE}" in dockerfile
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("v1.0.0", "1.0.0"),
+        ("1.0.0", "1.0.0"),
+        ("v1.6.0-rc.1", "1.6.0-rc.1"),
+        ("1.6.0-rc.1", "1.6.0-rc.1"),
+        ("v0.0.0-alpha.0+build.01", "0.0.0-alpha.0+build.01"),
+    ],
+)
+def test_normalizes_observed_release_version(value: str, expected: str) -> None:
+    assert normalize_release_version(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        1,
+        "",
+        "unknown",
+        "v",
+        "vv1.0.0",
+        "V1.0.0",
+        " v1.0.0",
+        "v1.0.0\n",
+        "v1.0",
+        "v01.0.0",
+        "v1.0.0-rc.01",
+        "v1.0.0-",
+        "v1.0.0+",
+        "v1.0.0+build..1",
+    ],
+)
+def test_rejects_invalid_observed_release_version(value: object) -> None:
+    with pytest.raises(ReleaseContractError, match="invalid release semantic version"):
+        normalize_release_version(value)

@@ -1,0 +1,8 @@
+{
+  "config": {
+    "digest": "sha256:2a1f513f4b87d8db621c0402ccf38b3e49bfb008978d4b03b7a24ed4fb8b10b2"
+  },
+  "layers": [],
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "schemaVersion": 2
+}

@@ -1,0 +1,42 @@
+{
+  "facts": {
+    "commit": "5555555555555555555555555555555555555555",
+    "path": "facts/facts.json",
+    "release_key": "1.6.0",
+    "sha256": "c4cbcff4e067a80515a05616a3d4dd4e672b4237d8d384250de2d5071b2070ee"
+  },
+  "hub_commit": "1111111111111111111111111111111111111111",
+  "image": {
+    "amd64_digest": "sha256:3aa71c425bca84cd53a021994221993fe6c1c2733b19ff1c34d45d422b117bcc",
+    "arm64_digest": "sha256:590911c332b965b31755a7f7959d196df947aadfca735be86f243a48edf7ba1a",
+    "digest": "sha256:cd06c078d3fc66f79d7b9815b1a68cdce51f0b0e68812466a051e436ed2ff3cc",
+    "repository": "ghcr.io/pineforge-4pass/pineforge-release"
+  },
+  "prerelease": false,
+  "release_version": "1.6.0",
+  "run_id": 123456,
+  "schema": "pineforge/release-ready/v1",
+  "versions": {
+    "codegen": {
+      "commit": "3333333333333333333333333333333333333333",
+      "npm_integrity": "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+      "npm_version": "1.6.0",
+      "pypi_version": "1.6.0",
+      "sdist_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "version": "1.6.0"
+    },
+    "engine": {
+      "commit": "2222222222222222222222222222222222222222",
+      "tag": "v1.6.0",
+      "version": "1.6.0"
+    },
+    "hpo": {
+      "commit": "4444444444444444444444444444444444444444",
+      "package_version": "1.6.0",
+      "sdist_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "tag": "v1.6.0",
+      "version": "1.6.0",
+      "wheel_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  }
+}

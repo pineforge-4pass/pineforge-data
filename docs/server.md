@@ -88,3 +88,18 @@ set an API key, enforce request-size and rate limits at the ingress, and do not
 expose it directly to the public internet. The container runs as UID 10001;
 deploy it with a read-only root filesystem, an executable `/tmp` tmpfs, dropped
 capabilities, `no-new-privileges`, and a writable cache volume.
+
+## Release provenance
+
+The server and local Docker runtime share the digest in
+`pineforge_data.DEFAULT_RELEASE_IMAGE`. Automated dependency PRs also pin the
+hub commit in the server Dockerfile. Local Docker responses report the image's
+OCI revision as `runtime.hub_commit`; server responses report the corresponding
+build pin. CI inspects the built server's inherited OCI labels and compares
+both real concurrent backtest responses with the same manifest. A configured
+image name alone cannot satisfy the release gate.
+
+This repository distributes the package and a locally runnable Dockerfile.
+There is no hosted server deployment or production database migration in the
+release adapter. See [Releasing](releasing.md) for CI, receipt and rollback
+behavior.

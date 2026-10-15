@@ -1,0 +1,13 @@
+{
+  "architecture": "amd64",
+  "config": {
+    "Labels": {
+      "io.pineforge.codegen.version": "1.6.0",
+      "io.pineforge.engine.version": "1.6.0",
+      "io.pineforge.hpo.version": "1.6.0",
+      "org.opencontainers.image.revision": "1111111111111111111111111111111111111111",
+      "org.opencontainers.image.version": "v1.6.0"
+    }
+  },
+  "os": "linux"
+}

@@ -7,9 +7,11 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   test:
+    name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -39,6 +41,7 @@ jobs:
         run: python -m twine check --strict dist/*
 
   docker:
+    name: Docker runtime
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -47,9 +50,14 @@ jobs:
           python-version: "3.13"
           cache: pip
       - run: python -m pip install -e '.[dev]'
-      - run: PINEFORGE_DOCKER_TEST=1 pytest tests/test_docker_integration.py
+      - run: PINEFORGE_DOCKER_TEST=1 pytest tests/test_docker_integration.py --junitxml=docker.xml
+      - name: Require every real runtime test with zero skips
+        env:
+          PYTHONPATH: scripts
+        run: python -m release_chain.evidence junit --suite docker --path docker.xml
 
   database-e2e:
+    name: Database E2E
     runs-on: ubuntu-latest
     services:
       mysql:
@@ -94,4 +102,105 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e '.[dev,database-e2e]'
-      - run: pytest tests/test_database_e2e.py
+      - run: pytest tests/test_database_e2e.py --junitxml=database.xml
+      - name: Require the disposable database E2E inventory with zero skips
+        env:
+          PYTHONPATH: scripts
+        run: python -m release_chain.evidence junit --suite database --path database.xml
+
+  contract:
+    name: Release contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Verify synchronized defaults, immutable manifest, source, facts and both OCI children
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/release_adapter.py local
+
+  distribution:
+    name: Distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+          cache: pip
+      - run: python -m pip install -e '.[release]'
+      - name: Set reproducible archive timestamps
+        run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+      - run: python -m build
+      - run: python -m twine check --strict dist/*
+      - name: The canonical sdist does not ship the native feed
+        run: |
+          if tar -tzf dist/*.tar.gz | grep -E '^[^/]+/native/'; then
+            echo "native/ must stay out of the Python sdist" >&2
+            exit 1
+          fi
+      - name: Install and backtest both built distributions without importing checkout source
+        env:
+          PYTHONPATH: scripts
+        run: |
+          set -euo pipefail
+          version="$(python scripts/bump_version.py current)"
+          image="$(python -c 'from pathlib import Path; from release_chain.contract import runtime_pin; print(runtime_pin(Path.cwd()))')"
+          for artifact in "$GITHUB_WORKSPACE"/dist/*; do
+            case "$artifact" in
+              *.whl) kind=wheel ;;
+              *.tar.gz) kind=sdist ;;
+              *) exit 1 ;;
+            esac
+            environment="$RUNNER_TEMP/distribution-$kind"
+            python -m venv "$environment"
+            "$environment/bin/python" -m pip install "$artifact"
+            "$environment/bin/python" -I scripts/exercise_distribution.py \
+              --version "$version" --image "$image" --source "$GITHUB_WORKSPACE/src" \
+              --fixtures "$GITHUB_WORKSPACE/tests/fixtures" \
+              --output "$RUNNER_TEMP/exercise-$kind.json"
+          done
+      - uses: actions/upload-artifact@v5
+        with:
+          name: distribution-runtime-evidence-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/exercise-*.json
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v5
+        with:
+          name: python-package-distributions-${{ github.run_attempt }}
+          path: dist/
+          if-no-files-found: error
+
+  ready:
+    name: release/ready
+    if: always()
+    needs: [test, contract, docker, database-e2e, distribution]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v6
+        with:
+          name: python-package-distributions-${{ github.run_attempt }}
+          path: dist/
+      - name: Require the complete job inventory and bind evidence to this head/base/tree
+        env:
+          PYTHONPATH: scripts
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          GH_TOKEN: ${{ github.token }}
+        run: python -m release_chain.evidence aggregate --path dist
+      - uses: actions/upload-artifact@v5
+        with:
+          name: release-evidence-${{ github.run_attempt }}
+          path: evidence.json
+          if-no-files-found: error

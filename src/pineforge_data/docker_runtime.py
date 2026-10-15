@@ -17,6 +17,7 @@ from .models import Bar, Instrument
 from .release_contract import (
     DEFAULT_RELEASE_IMAGE,
     ReleaseContractError,
+    normalize_release_version,
     parse_release_report,
     release_environment,
     release_response,
@@ -115,9 +116,12 @@ class DockerBacktestRuntime:
             return {}
         return {
             "resolved_digest": str(digests[0]) if digests else None,
-            "release_version": labels.get("org.opencontainers.image.version"),
+            "release_version": normalize_release_version(
+                labels.get("org.opencontainers.image.version")
+            ),
             "engine_version": labels.get("io.pineforge.engine.version"),
             "codegen_version": labels.get("io.pineforge.codegen.version"),
+            "hub_commit": labels.get("org.opencontainers.image.revision"),
         }
 
     def ensure_image(self) -> str:
@@ -215,6 +219,7 @@ class DockerBacktestRuntime:
             raise DockerExecutionError(f"{phase} failed: {_completed_error(completed)}")
         try:
             report = parse_release_report(completed.stdout)
+            runtime_metadata = self._image_identity()
         except ReleaseContractError as exc:
             raise DockerExecutionError(str(exc)) from exc
         return release_response(
@@ -222,5 +227,5 @@ class DockerBacktestRuntime:
             release_image=image,
             mode="local-container",
             request_id=None,
-            runtime_metadata=self._image_identity(),
+            runtime_metadata=runtime_metadata,
         )

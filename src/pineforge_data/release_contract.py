@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from collections.abc import Mapping, Sequence
 from itertools import pairwise
 from pathlib import Path
@@ -17,10 +18,26 @@ DEFAULT_RELEASE_IMAGE = (
 )
 RELEASE_ENTRYPOINT = "/opt/pineforge/bin/entrypoint.sh"
 RESPONSE_SCHEMA_VERSION = 1
+_RELEASE_VERSION = re.compile(
+    r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+    r"(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+)
 
 
 class ReleaseContractError(ValueError):
     """A request or release-image response violates the integration contract."""
+
+
+def normalize_release_version(value: object) -> str:
+    """Validate observed release provenance and remove at most one leading `v`."""
+
+    if isinstance(value, str):
+        version = value.removeprefix("v")
+        if _RELEASE_VERSION.fullmatch(version):
+            return version
+    raise ReleaseContractError(f"invalid release semantic version: {value!r}")
 
 
 def _validate_request(pine_source: str, bars: Sequence[Bar]) -> None:
@@ -88,7 +105,7 @@ def release_environment(
     """Translate PineForge options into the release entrypoint environment."""
 
     if options.trace_enabled:
-        raise ReleaseContractError("pineforge-release 1.0.0 does not expose trace collection")
+        raise ReleaseContractError("the release adapter does not expose trace collection")
     if options.bar_magnifier and options.magnifier_samples < 2:
         raise ReleaseContractError("bar magnifier requires at least two samples")
     environment = {

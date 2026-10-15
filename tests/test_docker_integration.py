@@ -13,6 +13,7 @@ from urllib.request import urlopen
 import pytest
 
 from pineforge_data import (
+    DEFAULT_RELEASE_IMAGE,
     BacktestOptions,
     Bar,
     DockerBacktestRuntime,
@@ -28,6 +29,23 @@ pytestmark = pytest.mark.skipif(
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def assert_release_identity(runtime: dict[str, Any], *, server: bool = False) -> None:
+    """Compare observed runtime provenance, not just the configured image name."""
+    assert runtime["release_image"] == DEFAULT_RELEASE_IMAGE
+    version = DEFAULT_RELEASE_IMAGE.split(":")[-2].split("@", 1)[0]
+    assert runtime["release_version"] == version
+    assert runtime["engine_version"] == runtime["codegen_version"] == version
+    lock_path = ROOT / "src/pineforge_data/release_lock.json"
+    if lock_path.exists():
+        event = json.loads(lock_path.read_text())["event"]
+        assert runtime["hub_commit"] == event["hub_commit"]
+        if not server:
+            assert runtime["resolved_digest"] in {
+                f"{event['image']['repository']}@{event['image'][key]}"
+                for key in ("digest", "amd64_digest", "arm64_digest")
+            }
 
 
 def fixture_values(
@@ -66,8 +84,7 @@ def test_local_runtime_uses_published_release_image() -> None:
     backtest = cast(dict[str, object], result["backtest"])
     summary = cast(dict[str, object], backtest["summary"])
     assert runtime["mode"] == "local-container"
-    assert "pineforge-release:1.0.0@sha256:" in cast(str, runtime["release_image"])
-    assert (runtime["engine_version"], runtime["codegen_version"]) == ("1.0.0", "1.0.0")
+    assert_release_identity(runtime)
     assert summary["bars_processed"] == len(bars)
 
 
@@ -222,6 +239,13 @@ def test_server_handles_concurrent_requests_and_reuses_compile_cache() -> None:
         check=False,
     )
     assert build.returncode == 0, f"server image build failed:\n{build.stdout}\n{build.stderr}"
+    inspected = json.loads(subprocess.check_output(["docker", "image", "inspect", image]))[0]
+    labels = inspected["Config"]["Labels"]
+    lock_path = ROOT / "src/pineforge_data/release_lock.json"
+    if lock_path.exists():
+        event = json.loads(lock_path.read_text())["event"]
+        assert labels["org.opencontainers.image.revision"] == event["hub_commit"]
+        assert labels["org.opencontainers.image.version"] == event["release_version"]
     container = subprocess.run(
         [
             "docker",
@@ -259,6 +283,12 @@ def test_server_handles_concurrent_requests_and_reuses_compile_cache() -> None:
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             first, second = executor.map(lambda _index: submit(), range(2))
+
+        for result in (first, second):
+            assert_release_identity(cast(dict[str, Any], result["runtime"]), server=True)
+            assert cast(dict[str, Any], result["backtest"])["summary"]["bars_processed"] == len(
+                bars
+            )
 
         cache_results = [
             cast(dict[str, object], cast(dict[str, object], result["runtime"])["compile_cache"])

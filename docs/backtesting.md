@@ -132,8 +132,11 @@ guides.
 
 ## Runtime image policy
 
-The package default is an exact `pineforge-release` version and OCI digest:
-1.0.0, which bundles engine 1.0.0 and codegen 1.0.0. The `missing` pull
+The package default is the exact release and OCI digest exported as
+`pineforge_data.DEFAULT_RELEASE_IMAGE`. The server Dockerfile carries the same
+pin. Release updates commit the verified hub manifest and dependency lock next
+to the package, increment the independently versioned data package, and pass
+the [release gates](releasing.md) before publication. The `missing` pull
 policy downloads it only when absent; `never` supports offline runs; `always`
 refreshes a tag before running.
 

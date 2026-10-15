@@ -100,8 +100,10 @@ pineforge-backtest \
   --pretty
 ```
 
-The first run pulls the digest-pinned `pineforge-release` 1.0.0 image (engine
-1.0.0, codegen 1.0.0). Results can differ between releases, notably for scripts
+The first run pulls the exact release and digest in `DEFAULT_RELEASE_IMAGE`.
+The runtime and server defaults advance together through a tested release PR;
+the [release guide](docs/releasing.md) describes the automated gates.
+Results can differ between releases, notably for scripts
 that omit their capital or order size; the
 [runtime image policy](https://pineforge-4pass.github.io/pineforge-data/backtesting/#runtime-image-policy)
 explains why and how to pin another release with `--runtime-image`.

@@ -1,0 +1,66 @@
+name: PineForge release adapter
+
+on:
+  repository_dispatch:
+    types: [pineforge-release]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  schedule:
+    - cron: '9,24,39,54 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: data-release-adapter
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@v2
+        id: app
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-actions: write
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Verify ready event, reconcile update PR and respect release gates
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          RELEASE_BOT_LOGIN: ${{ steps.app.outputs.app-slug }}[bot]
+        run: python scripts/release_adapter.py reconcile --receipt "$RUNNER_TEMP/receipt.json"
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: release-receipt-${{ github.run_attempt }}-10-adapter
+          path: ${{ runner.temp }}/receipt.json
+          if-no-files-found: warn
+
+  report:
+    if: always() && needs.reconcile.result != 'skipped'
+    needs: reconcile
+    uses: ./.github/workflows/release-report.yml
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    with:
+      failed: ${{ needs.reconcile.result != 'success' }}
+      stage: reconcile
+    secrets: inherit

@@ -9,6 +9,7 @@ RUN python -m pip install --no-cache-dir --target /opt/pineforge-server-deps \
 
 FROM ${PINEFORGE_RELEASE_IMAGE}
 ARG PINEFORGE_RELEASE_IMAGE
+ARG PINEFORGE_HUB_COMMIT=unknown
 
 USER root
 COPY --from=server-builder /opt/pineforge-server-deps /opt/pineforge-server-deps
@@ -18,6 +19,7 @@ RUN mkdir -p /cache \
 
 ENV PYTHONPATH=/opt/pineforge-server:/opt/pineforge-server-deps:/opt/pineforge/pycodegen \
     PINEFORGE_RELEASE_IMAGE=${PINEFORGE_RELEASE_IMAGE} \
+    PINEFORGE_HUB_COMMIT=${PINEFORGE_HUB_COMMIT} \
     PINEFORGE_RELEASE_ENTRYPOINT=/opt/pineforge/bin/entrypoint.sh \
     PINEFORGE_RELEASE_RUN_JSON=/opt/pineforge/bin/run_json.py \
     PINEFORGE_SERVER_CACHE_DIR=/cache \

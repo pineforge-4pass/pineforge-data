@@ -215,7 +215,7 @@ def _next_offset(payload: Mapping[str, object], current: int, returned: int) -> 
         raise FxMacroDataDataError("response.pagination must be an object")
     if pagination.get("has_more") is not True:
         return None
-    next_offset = pagination.get("next_offset", current + returned)
+    next_offset: object = pagination.get("next_offset", current + returned)
     if isinstance(next_offset, bool) or not isinstance(next_offset, int) or next_offset <= current:
         raise FxMacroDataDataError("response.pagination.next_offset must advance the cursor")
     return next_offset

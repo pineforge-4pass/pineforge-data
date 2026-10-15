@@ -1,0 +1,47 @@
+{
+  "event_id": "sha256:e3371df844ffab39a748cf332e673b415d4c9f8e9a2a92445bf05b4d56170375",
+  "facts": {
+    "commit": "5555555555555555555555555555555555555555",
+    "path": "facts/facts.json",
+    "release_key": "1.6.0",
+    "sha256": "c4cbcff4e067a80515a05616a3d4dd4e672b4237d8d384250de2d5071b2070ee"
+  },
+  "hub_commit": "1111111111111111111111111111111111111111",
+  "image": {
+    "amd64_digest": "sha256:857833a7792c6c3f135e177d3f85ab4f54f1c307677b2e29e989f56f94767fdb",
+    "arm64_digest": "sha256:6491250e5029b0b306560766d5ff691f330bea85bbb8b3303b42e58e3b5858d8",
+    "digest": "sha256:6da1f64f905716b404737abd4a4abdb8128ff4684dd509acd149b1df65e2a4d5",
+    "repository": "ghcr.io/pineforge-4pass/pineforge-release"
+  },
+  "manifest": {
+    "asset": "release-manifest.json",
+    "sha256": "e3371df844ffab39a748cf332e673b415d4c9f8e9a2a92445bf05b4d56170375"
+  },
+  "prerelease": false,
+  "release_version": "1.6.0",
+  "run_id": 123456,
+  "schema": "pineforge/release-ready/v1",
+  "versions": {
+    "codegen": {
+      "commit": "3333333333333333333333333333333333333333",
+      "npm_integrity": "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+      "npm_version": "1.6.0",
+      "pypi_version": "1.6.0",
+      "sdist_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "version": "1.6.0"
+    },
+    "engine": {
+      "commit": "2222222222222222222222222222222222222222",
+      "tag": "v1.6.0",
+      "version": "1.6.0"
+    },
+    "hpo": {
+      "commit": "4444444444444444444444444444444444444444",
+      "package_version": "1.6.0",
+      "sdist_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "tag": "v1.6.0",
+      "version": "1.6.0",
+      "wheel_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  }
+}

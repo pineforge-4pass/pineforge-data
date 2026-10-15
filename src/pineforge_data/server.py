@@ -548,6 +548,7 @@ class BacktestService:
                     "release_version": os.environ.get("PINEFORGE_RELEASE_VERSION", "unknown"),
                     "engine_version": os.environ.get("PINEFORGE_ENGINE_VERSION", "unknown"),
                     "codegen_version": os.environ.get("PINEFORGE_CODEGEN_VERSION", "unknown"),
+                    "hub_commit": os.environ.get("PINEFORGE_HUB_COMMIT", "unknown"),
                     "compile_cache": {
                         "key": cache_key,
                         "hit": cache_hit,

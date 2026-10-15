@@ -118,6 +118,7 @@ class DockerBacktestRuntime:
             "release_version": labels.get("org.opencontainers.image.version"),
             "engine_version": labels.get("io.pineforge.engine.version"),
             "codegen_version": labels.get("io.pineforge.codegen.version"),
+            "hub_commit": labels.get("org.opencontainers.image.revision"),
         }
 
     def ensure_image(self) -> str:

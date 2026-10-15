@@ -1,0 +1,20 @@
+{
+  "manifests": [
+    {
+      "digest": "sha256:857833a7792c6c3f135e177d3f85ab4f54f1c307677b2e29e989f56f94767fdb",
+      "platform": {
+        "architecture": "amd64",
+        "os": "linux"
+      }
+    },
+    {
+      "digest": "sha256:6491250e5029b0b306560766d5ff691f330bea85bbb8b3303b42e58e3b5858d8",
+      "platform": {
+        "architecture": "arm64",
+        "os": "linux"
+      }
+    }
+  ],
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "schemaVersion": 2
+}

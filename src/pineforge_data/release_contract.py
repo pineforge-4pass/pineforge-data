@@ -88,7 +88,7 @@ def release_environment(
     """Translate PineForge options into the release entrypoint environment."""
 
     if options.trace_enabled:
-        raise ReleaseContractError("pineforge-release 1.0.0 does not expose trace collection")
+        raise ReleaseContractError("the release adapter does not expose trace collection")
     if options.bar_magnifier and options.magnifier_samples < 2:
         raise ReleaseContractError("bar magnifier requires at least two samples")
     environment = {

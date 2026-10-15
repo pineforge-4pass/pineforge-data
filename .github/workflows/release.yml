@@ -4,228 +4,283 @@ on:
   workflow_dispatch:
     inputs:
       bump:
-        description: Semantic version component to increment
+        description: Semantic version component for an App-created, CI-gated package PR
         required: true
         default: patch
         type: choice
-        options:
-          - patch
-          - minor
-          - major
+        options: [patch, minor, major]
+      ci_run:
+        description: Optional successful landed main CI run ID to replay publication without a bump
+        required: false
+        type: string
+      rollback_package:
+        description: Optional previously verified data package; opens a tested forward patch rollback PR
+        required: false
+        type: string
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: release
   cancel-in-progress: false
 
+env:
+  PYTHONPATH: scripts
+
 jobs:
-  prepare:
+  manual-pr:
+    if: github.event_name == 'workflow_dispatch' && inputs.ci_run == ''
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      issues: write
-      pull-requests: write
+    concurrency:
+      group: data-release-adapter
+      cancel-in-progress: false
+    steps:
+      - uses: actions/create-github-app-token@v2
+        id: app
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-actions: read
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Create or reuse a version PR; merge only after its own CI and E2E
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          RELEASE_BOT_LOGIN: ${{ steps.app.outputs.app-slug }}[bot]
+          BUMP: ${{ inputs.bump }}
+          ROLLBACK_PACKAGE: ${{ inputs.rollback_package }}
+        run: |
+          test "$GITHUB_REF_NAME" = main
+          if [ -n "$ROLLBACK_PACKAGE" ]; then
+            python scripts/release_adapter.py rollback --package "$ROLLBACK_PACKAGE" --receipt "$RUNNER_TEMP/receipt.json"
+          else
+            python scripts/release_adapter.py manual --bump "$BUMP" --receipt "$RUNNER_TEMP/receipt.json"
+          fi
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: release-receipt-${{ github.run_attempt }}-10-manual
+          path: ${{ runner.temp }}/receipt.json
+          if-no-files-found: warn
+
+  prepare:
+    if: >-
+      (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'push') ||
+      (github.event_name == 'workflow_dispatch' && inputs.ci_run != '')
+    runs-on: ubuntu-latest
     outputs:
+      eligible: ${{ steps.release.outputs.eligible }}
       published: ${{ steps.release.outputs.published }}
       sha: ${{ steps.release.outputs.sha }}
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
     steps:
+      - uses: actions/create-github-app-token@v2
+        id: app
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: read
+          permission-pull-requests: read
+          permission-actions: read
       - uses: actions/checkout@v7
         with:
+          ref: main
           fetch-depth: 0
-          ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.13"
-      - name: Create and merge version bump
+          python-version: '3.13'
+      - name: Require the landed PR, complete CI inventory and exact tested distributions
         id: release
         env:
-          BUMP: ${{ inputs.bump }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          RELEASE_BOT_LOGIN: ${{ steps.app.outputs.app-slug }}[bot]
+          CI_RUN: ${{ inputs.ci_run || github.event.workflow_run.id }}
         run: |
-          set -euo pipefail
-          if [[ "$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ]]; then
-            echo "Release must be dispatched from $DEFAULT_BRANCH, not $GITHUB_REF_NAME" >&2
-            exit 1
-          fi
-
-          current_version="$(python scripts/bump_version.py current)"
-          version="$(python scripts/bump_version.py "$BUMP")"
-          tag="v$version"
-          git fetch origin "$DEFAULT_BRANCH" --tags
-
-          if sha="$(git rev-list -n 1 "$tag" 2>/dev/null)" && [[ -n "$sha" ]]; then
-            echo "Reusing existing tag $tag at $sha"
-          else
-            git show "origin/$DEFAULT_BRANCH:pyproject.toml" > "$RUNNER_TEMP/main-pyproject.toml"
-            main_version="$(python scripts/bump_version.py current --pyproject "$RUNNER_TEMP/main-pyproject.toml")"
-            if [[ "$main_version" == "$version" ]]; then
-              sha="$(git rev-parse "origin/$DEFAULT_BRANCH")"
-              echo "Reusing version bump already merged at $sha"
-            elif [[ "$main_version" != "$current_version" ]]; then
-              echo "main moved from version $current_version to $main_version; dispatch again" >&2
-              exit 1
-            else
-              branch="release/$tag-$GITHUB_RUN_ID"
-              git switch --create "$branch" "origin/$DEFAULT_BRANCH"
-              written_version="$(python scripts/bump_version.py "$BUMP" --write)"
-              [[ "$written_version" == "$version" ]]
-              git config user.name "github-actions[bot]"
-              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-              git add pyproject.toml
-              git commit -m "Release $tag"
-              head_sha="$(git rev-parse HEAD)"
-              git push --set-upstream origin "$branch"
-
-              gh label create skip-changelog \
-                --description "Exclude this PR from generated release notes" \
-                --color "ededed" \
-                --force
-              pr_url="$(gh pr create \
-                --base "$DEFAULT_BRANCH" \
-                --head "$branch" \
-                --title "Release $tag" \
-                --body "Automated **$BUMP** version bump from $current_version to $version.")"
-              pr_number="${pr_url##*/}"
-              gh pr edit "$pr_number" --add-label skip-changelog
-              mergeable=UNKNOWN
-              for _attempt in {1..30}; do
-                mergeable="$(gh pr view "$pr_number" --json mergeable --jq ".mergeable")"
-                [[ "$mergeable" == "MERGEABLE" ]] && break
-                if [[ "$mergeable" == "CONFLICTING" ]]; then
-                  echo "Release PR $pr_number conflicts with $DEFAULT_BRANCH" >&2
-                  exit 1
-                fi
-                sleep 2
-              done
-              if [[ "$mergeable" != "MERGEABLE" ]]; then
-                echo "Release PR $pr_number did not become mergeable" >&2
-                exit 1
-              fi
-              gh pr merge "$pr_number" \
-                --squash \
-                --delete-branch \
-                --match-head-commit "$head_sha" \
-                --subject "Release $tag" \
-                --body "Automated semantic version bump."
-              sha="$(gh pr view "$pr_number" --json mergeCommit --jq ".mergeCommit.oid")"
-            fi
-          fi
-
-          pypi_status="$(curl \
-            --silent \
-            --output /dev/null \
-            --write-out '%{http_code}' \
-            --retry 3 \
-            --retry-all-errors \
-            "https://pypi.org/pypi/pineforge-data/$version/json")"
-          case "$pypi_status" in
-            200) published=true ;;
-            404) published=false ;;
-            *)
-              echo "Unexpected PyPI status $pypi_status while checking $version" >&2
-              exit 1
-              ;;
-          esac
-
-          {
-            echo "published=$published"
-            echo "sha=$sha"
-            echo "tag=$tag"
-            echo "version=$version"
-          } >> "$GITHUB_OUTPUT"
-          printf "Prepared %s at %s (already on PyPI: %s).\n" \
-            "$tag" "$sha" "$published" >> "$GITHUB_STEP_SUMMARY"
+          python -m release_chain.publishing prepare --run "$CI_RUN" \
+            --directory "$RUNNER_TEMP/bundle" --receipt "$RUNNER_TEMP/receipt.json"
+      - uses: actions/upload-artifact@v5
+        if: steps.release.outputs.eligible == 'true'
+        with:
+          name: validated-release-bundle-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bundle/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: release-receipt-${{ github.run_attempt }}-20-prepare
+          path: ${{ runner.temp }}/receipt.json
+          if-no-files-found: warn
 
   build:
-    if: needs.prepare.outputs.published != 'true'
+    if: needs.prepare.outputs.eligible == 'true'
     needs: prepare
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.prepare.outputs.sha }}
+          ref: main
           persist-credentials: false
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.13"
-          cache: pip
-      - run: python -m pip install --upgrade pip
-      - run: python -m pip install -e '.[dev,ccxt,release]'
-      - name: Verify release tag and source
-        run: python scripts/verify_release.py "${{ needs.prepare.outputs.tag }}"
-      - name: Run static and unit checks
-        run: |
-          ruff check .
-          mypy src
-          pytest
-      - name: Run Docker integration checks
-        run: PINEFORGE_DOCKER_TEST=1 pytest tests/test_docker_integration.py
-      - name: Build wheel and source distribution
-        run: python -m build
-      - name: Check distribution metadata
-        run: python -m twine check --strict dist/*
-      - name: Install wheel in a clean environment
-        run: |
-          python -m venv /tmp/pineforge-wheel
-          /tmp/pineforge-wheel/bin/python -m pip install dist/*.whl
-          /tmp/pineforge-wheel/bin/python -c "import pineforge_data; assert 'Bar' in pineforge_data.__all__"
-      - name: Upload validated distributions
+          python-version: '3.13'
+      - uses: actions/download-artifact@v6
+        with:
+          name: validated-release-bundle-${{ github.run_attempt }}
+          path: bundle/
+      - name: Verify release tag and source version
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: python scripts/verify_release.py "$TAG" --pyproject bundle/source/pyproject.toml
+      - name: Preserve the exact already-built and exercised CI distributions
         uses: actions/upload-artifact@v5
         with:
-          name: python-package-distributions
-          path: dist/
+          name: python-package-distributions-${{ github.run_attempt }}
+          path: bundle/dist/
           if-no-files-found: error
 
   github-release:
-    if: needs.prepare.outputs.published != 'true'
-    needs:
-      - prepare
-      - build
+    needs: [prepare, build]
+    if: needs.prepare.outputs.eligible == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: read
     steps:
-      - name: Create GitHub Release with generated notes
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v6
+        with:
+          name: validated-release-bundle-${{ github.run_attempt }}
+          path: bundle/
+      - uses: actions/download-artifact@v6
+        with:
+          name: release-receipt-${{ github.run_attempt }}-20-prepare
+          path: report/
+      - name: Retain immutable tag and distribution assets with generated notes
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          SHA: ${{ needs.prepare.outputs.sha }}
-          TAG: ${{ needs.prepare.outputs.tag }}
-        run: |
-          set -euo pipefail
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "GitHub Release $TAG already exists"
-          else
-            gh release create "$TAG" \
-              --target "$SHA" \
-              --title "pineforge-data $TAG" \
-              --generate-notes \
-              --latest
-          fi
+        run: python -m release_chain.publishing github-release --directory bundle --receipt report/receipt.json
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: release-receipt-${{ github.run_attempt }}-30-github
+          path: report/receipt.json
+          if-no-files-found: warn
 
   publish:
-    if: needs.prepare.outputs.published != 'true'
-    needs:
-      - prepare
-      - build
-      - github-release
+    if: needs.prepare.outputs.eligible == 'true' && needs.prepare.outputs.published != 'true'
+    needs: [prepare, build, github-release]
     runs-on: ubuntu-latest
     environment:
       name: pypi
       url: https://pypi.org/project/pineforge-data/
     permissions:
+      contents: read
+      actions: read
       id-token: write
     steps:
-      - name: Download validated distributions
-        uses: actions/download-artifact@v6
+      - uses: actions/checkout@v7
         with:
-          name: python-package-distributions
-          path: dist/
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v6
+        with:
+          name: validated-release-bundle-${{ github.run_attempt }}
+          path: bundle/
+      - uses: actions/download-artifact@v6
+        with:
+          name: release-receipt-${{ github.run_attempt }}-30-github
+          path: report/
+      - name: Recheck desired identity and tested bytes immediately before OIDC publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python -m release_chain.publishing preflight --directory bundle --receipt report/receipt.json
       - name: Publish to PyPI with Trusted Publishing
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: bundle/dist/
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: release-receipt-${{ github.run_attempt }}-40-publish
+          path: report/receipt.json
+          if-no-files-found: warn
+
+  verify:
+    if: >-
+      always() && needs.prepare.outputs.eligible == 'true' &&
+      needs.github-release.result == 'success' &&
+      (needs.publish.result == 'success' || needs.prepare.outputs.published == 'true')
+    needs: [prepare, github-release, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v6
+        with:
+          name: validated-release-bundle-${{ github.run_attempt }}
+          path: bundle/
+      - uses: actions/download-artifact@v6
+        with:
+          name: release-receipt-${{ github.run_attempt }}-30-github
+          path: report/
+      - name: Verify PyPI inventory and downloaded bytes before reporting success
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python -m release_chain.publishing verify --directory bundle --receipt report/receipt.json
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: release-receipt-${{ github.run_attempt }}-50-verify
+          path: report/receipt.json
+          if-no-files-found: warn
+
+  report:
+    if: always()
+    needs: [manual-pr, prepare, build, github-release, publish, verify]
+    uses: ./.github/workflows/release-report.yml
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    with:
+      failed: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+      stage: ${{ needs.publish.result == 'failure' && 'pypi-upload' || needs.verify.result == 'failure' && 'verify-publication' || needs.github-release.result == 'failure' && 'github-release' || needs.build.result == 'failure' && 'distribution-transfer' || needs.prepare.result == 'failure' && 'prepare-publication' || needs.manual-pr.result == 'failure' && 'prepare-pr' || 'publication' }}
+    secrets: inherit

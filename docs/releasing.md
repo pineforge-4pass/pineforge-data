@@ -99,20 +99,93 @@ tested distribution inventory. Only then is the GitHub latest pointer moved
 and a `verified` receipt recorded. Publication does not claim that users have
 installed the new package or that a hosted data server was deployed.
 
-Receipts contain event/manifest identity, neutral role `data`, PR/base/head/merge
-identities, CI attempt, expected jobs and results, named E2E inventory and
-approved unit-matrix skips, local Docker candidate evidence, actual published
-source/package/image/facts identity, previous identity, state and completion
-time. Artifacts are named per run attempt, so retries preserve earlier evidence.
-A verified `consumer-receipt.json` is retained as a GitHub Release asset.
+The only receipt format is the hub's **Consumer receipt contract v1**,
+`pineforge/consumer-receipt/v1`. The trusted `pineforge-release.yml` coordinator
+runs checked-out `main` tooling. Its `report` job calls `release-report.yml`'s
+`report` job, which uploads exactly **`release-receipt-data`** containing one root
+file **`release-receipt.json`**. Sorted, compact JSON with a final LF is used.
+Reruns replace that run's one live artifact and advance `sequence` using the
+Actions run attempt. `attempt` is the reporting Actions run ID. Stage artifacts
+named `release-stage-<run_attempt>-<stage>` use the same receipt contract; they
+are private inputs, never separate hub-facing formats. Target-less operations
+produce no receipt; ordinary manual package publication still uses the existing
+landed CI evidence and gates, without requiring a product receipt artifact. CI/PR-head code never builds the hub artifact.
 
-The configured owner receives one reused GitHub incident per event, with run
-and PR links and recovery updates. Detailed errors remain in the consumer
-issue. A separately minted hub-scoped App token dispatches the neutral receipt
-using `RELEASE_RECEIPT_EVENT_TYPE`. The audit specifies receipt fields but does
-not name that callback event; the supervisor must set the variable to the hub
-lane's implemented receiver. It cannot reuse `pineforge-release` or
-`facts-update`. Callback/authentication failures fail and alert locally.
+CI and E2E both reference the complete successful **pre-merge** `ci.yml` run,
+including `release/ready`. The landed main CI still authorizes the exact
+wheel/sdist bytes used by the existing publisher. Preview records the candidate
+head/image/facts and a SHA-256 of its tested distribution identity. After the
+`Release` run finishes, the coordinator rechecks the actual PR, tested base and
+merge first parent, pre-merge checks, landed CI evidence, publication jobs,
+served PyPI bytes, matching GitHub assets and previous/rollback identity. Only
+then can it emit `verified`, with a timestamp after the completed deploy checks.
+The deploy inventory is `prepare`, `build`, `github-release`, `publish`, `verify`;
+only `publish` may skip when the exact distributions are already on PyPI.
+
+The deploy and reporting Actions runs must both have the recorded merge SHA.
+If a `workflow_run` starts after unrelated main changes, the coordinator repairs
+that mismatch using the immutable, verified data-package tag `v<package_version>`:
+first replay `Release` with the original landed `ci_run` if needed (matching
+PyPI bytes skip upload), then replay `pineforge-release.yml` with
+`publication_run`. Tooling is still checked out from trusted `main`; source and
+artifacts are read as data. The mismatched run emits no invalid snapshot.
+
+Receipts contain only contract fields: numeric PR/run IDs, public check names,
+commit/image/facts identities and SHA-256 deployment identities. Package file
+inventories, raw distribution identifiers, URLs, secrets and diagnostics never
+enter a receipt. `deployment_id_sha256` hashes compact canonical JSON containing
+`package: "pineforge-data"`, the data package `version`, and the verified
+`distributions` filename-to-SHA-256 map. The same contract is retained as the
+immutable GitHub Release asset `release-receipt.json`, after artifact upload.
+Rollback/replay checks recompute that identity from actual PyPI downloads,
+matching GitHub distribution assets and the unchanged package tag/source.
+
+A previous publication must have verifiable tagged-source manifest/facts
+provenance, wheel and sdist bytes and matching immutable GitHub assets. A package
+from before manifest adoption cannot supply the contract's previous facts
+identity. Establish a manifest-based baseline before enabling the `data` role;
+missing previous provenance fails before automatic publication. The adapter
+never fills in synthetic commits/hashes or treats unknown rollback state as
+verified. Automatic rollback still requires a stored **verified** receipt.
+
+The configured owner receives one reused GitHub incident per event, with private
+run and PR links. Full diagnostics stay in the consumer's Actions log. After
+successful artifact upload, a separate hub-only App token POSTs
+`repos/pineforge-4pass/pineforge-release/dispatches` with exactly:
+
+```json
+{
+  "event_type": "pineforge-release-status",
+  "client_payload": {
+    "schema": "pineforge/consumer-signal/v1",
+    "consumer": "data",
+    "release_version": "1.6.0",
+    "run_id": 300
+  }
+}
+```
+
+`run_id` identifies the coordinator run containing the artifact, never the CI
+or publication run. The event type is fixed by the hub; no configurable legacy
+callback format remains. Upload failure prevents callback. Callback failures
+alert locally; hub polling can still collect the immutable artifact. Reporting
+errors write a separate local incident snapshot without replacing a previously
+uploaded completion snapshot. A previously verified target never emits a later
+failed/superseded/progress receipt; local incidents still record those errors.
+
+The required hub `RELEASE_RECEIPT_POLICY.data` entry is checked into
+[`receipt-policy.json`](../tests/fixtures/release_chain/receipt-policy.json).
+Both CI and E2E inventories include Python 3.11/3.12/3.13, Release contract,
+Docker runtime, Database E2E, Distribution and release/ready, with zero approved
+skips. The reporting workflow is `pineforge-release.yml`, artifact
+`release-receipt-data`, base `main`; deploy uses `release.yml` and the inventory
+above. A complete synthetic verified receipt is in
+[`sample-release-receipt.json`](../tests/fixtures/release_chain/sample-release-receipt.json).
+`tests/test_consumer_receipt.py` builds it through the real coordinator builder
+and validates it with the hub's field, GitHub-check, identity, artifact and
+signal checks vendored in `tests/hub_receipt_validator.py`. The sibling hub repo
+is unavailable in standalone CI, so the snapshot records its source hash. These
+unit tests run in CI only, together with the existing suites.
 
 The 15-minute reconciler repairs dropped ready events and missing publication
 transitions, reuses verified receipts without republishing, and refuses to
@@ -152,7 +225,6 @@ Create or expose these names to this repository; never put their values in code:
 | `RELEASE_APP_ID` | Repository variable (or selected org variable) | Existing GitHub App identifier |
 | `RELEASE_APP_PRIVATE_KEY` | Repository secret (or selected org secret) | Mint short-lived, single-target installation tokens |
 | `RELEASE_ALERT_OWNER` | Repository variable | Assignable GitHub login for incident/failure and verified-publication notices |
-| `RELEASE_RECEIPT_EVENT_TYPE` | Repository variable | Exact completion callback event implemented by the hub lane |
 
 Install the App on this consumer and the hub. Its consumer permissions need
 Contents write, Pull requests write and Actions write; the reconciliation token
@@ -185,6 +257,6 @@ changed by this code. Retain the existing GitHub Pages **Source: GitHub Actions*
 setting and documentation/native-feed workflows.
 
 The hub lane must publish the immutable manifest and matching image/facts
-identities, include data in fan-out/receipt monitoring, and align the callback
-name/receipt schema before live acceptance. Hub readiness owns upstream package
+identities, include data in fan-out/receipt monitoring, and configure the exact
+`RELEASE_RECEIPT_POLICY.data` entry before live acceptance. Hub readiness owns upstream package
 artifact availability. There is no hosted data deployment target to configure.

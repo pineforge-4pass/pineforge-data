@@ -1,5 +1,5 @@
 {
-  "event_id": "sha256:e3371df844ffab39a748cf332e673b415d4c9f8e9a2a92445bf05b4d56170375",
+  "event_id": "sha256:8b23d0dd906cd9e5fc8f9750f486b9ca141466d4abdb021f7ba2ebdcf2e3cf11",
   "facts": {
     "commit": "5555555555555555555555555555555555555555",
     "path": "facts/facts.json",
@@ -8,14 +8,14 @@
   },
   "hub_commit": "1111111111111111111111111111111111111111",
   "image": {
-    "amd64_digest": "sha256:857833a7792c6c3f135e177d3f85ab4f54f1c307677b2e29e989f56f94767fdb",
-    "arm64_digest": "sha256:6491250e5029b0b306560766d5ff691f330bea85bbb8b3303b42e58e3b5858d8",
-    "digest": "sha256:6da1f64f905716b404737abd4a4abdb8128ff4684dd509acd149b1df65e2a4d5",
+    "amd64_digest": "sha256:3aa71c425bca84cd53a021994221993fe6c1c2733b19ff1c34d45d422b117bcc",
+    "arm64_digest": "sha256:590911c332b965b31755a7f7959d196df947aadfca735be86f243a48edf7ba1a",
+    "digest": "sha256:cd06c078d3fc66f79d7b9815b1a68cdce51f0b0e68812466a051e436ed2ff3cc",
     "repository": "ghcr.io/pineforge-4pass/pineforge-release"
   },
   "manifest": {
     "asset": "release-manifest.json",
-    "sha256": "e3371df844ffab39a748cf332e673b415d4c9f8e9a2a92445bf05b4d56170375"
+    "sha256": "8b23d0dd906cd9e5fc8f9750f486b9ca141466d4abdb021f7ba2ebdcf2e3cf11"
   },
   "prerelease": false,
   "release_version": "1.6.0",

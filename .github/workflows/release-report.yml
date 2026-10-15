@@ -9,6 +9,9 @@ on:
       stage:
         type: string
         required: true
+      hub:
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -28,9 +31,9 @@ jobs:
           python-version: '3.13'
       - uses: actions/download-artifact@v6
         with:
-          pattern: release-receipt-${{ github.run_attempt }}-*
+          pattern: release-stage-${{ github.run_attempt }}-*
           path: receipts
-      - name: Preserve consumer details and alert the configured owner
+      - name: Preserve contract evidence and alert the configured owner
         id: receipt
         env:
           PYTHONPATH: scripts
@@ -39,14 +42,35 @@ jobs:
           STAGE: ${{ inputs.stage }}
           RELEASE_ALERT_OWNER: ${{ vars.RELEASE_ALERT_OWNER }}
         run: python -m release_chain.reporting collect
-      - uses: actions/upload-artifact@v5
-        if: always()
+      - name: Upload the single hub receipt snapshot
+        id: upload
+        if: inputs.hub && steps.receipt.outputs.has_event == 'true'
+        uses: actions/upload-artifact@v5
         with:
-          name: consumer-release-receipt-${{ github.run_attempt }}
-          path: receipt.json
+          name: release-receipt-data
+          path: release-receipt.json
           if-no-files-found: error
+          overwrite: true
+          retention-days: 90
+      - name: Mint a consumer-only token for the immutable completion asset
+        if: inputs.hub && steps.upload.outcome == 'success'
+        uses: actions/create-github-app-token@v2
+        id: consumer
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: read
+      - name: Retain this same verified contract as an immutable distribution asset
+        if: inputs.hub && steps.upload.outcome == 'success'
+        env:
+          PYTHONPATH: scripts
+          GH_TOKEN: ${{ steps.consumer.outputs.token }}
+        run: python -m release_chain.reporting retain
       - name: Mint a separate token scoped only to the hub
-        if: steps.receipt.outputs.has_event == 'true'
+        if: inputs.hub && steps.upload.outcome == 'success'
         uses: actions/create-github-app-token@v2
         id: hub
         with:
@@ -55,12 +79,11 @@ jobs:
           owner: pineforge-4pass
           repositories: pineforge-release
           permission-contents: write
-      - name: Send neutral completion state to the hub receiver
-        if: steps.receipt.outputs.has_event == 'true'
+      - name: Wake the hub collector with the exact consumer-signal/v1 callback
+        if: inputs.hub && steps.upload.outcome == 'success'
         env:
           PYTHONPATH: scripts
           GH_TOKEN: ${{ steps.hub.outputs.token }}
-          RELEASE_RECEIPT_EVENT_TYPE: ${{ vars.RELEASE_RECEIPT_EVENT_TYPE }}
         run: python -m release_chain.reporting callback
       - name: Alert locally if receipt delivery or reporting failed
         if: failure()
@@ -70,10 +93,4 @@ jobs:
           FAILED: 'true'
           STAGE: receipt-transport
           RELEASE_ALERT_OWNER: ${{ vars.RELEASE_ALERT_OWNER }}
-        run: python -m release_chain.reporting collect
-      - uses: actions/upload-artifact@v5
-        if: failure()
-        with:
-          name: consumer-release-reporting-failure-${{ github.run_attempt }}
-          path: receipt.json
-          if-no-files-found: warn
+        run: python -m release_chain.reporting collect --receipt incident-release-receipt.json

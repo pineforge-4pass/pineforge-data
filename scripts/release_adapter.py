@@ -15,7 +15,6 @@ from release_chain.contract import (
     verify_local,
     verify_manifest,
 )
-from release_chain.evidence import GateRejected
 
 
 def main() -> None:
@@ -48,11 +47,9 @@ def main() -> None:
             bump=args.bump if args.command == "manual" else None,
             rollback_package=args.package if args.command == "rollback" else None,
         )
-    except Exception as exc:
+    except Exception:
+        # Diagnostics remain in the private Actions log and incident, never in JSON.
         report["state"] = "failed"
-        report["verification"]["detail"] = str(exc)
-        if isinstance(exc, GateRejected):
-            report["verification"]["ci"] = exc.evidence
         raise
     finally:
         assert args.receipt is not None

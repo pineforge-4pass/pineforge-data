@@ -1,0 +1,48 @@
+{
+  "data": {
+    "artifact": "release-receipt-data",
+    "base": "main",
+    "ci": {
+      "approved_skips": [],
+      "expected": [
+        "Python 3.11",
+        "Python 3.12",
+        "Python 3.13",
+        "Release contract",
+        "Docker runtime",
+        "Database E2E",
+        "Distribution",
+        "release/ready"
+      ],
+      "workflow": "ci.yml"
+    },
+    "deploy": {
+      "approved_skips": [
+        "publish"
+      ],
+      "expected": [
+        "prepare",
+        "build",
+        "github-release",
+        "publish",
+        "verify"
+      ],
+      "workflow": "release.yml"
+    },
+    "e2e": {
+      "approved_skips": [],
+      "expected": [
+        "Python 3.11",
+        "Python 3.12",
+        "Python 3.13",
+        "Release contract",
+        "Docker runtime",
+        "Database E2E",
+        "Distribution",
+        "release/ready"
+      ],
+      "workflow": "ci.yml"
+    },
+    "workflow": "pineforge-release.yml"
+  }
+}

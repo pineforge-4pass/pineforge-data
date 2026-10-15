@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 import tempfile
 import time
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +34,8 @@ from .contract import (
     verify_manifest,
     version_key,
 )
-from .evidence import JOBS, gate_for_run
+from .evidence import gate_for_run
+from .receipts import FIELDS, candidate, canonical, receipt, timestamp
 
 MARKER = re.compile(r"<!-- pineforge-data-release (\{[^\n]+\}) -->")
 
@@ -90,44 +89,12 @@ def body(metadata: dict[str, Any]) -> str:
     )
 
 
-def receipt(event: dict[str, Any] | None, stage: str) -> dict[str, Any]:
-    return {
-        "schema": "pineforge/consumer-receipt/v1",
-        "consumer": "data",
-        "event_id": event["event_id"] if event else None,
-        "manifest": event["manifest"] if event else None,
-        "state": "pending",
-        "completed_at": None,
-        "attempt": {
-            "run_id": int(os.environ.get("GITHUB_RUN_ID", "0")),
-            "number": int(os.environ.get("GITHUB_RUN_ATTEMPT", "1")),
-        },
-        "pull_request": None,
-        "verification": {"stage": stage, "ci": None, "expected_jobs": [*JOBS, "release/ready"]},
-        "deployment": {
-            "kind": "pypi",
-            "expected": {
-                "image": event["image"] if event else None,
-                "facts": event["facts"] if event else None,
-                "hub_commit": event["hub_commit"] if event else None,
-            },
-            "actual": None,
-            "previous": None,
-            "preview": None,
-        },
-    }
-
-
 def finish(report: dict[str, Any], path: Path) -> None:
-    if report["completed_at"] is None and report["state"] in {
-        "verified",
-        "failed",
-        "superseded",
-        "skipped_by_policy",
-    }:
-        report["completed_at"] = datetime.now(UTC).isoformat()
+    require(set(report) == FIELDS, "receipt fields differ from the hub contract")
+    if report["event_id"] is None:
+        return  # No target means no receipt, including ordinary non-release main pushes.
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(json_bytes(report))
+    path.write_bytes(canonical(report))
 
 
 def snapshot(revision: str, root: Path) -> None:
@@ -152,6 +119,11 @@ def manual_patch(root: Path, part: str) -> dict[str, bytes]:
     }
     lock = load_lock(root)
     if lock:
+        lock["previous"] = {
+            "package_version": current,
+            "image": runtime_pin(root),
+            "event_id": lock["event"]["event_id"],
+        }
         lock["package_version"] = version
         patch[LOCK] = json_bytes(lock)
     return patch
@@ -166,21 +138,16 @@ def assert_patch(base: str, head: str, patch: dict[str, bytes]) -> None:
 
 
 def rollback_patch(root: Path, repo: str, known_good_package: str) -> dict[str, bytes]:
-    from .publishing import pypi_files, stored_receipt
+    from .publishing import stored_receipt
 
     version_key(known_good_package)
     saved = stored_receipt(repo, known_good_package)
     require(saved is not None and saved["state"] == "verified", "rollback target is not verified")
     assert saved is not None
-    actual = saved["deployment"]["actual"]
-    require(
-        actual["package_version"] == known_good_package
-        and pypi_files(known_good_package) == actual["distributions"],
-        "known-good package publication no longer verifies",
-    )
-    git("fetch", "origin", f"refs/tags/v{known_good_package}")
-    revision = git("rev-parse", f"v{known_good_package}^{{commit}}")
-    require(revision == actual["source"], "rollback tag source changed")
+    from .publishing import verified_package
+
+    actual = verified_package(repo, known_good_package, saved)
+    revision = actual["source"]
     installed = verify_local(root)
     require(installed is not None, "rollback needs a recorded current manifest")
     with tempfile.TemporaryDirectory() as temporary:
@@ -253,10 +220,11 @@ def open_bot_prs(repo: str) -> list[dict[str, Any]]:
     return [pr for pr in prs if pr["head"]["ref"].startswith("bot/pineforge-") and marker(pr)]
 
 
-def pr_identity(pr: dict[str, Any]) -> dict[str, Any]:
+def pr_identity(pr: dict[str, Any], *, base: str | None = None) -> dict[str, Any]:
     return {
         "number": pr["number"],
-        "base": pr["base"]["sha"],
+        "base": pr["base"]["ref"],
+        "base_sha": base or pr["base"]["sha"],
         "head": pr["head"]["sha"],
         "merge": pr.get("merge_commit_sha") if pr.get("merged") else None,
     }
@@ -274,7 +242,7 @@ def maybe_merge(
     pr = api(repo, f"pulls/{number}")
     meta = marker(pr)
     assert meta is not None
-    report["pull_request"] = pr_identity(pr)
+    report["pr"] = pr_identity(pr)
     require(
         pr["user"]["login"] == bot and pr["head"]["repo"]["full_name"] == repo,
         "PR is not owned by the scoped release App",
@@ -296,12 +264,8 @@ def maybe_merge(
             patch = rollback_patch(source, repo, meta["rollback_package"])
             event = object_json(patch[LOCK])["event"]
             manifest = patch[MANIFEST]
-            superseded = report["verification"].get("superseded", [])
             report.update(receipt(event, "rollback"))
-            if superseded:
-                report["verification"]["superseded"] = superseded
-            report["pull_request"] = pr_identity(pr)
-            report["deployment"]["previous"] = object_json(patch[LOCK])["previous"]
+            report["pr"] = pr_identity(pr, base=comparison_base)
         else:
             patch = (
                 update_files(source, event, manifest)
@@ -322,8 +286,10 @@ def maybe_merge(
             raise ValueError("base update did not produce a new head; no stale evidence accepted")
         meta.update(generated_head=updated["head"]["sha"], base=base)
         api(repo, f"pulls/{number}", "PATCH", {"body": body(meta)})
+        report["pr"] = pr_identity(updated, base=base)
         report["state"] = "testing"
         return
+    report["pr"] = pr_identity(pr, base=base)
     runs = api(
         repo, f"actions/workflows/ci.yml/runs?event=pull_request&head_sha={head}&per_page=100"
     )["workflow_runs"]
@@ -337,12 +303,12 @@ def maybe_merge(
         report["state"] = "pr_open"
         return
     run = max(runs, key=lambda item: item["id"])
-    report["verification"]["ci"] = {"run_id": run["id"], "attempt": run["run_attempt"]}
     if run["status"] != "completed":
         report["state"] = "testing"
         return
     evidence = gate_for_run(repo, run["id"], head=head, base=base, pr=number)
-    report["verification"]["ci"] = evidence
+    if event:
+        candidate(report, event, evidence, meta["version"])
     git("fetch", "origin", f"refs/pull/{number}/merge")
     require(
         git("rev-parse", "FETCH_HEAD") == evidence["tested_sha"]
@@ -385,7 +351,8 @@ def maybe_merge(
     )  # Normal branch protection applies. No admin/bypass merge or branch deletion.
     require(result["merged"], "GitHub refused protected merge")
     report["state"] = "merged"
-    report["pull_request"]["merge"] = result["sha"]
+    report["pr"]["merge"] = result["sha"]
+    report["timestamp"] = timestamp()
 
 
 def reconcile(
@@ -405,9 +372,9 @@ def reconcile(
     manifest: bytes | None = None
     if incoming is not None:
         validate_event(incoming)
-        report.update(receipt(incoming, "reconcile"))
         manifest = hub_manifest(incoming["release_version"])
         verify_manifest(incoming, manifest)
+        report.update(receipt(incoming, "reconcile"))
         if incoming["prerelease"]:
             report["state"] = "skipped_by_policy"
             return
@@ -460,7 +427,6 @@ def reconcile(
             branch = f"bot/pineforge-package/main/{version}-{base[:12]}"
         elif event:
             report.update(receipt(event, "reconcile"))
-            report["deployment"]["previous"] = installed or {"image": runtime_pin(source)}
             rollbacks = [pr for pr in prs if marker(pr)["kind"] == "rollback"]
             if rollbacks and installed and installed["event"]["event_id"] == event["event_id"]:
                 require(len(rollbacks) == 1, "ambiguous pending rollback PR")
@@ -477,8 +443,7 @@ def reconcile(
                     report.update(receipt(installed["event"], "reconcile-rollback"))
                     recover_applied(repo, source, report)
                     return
-                report["state"] = "skipped_by_policy"
-                report["verification"]["stage"] = "rejected-by-rollback"
+                report["state"] = "superseded"
                 return
             if installed and installed["event"]["event_id"] == event["event_id"]:
                 for pr in prs:
@@ -539,7 +504,7 @@ def reconcile(
     # New PR first, supersession second; a failed create leaves the old PR intact.
     pr = same[0] if same else create_pr(repo, base, patch, branch, meta, bot)
     report["state"] = "pr_open"
-    report["pull_request"] = pr_identity(pr)
+    report["pr"] = pr_identity(pr)
     for old in prs:
         old_meta = marker(old)
         if old["number"] != pr["number"] and not bump:
@@ -558,14 +523,6 @@ def reconcile(
                 },
             )
             api(repo, f"pulls/{old['number']}", "PATCH", {"state": "closed"})
-            if old_meta.get("event_id"):
-                superseded = receipt(None, "superseded")
-                superseded.update(
-                    event_id=old_meta["event_id"],
-                    state="superseded",
-                    completed_at=datetime.now(UTC).isoformat(),
-                    manifest={"asset": "release-manifest.json", "sha256": old_meta["event_id"][7:]},
-                    pull_request=pr_identity(old),
-                )
-                report["verification"].setdefault("superseded", []).append(superseded)
+            # The retained PR comment is the human-facing supersession record.
+            # One reporting run owns one target and one immutable hub receipt.
     maybe_merge(repo, pr, report, bot, event if not bump else None, manifest)

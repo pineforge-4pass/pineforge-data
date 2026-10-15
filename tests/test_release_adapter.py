@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import json
 import shutil
 from pathlib import Path
 from typing import Any
@@ -9,7 +8,7 @@ from xml.etree import ElementTree
 
 import pytest
 import yaml
-from release_chain import automation, contract, evidence, publishing, reporting
+from release_chain import automation, contract, evidence, publishing, receipts, reporting
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests/fixtures/release_chain"
@@ -188,10 +187,19 @@ def test_facts_without_target_evidence_are_not_a_ready_release(ready, monkeypatc
         contract.verify_artifacts(event)
 
 
-def test_valid_oci_hashes_cannot_hide_wrong_runtime_provenance(ready, monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "label,value",
+    [
+        ("org.opencontainers.image.version", "1.6.0"),
+        ("io.pineforge.engine.version", "1.5.0"),
+    ],
+)
+def test_valid_oci_hashes_cannot_hide_wrong_runtime_provenance(
+    ready, monkeypatch, label, value
+) -> None:
     event, _manifest = ready
     config = contract.object_json((FIXTURES / "amd64-config.json").read_bytes())
-    config["config"]["Labels"]["io.pineforge.engine.version"] = "1.5.0"
+    config["config"]["Labels"][label] = value
     config_raw = contract.json_bytes(config)
     config_digest = f"sha256:{contract.sha256(config_raw)}"
     child = contract.object_json((FIXTURES / "amd64-manifest.json").read_bytes())
@@ -399,37 +407,36 @@ def test_distribution_publication_refuses_different_pypi_bytes(tmp_path, monkeyp
     (dist / "pineforge_data-0.3.1.tar.gz").write_bytes(b"tested sdist")
     hashes = evidence.distribution_hashes(dist)
     report = automation.receipt(None, "verify")
-    report["verification"]["ci"] = {"distributions": hashes}
+    (bundle / "evidence.json").write_bytes(contract.json_bytes({"distributions": hashes}))
     report["state"] = "deploying"
     monkeypatch.setattr(publishing, "pypi_files", lambda version: dict.fromkeys(hashes, "0" * 64))
     with pytest.raises(ValueError, match="digests disagree"):
         publishing.verify_publication("owner/data", bundle, report)
     assert report["state"] == "deploying"
-    assert report["deployment"]["actual"] is None
+    assert report["deployed"] is None
 
 
-def test_public_receipt_keeps_actionable_private_details_in_consumer_only(ready) -> None:
+def test_public_receipt_cannot_contain_homegrown_or_private_fields(ready) -> None:
     event, _manifest = ready
     report = automation.receipt(event, "test")
-    report["verification"]["detail"] = "https://github.com/private-owner/private-repo/runs/1"
-    public = reporting.public_receipt(report)
-    assert "private-repo" not in json.dumps(public)
-    assert "detail" in report["verification"]
-    assert public["consumer"] == "data"
-    assert public["event_id"] == event["event_id"]
+    assert set(report) == receipts.FIELDS
+    assert reporting.public_receipt(report) == report
+    report["detail"] = "https://github.com/private-owner/private-repo/runs/1"
+    with pytest.raises(ValueError, match="receipt fields differ"):
+        reporting.public_receipt(report)
 
 
 def test_failed_downstream_job_overrides_earlier_green_receipt(tmp_path, ready) -> None:
     event, _manifest = ready
     report = automation.receipt(event, "prepare")
     report["state"] = "deploying"
-    directory = tmp_path / "release-receipt-20-prepare"
+    directory = tmp_path / "release-stage-1-20-prepare"
     directory.mkdir()
-    (directory / "receipt.json").write_bytes(contract.json_bytes(report))
+    (directory / "release-receipt.json").write_bytes(contract.json_bytes(report))
     result = reporting.collect(tmp_path, failed=True, stage="publication")
     assert result["state"] == "failed"
     assert result["event_id"] == event["event_id"]
-    assert result["deployment"]["actual"] is None
+    assert result["deployed"] is None
 
 
 def test_duplicate_open_pr_is_reused_without_a_new_commit(ready, baseline, monkeypatch) -> None:
@@ -459,7 +466,7 @@ def test_duplicate_open_pr_is_reused_without_a_new_commit(ready, baseline, monke
     report = automation.receipt(None, "test")
     automation.reconcile("owner/data", {"client_payload": event}, report, "release[bot]")
     assert checked == [7]
-    assert report["pull_request"]["number"] == 7
+    assert report["pr"]["number"] == 7
 
 
 def next_ready(event):
@@ -525,7 +532,7 @@ def test_newer_pr_exists_before_obsolete_pr_is_closed(ready, baseline, monkeypat
     automation.reconcile("owner/data", {"client_payload": event}, report, "release[bot]")
     assert operations[0] == "create"
     assert ("PATCH", "pulls/7", {"state": "closed"}) in operations
-    assert report["verification"]["superseded"][0]["event_id"] == old_event["event_id"]
+    assert set(report) == receipts.FIELDS
     assert all(operation[0] != "DELETE" for operation in operations if isinstance(operation, tuple))
 
 
@@ -559,18 +566,21 @@ def test_completed_receipt_replay_does_not_dispatch_or_publish(
     apply(baseline, contract.update_files(baseline, event, raw))
     saved = automation.receipt(event, "verify")
     saved["state"] = "verified"
-    saved["deployment"]["actual"] = {
-        "package_version": "0.3.1",
-        "image": contract.image_ref(event),
-        "distributions": {"wheel": "a", "sdist": "b"},
+    saved["pr"] = {
+        "number": 7,
+        "base": "main",
+        "base_sha": "b" * 40,
+        "head": "c" * 40,
+        "merge": "a" * 40,
     }
+    saved["deployed"] = receipts.served(event, "a" * 40, "0.3.1", {"wheel": "a", "sdist": "b"})
     monkeypatch.setattr(publishing, "stored_receipt", lambda *args: saved)
-    monkeypatch.setattr(publishing, "pypi_files", lambda version: {"wheel": "a", "sdist": "b"})
+    monkeypatch.setattr(publishing, "verified_package", lambda *args: saved["deployed"])
     monkeypatch.setattr(publishing, "api", lambda *args: pytest.fail("replayed publication"))
     report = automation.receipt(event, "reconcile")
     publishing.recover_applied("owner/data", baseline, report)
     assert report["state"] == "verified"
-    assert report["deployment"]["actual"] == saved["deployment"]["actual"]
+    assert report["deployed"] == saved["deployed"]
 
 
 def test_workflows_keep_every_gate_ahead_of_oidc_publication() -> None:

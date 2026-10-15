@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import subprocess
 import tempfile
 import time
+import zipfile
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
 
 from .automation import api, finish, git, inventory, marker, pr_identity, receipt, snapshot
 from .contract import (
+    LOCK,
+    MANIFEST,
+    RUNTIME,
     fetch,
     gh_bytes,
     json_bytes,
@@ -25,7 +30,9 @@ from .contract import (
     verify_artifacts,
     verify_local,
 )
-from .evidence import GateRejected, distribution_hashes, gate_for_run
+from .evidence import distribution_hashes, gate_for_run
+from .receipts import candidate as record_candidate
+from .receipts import served, timestamp
 
 
 def pypi_files(version: str) -> dict[str, str] | None:
@@ -38,12 +45,112 @@ def pypi_files(version: str) -> dict[str, str] | None:
     return {entry["filename"]: entry["digests"]["sha256"] for entry in value["urls"]}
 
 
+def candidate_gate(repo: str, pr: dict[str, Any]) -> dict[str, Any]:
+    """Re-read the successful PR attempt, never substitute post-merge smoke tests."""
+    meta = marker(pr)
+    runs = inventory(
+        repo,
+        "actions/workflows/ci.yml/runs?event=pull_request&head_sha=" + pr["head"]["sha"],
+        "workflow_runs",
+    )
+    runs = [
+        run
+        for run in runs
+        if run["head_sha"] == pr["head"]["sha"]
+        and any(item["number"] == pr["number"] for item in run["pull_requests"])
+    ]
+    require(runs, "pre-merge CI evidence missing")
+    run = max(runs, key=lambda row: row["id"])
+    evidence = gate_for_run(
+        repo, run["id"], head=pr["head"]["sha"], base=meta["base"], pr=pr["number"]
+    )
+    jobs = inventory(repo, f"actions/runs/{run['id']}/attempts/{run['run_attempt']}/jobs", "jobs")
+    if pr.get("merged_at"):
+        require(
+            all(job["completed_at"] and job["completed_at"] <= pr["merged_at"] for job in jobs),
+            "candidate CI/E2E did not finish before merge",
+        )
+    return evidence
+
+
+def verified_package(
+    repo: str, version: str, saved: dict[str, Any] | None = None
+) -> dict[str, str]:
+    """Observe immutable PyPI bytes, matching GitHub assets and tagged source/facts."""
+    files = pypi_files(version)
+    require(
+        files is not None
+        and len(files) == 2
+        and sum(name.endswith(".whl") for name in files) == 1
+        and sum(name.endswith(".tar.gz") for name in files) == 1,
+        "previous publication needs a wheel and sdist",
+    )
+    metadata = object_json(fetch(f"https://pypi.org/pypi/pineforge-data/{version}/json"))
+    require(
+        {entry["filename"]: entry["digests"]["sha256"] for entry in metadata["urls"]} == files,
+        "PyPI inventory moved during verification",
+    )
+    downloads = {}
+    for entry in metadata["urls"]:
+        require(
+            entry["url"].startswith("https://files.pythonhosted.org/"), "unexpected PyPI source"
+        )
+        downloads[entry["filename"]] = fetch(entry["url"])
+        require(
+            sha256(downloads[entry["filename"]]) == files[entry["filename"]], "PyPI bytes differ"
+        )
+    release = api(repo, f"releases/tags/v{version}")
+    for name, digest in files.items():
+        assets = [asset for asset in release["assets"] if asset["name"] == name]
+        require(len(assets) == 1, "distribution has no unique immutable release asset")
+        require(
+            sha256(
+                gh_bytes(
+                    f"repos/{repo}/releases/assets/{assets[0]['id']}",
+                    accept="application/octet-stream",
+                )
+            )
+            == digest,
+            "release asset differs from PyPI",
+        )
+    git("fetch", "origin", f"refs/tags/v{version}")
+    source = git("rev-parse", f"v{version}^{{commit}}")
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        snapshot(source, root)
+        lock = verify_local(root)
+        require(
+            lock is not None and package_version(root) == version,
+            "previous distribution lacks manifest/facts provenance; "
+            "establish a baseline before enablement",
+        )
+        wheel = next(data for name, data in downloads.items() if name.endswith(".whl"))
+        with zipfile.ZipFile(io.BytesIO(wheel)) as zipped:
+            for name in (LOCK, MANIFEST, RUNTIME):
+                member = name.removeprefix("src/")
+                require(
+                    zipped.namelist().count(member) == 1
+                    and zipped.read(member) == (root / name).read_bytes(),
+                    "served wheel source/manifest/facts differs from the tagged source",
+                )
+        verify_artifacts(lock["event"])
+        actual = served(lock["event"], source, version, files)
+    if saved:
+        require(
+            saved["state"] == "verified"
+            and saved["pr"]["merge"] == source
+            and saved["deployed"] == actual,
+            "stored publication no longer verifies",
+        )
+    return actual
+
+
 def stored_receipt(repo: str, version: str) -> dict[str, Any] | None:
     releases = inventory(repo, "releases")
     matching = [release for release in releases if release["tag_name"] == f"v{version}"]
     if not matching:
         return None
-    assets = [asset for asset in matching[0]["assets"] if asset["name"] == "consumer-receipt.json"]
+    assets = [asset for asset in matching[0]["assets"] if asset["name"] == "release-receipt.json"]
     require(len(assets) <= 1, "ambiguous stored completion receipt")
     if not assets:
         return None
@@ -64,13 +171,9 @@ def recover_applied(repo: str, source: Path, report: dict[str, Any]) -> None:
             "stored publication identity differs",
         )
         require(
-            saved["deployment"]["actual"]["package_version"] == version
-            and saved["deployment"]["actual"]["image"] == runtime_pin(source),
+            verified_package(repo, version, saved)["image_digest"]
+            == verify_local(source)["event"]["image"]["digest"],
             "stored publication does not match installed defaults",
-        )
-        require(
-            pypi_files(version) == saved["deployment"]["actual"]["distributions"],
-            "stored publication no longer matches PyPI",
         )
         report.update(saved)
         return
@@ -80,8 +183,8 @@ def recover_applied(repo: str, source: Path, report: dict[str, Any]) -> None:
     ]
     require(len(candidates) == 1, "applied release has no unique merged update PR")
     pr = candidates[0]
-    report["pull_request"] = pr_identity({**pr, "merged": True})
-    report["pull_request"]["base"] = marker(pr)["base"]
+    report["pr"] = pr_identity({**pr, "merged": True})
+    report["pr"]["base_sha"] = marker(pr)["base"]
     runs = api(
         repo,
         "actions/workflows/ci.yml/runs?event=push&per_page=100&head_sha=" + pr["merge_commit_sha"],
@@ -91,10 +194,37 @@ def recover_applied(repo: str, source: Path, report: dict[str, Any]) -> None:
         report["state"] = "testing"
         return
     run = max(runs, key=lambda run: run["id"])
-    report["verification"]["ci"] = gate_for_run(repo, run["id"], head=pr["merge_commit_sha"])
+    gate_for_run(repo, run["id"], head=pr["merge_commit_sha"])
+    lock = verify_local(source)
+    if lock:
+        record_candidate(report, lock["event"], candidate_gate(repo, pr), version)
     publishers = api(repo, "actions/workflows/release.yml/runs?per_page=100")["workflow_runs"]
-    if any(publisher["status"] != "completed" for publisher in publishers):
+    matching = [row for row in publishers if row["head_sha"] == pr["merge_commit_sha"]]
+    if any(row["status"] != "completed" for row in matching):
         report["state"] = "deploying"
+        return
+    completed = [
+        row
+        for row in matching
+        if row["conclusion"] == "success"
+        and any(
+            artifact["name"] == f"release-stage-{row['run_attempt']}-50-verify"
+            and not artifact["expired"]
+            for artifact in inventory(repo, f"actions/runs/{row['id']}/artifacts", "artifacts")
+        )
+    ]
+    if completed:
+        # Repair a lost completion event without repeating OIDC publication.
+        api(
+            repo,
+            "actions/workflows/pineforge-release.yml/dispatches",
+            "POST",
+            {
+                "ref": f"v{version}",
+                "inputs": {"publication_run": str(max(completed, key=lambda row: row["id"])["id"])},
+            },
+        )
+        report.update(receipt(None))  # The pinned reporting run owns the next snapshot.
         return
     # App token needs Actions:write only on this consumer for lost-event repair.
     api(
@@ -142,17 +272,12 @@ def verify_rollback(lock: dict[str, Any], repo: str) -> None:
         saved is not None and saved["state"] == "verified", "rollback has no known-good receipt"
     )
     assert saved is not None
-    actual = saved["deployment"]["actual"]
+    actual = verified_package(repo, rollback["package_version"], saved)
     require(
         saved["event_id"] == lock["event"]["event_id"]
         and actual["source"] == rollback["source"]
-        and actual["package_version"] == rollback["package_version"]
         and rollback["rejected_event_id"] in lock["rejected_event_ids"],
         "rollback provenance differs from the known-good receipt",
-    )
-    require(
-        pypi_files(rollback["package_version"]) == actual["distributions"],
-        "known-good rollback package does not verify on PyPI",
     )
 
 
@@ -187,17 +312,24 @@ def prepare(
     lock = verify_local(candidate)
     event = lock["event"] if lock else None
     report.update(receipt(event, "prepare-publication"))
-    report["pull_request"] = pr_identity(pr)
-    report["pull_request"]["base"] = meta["base"]
+    report["pr"] = pr_identity(pr)
+    report["pr"]["base_sha"] = meta["base"]
     evidence = gate_for_run(repo, run_id, head=source)
     require(
         git("rev-parse", f"{source}^{{tree}}") == evidence["tree"]
         and evidence["tested_sha"] == source,
         "CI source tree disagrees",
     )
-    report["verification"]["ci"] = evidence
-    report["deployment"]["preview"] = {"kind": "local-docker", "run_id": run_id}
-    report["deployment"]["previous"] = lock["previous"] if lock else None
+    # Retain the independent pre-merge candidate gates, as required by the hub.
+    # Main CI still authorizes the exact distributions we publish.
+    if event:
+        record_candidate(report, event, candidate_gate(repo, pr), meta["version"])
+        previous_version = lock["previous"]["package_version"]
+        report["previous"] = verified_package(repo, previous_version)
+    require(
+        git("rev-parse", f"{source}^1") == meta["base"],
+        "landed first parent differs from the tested base",
+    )
     current_intent(candidate, repo)
     require(
         package_version(candidate) == meta["version"], "package version differs from release PR"
@@ -237,12 +369,17 @@ def prepare(
         "tag": f"v{version}",
         "version": version,
         "ci_run": str(run_id),
+        "has_target": str(event is not None).lower(),
     }
 
 
 def github_release(root: Path, repo: str, directory: Path, report: dict[str, Any]) -> None:
     version = package_version(directory / "source")
-    source = report["verification"]["ci"]["head"]
+    source = object_json((directory / "evidence.json").read_bytes())["head"]
+    require(
+        report["pr"] is None or report["pr"]["merge"] == source,
+        "distribution source differs from recorded merge",
+    )
     tag = f"v{version}"
     current_intent(directory / "source", repo)
     # Tags and assets are immutable. A rerun only fills absent assets.
@@ -287,7 +424,8 @@ def verify_publication(repo: str, directory: Path, report: dict[str, Any]) -> No
     candidate = directory / "source"
     version = package_version(candidate)
     expected = distribution_hashes(directory / "dist")
-    require(expected == report["verification"]["ci"]["distributions"], "distribution drift")
+    gate = object_json((directory / "evidence.json").read_bytes())
+    require(expected == gate["distributions"], "distribution drift")
     for _attempt in range(12):
         actual = pypi_files(version)
         if actual is not None:
@@ -308,33 +446,14 @@ def verify_publication(repo: str, directory: Path, report: dict[str, Any]) -> No
             "PyPI download bytes disagree with tested distribution",
         )
     lock = verify_local(candidate)
-    report["deployment"]["actual"] = {
-        "source": report["verification"]["ci"]["head"],
-        "package_version": version,
-        "distributions": expected,
-        "image": runtime_pin(candidate),
-        "facts": lock["event"]["facts"] if lock else None,
-    }
-    report["state"] = "verified"
-    # The channel pointer only moves after all immutable publication checks succeed.
+    if lock:
+        report["deployed"] = served(lock["event"], report["pr"]["merge"], version, expected)
+        require(report["previous"] is not None, "previous distribution identity missing")
+    # Only the later, completed-run coordinator can claim verified and store a receipt.
+    report["state"] = "deploying"
+    report["timestamp"] = timestamp()
     current_intent(candidate, repo)
     subprocess.run(["gh", "release", "edit", f"v{version}", "--repo", repo, "--latest"], check=True)
-    saved = stored_receipt(repo, version)
-    if saved:
-        require(
-            saved["state"] == "verified"
-            and saved["event_id"] == report["event_id"]
-            and saved["deployment"]["actual"] == report["deployment"]["actual"],
-            "stored completion receipt differs from verified publication",
-        )
-        report.update(saved)
-    else:
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "consumer-receipt.json"
-            finish(report, path)
-            subprocess.run(
-                ["gh", "release", "upload", f"v{version}", str(path), "--repo", repo], check=True
-            )
 
 
 def main() -> None:
@@ -352,8 +471,6 @@ def main() -> None:
     )
     try:
         args.directory.mkdir(parents=True, exist_ok=True)
-        if args.command != "prepare":
-            report["verification"]["stage"] = args.command
         if args.command == "prepare":
             outputs = prepare(Path.cwd(), repo, args.run, args.directory, report)
             with Path(os.environ["GITHUB_OUTPUT"]).open("a") as handle:
@@ -365,16 +482,13 @@ def main() -> None:
             current_intent(args.directory / "source", repo)
             require(
                 distribution_hashes(args.directory / "dist")
-                == report["verification"]["ci"]["distributions"],
+                == object_json((args.directory / "evidence.json").read_bytes())["distributions"],
                 "untested upload bytes",
             )
         else:
             verify_publication(repo, args.directory, report)
-    except Exception as exc:
+    except Exception:
         report["state"] = "failed"
-        report["verification"]["detail"] = str(exc)
-        if isinstance(exc, GateRejected):
-            report["verification"]["ci"] = exc.evidence
         raise
     finally:
         finish(report, args.receipt)

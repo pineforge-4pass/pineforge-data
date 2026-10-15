@@ -330,7 +330,7 @@ def verify_artifacts(event: dict[str, Any]) -> None:
         )
         labels = config.get("config", {}).get("Labels", {})
         expected = {
-            "org.opencontainers.image.version": version,
+            "org.opencontainers.image.version": f"v{version}",
             "org.opencontainers.image.revision": event["hub_commit"],
             "io.pineforge.engine.version": event["versions"]["engine"]["version"],
             "io.pineforge.codegen.version": event["versions"]["codegen"]["version"],

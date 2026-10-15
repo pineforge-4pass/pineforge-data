@@ -1,0 +1,112 @@
+{
+  "attempt": 300,
+  "ci": {
+    "approved_skips": [],
+    "expected": [
+      "Python 3.11",
+      "Python 3.12",
+      "Python 3.13",
+      "Release contract",
+      "Docker runtime",
+      "Database E2E",
+      "Distribution",
+      "release/ready"
+    ],
+    "results": {
+      "Database E2E": "success",
+      "Distribution": "success",
+      "Docker runtime": "success",
+      "Python 3.11": "success",
+      "Python 3.12": "success",
+      "Python 3.13": "success",
+      "Release contract": "success",
+      "release/ready": "success"
+    },
+    "run_attempt": 2,
+    "run_id": 70,
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "consumer": "data",
+  "deploy": {
+    "approved_skips": [
+      "publish"
+    ],
+    "expected": [
+      "prepare",
+      "build",
+      "github-release",
+      "publish",
+      "verify"
+    ],
+    "results": {
+      "build": "success",
+      "github-release": "success",
+      "prepare": "success",
+      "publish": "success",
+      "verify": "success"
+    },
+    "run_attempt": 1,
+    "run_id": 200,
+    "sha": "cccccccccccccccccccccccccccccccccccccccc"
+  },
+  "deployed": {
+    "deployment_id_sha256": "fda9cda3a5ee2e0490aa51926b814488b288052e537910fdf0aa1cfd03a3fc9a",
+    "facts_commit": "5555555555555555555555555555555555555555",
+    "facts_sha256": "c4cbcff4e067a80515a05616a3d4dd4e672b4237d8d384250de2d5071b2070ee",
+    "image_digest": "sha256:cd06c078d3fc66f79d7b9815b1a68cdce51f0b0e68812466a051e436ed2ff3cc",
+    "source": "cccccccccccccccccccccccccccccccccccccccc"
+  },
+  "e2e": {
+    "approved_skips": [],
+    "expected": [
+      "Python 3.11",
+      "Python 3.12",
+      "Python 3.13",
+      "Release contract",
+      "Docker runtime",
+      "Database E2E",
+      "Distribution",
+      "release/ready"
+    ],
+    "results": {
+      "Database E2E": "success",
+      "Distribution": "success",
+      "Docker runtime": "success",
+      "Python 3.11": "success",
+      "Python 3.12": "success",
+      "Python 3.13": "success",
+      "Release contract": "success",
+      "release/ready": "success"
+    },
+    "run_attempt": 2,
+    "run_id": 70,
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "event_id": "sha256:8b23d0dd906cd9e5fc8f9750f486b9ca141466d4abdb021f7ba2ebdcf2e3cf11",
+  "pr": {
+    "base": "main",
+    "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "merge": "cccccccccccccccccccccccccccccccccccccccc",
+    "number": 7
+  },
+  "preview": {
+    "deployment_id_sha256": "a64240825d1189c77374a67057257d5877c4cdadeeab6f8d08a3a3df53206800",
+    "facts_commit": "5555555555555555555555555555555555555555",
+    "facts_sha256": "c4cbcff4e067a80515a05616a3d4dd4e672b4237d8d384250de2d5071b2070ee",
+    "image_digest": "sha256:cd06c078d3fc66f79d7b9815b1a68cdce51f0b0e68812466a051e436ed2ff3cc",
+    "source": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "previous": {
+    "deployment_id_sha256": "a2ddfbc368cb7ea8af71abdd57c9a34b4df4d48827c82bd28d43f385b7805849",
+    "facts_commit": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "facts_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "image_digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "source": "dddddddddddddddddddddddddddddddddddddddd"
+  },
+  "release_version": "1.6.0",
+  "schema": "pineforge/consumer-receipt/v1",
+  "sequence": 1,
+  "state": "verified",
+  "timestamp": "2020-01-01T00:07:00Z"
+}

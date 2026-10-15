@@ -1,14 +1,14 @@
 {
   "manifests": [
     {
-      "digest": "sha256:857833a7792c6c3f135e177d3f85ab4f54f1c307677b2e29e989f56f94767fdb",
+      "digest": "sha256:3aa71c425bca84cd53a021994221993fe6c1c2733b19ff1c34d45d422b117bcc",
       "platform": {
         "architecture": "amd64",
         "os": "linux"
       }
     },
     {
-      "digest": "sha256:6491250e5029b0b306560766d5ff691f330bea85bbb8b3303b42e58e3b5858d8",
+      "digest": "sha256:590911c332b965b31755a7f7959d196df947aadfca735be86f243a48edf7ba1a",
       "platform": {
         "architecture": "arm64",
         "os": "linux"

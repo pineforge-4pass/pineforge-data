@@ -68,15 +68,15 @@ jobs:
         run: |
           test "$GITHUB_REF_NAME" = main
           if [ -n "$ROLLBACK_PACKAGE" ]; then
-            python scripts/release_adapter.py rollback --package "$ROLLBACK_PACKAGE" --receipt "$RUNNER_TEMP/receipt.json"
+            python scripts/release_adapter.py rollback --package "$ROLLBACK_PACKAGE" --receipt "$RUNNER_TEMP/release-receipt.json"
           else
-            python scripts/release_adapter.py manual --bump "$BUMP" --receipt "$RUNNER_TEMP/receipt.json"
+            python scripts/release_adapter.py manual --bump "$BUMP" --receipt "$RUNNER_TEMP/release-receipt.json"
           fi
       - uses: actions/upload-artifact@v5
         if: always()
         with:
-          name: release-receipt-${{ github.run_attempt }}-10-manual
-          path: ${{ runner.temp }}/receipt.json
+          name: release-stage-${{ github.run_attempt }}-10-manual
+          path: ${{ runner.temp }}/release-receipt.json
           if-no-files-found: warn
 
   prepare:
@@ -86,6 +86,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       eligible: ${{ steps.release.outputs.eligible }}
+      has_target: ${{ steps.release.outputs.has_target }}
       published: ${{ steps.release.outputs.published }}
       sha: ${{ steps.release.outputs.sha }}
       tag: ${{ steps.release.outputs.tag }}
@@ -117,7 +118,7 @@ jobs:
           CI_RUN: ${{ inputs.ci_run || github.event.workflow_run.id }}
         run: |
           python -m release_chain.publishing prepare --run "$CI_RUN" \
-            --directory "$RUNNER_TEMP/bundle" --receipt "$RUNNER_TEMP/receipt.json"
+            --directory "$RUNNER_TEMP/bundle" --receipt "$RUNNER_TEMP/release-receipt.json"
       - uses: actions/upload-artifact@v5
         if: steps.release.outputs.eligible == 'true'
         with:
@@ -127,8 +128,8 @@ jobs:
       - uses: actions/upload-artifact@v5
         if: always()
         with:
-          name: release-receipt-${{ github.run_attempt }}-20-prepare
-          path: ${{ runner.temp }}/receipt.json
+          name: release-stage-${{ github.run_attempt }}-20-prepare
+          path: ${{ runner.temp }}/release-receipt.json
           if-no-files-found: warn
 
   build:
@@ -178,18 +179,19 @@ jobs:
           name: validated-release-bundle-${{ github.run_attempt }}
           path: bundle/
       - uses: actions/download-artifact@v6
+        if: needs.prepare.outputs.has_target == 'true'
         with:
-          name: release-receipt-${{ github.run_attempt }}-20-prepare
+          name: release-stage-${{ github.run_attempt }}-20-prepare
           path: report/
       - name: Retain immutable tag and distribution assets with generated notes
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python -m release_chain.publishing github-release --directory bundle --receipt report/receipt.json
+        run: python -m release_chain.publishing github-release --directory bundle --receipt report/release-receipt.json
       - uses: actions/upload-artifact@v5
         if: always()
         with:
-          name: release-receipt-${{ github.run_attempt }}-30-github
-          path: report/receipt.json
+          name: release-stage-${{ github.run_attempt }}-30-github
+          path: report/release-receipt.json
           if-no-files-found: warn
 
   publish:
@@ -217,13 +219,14 @@ jobs:
           name: validated-release-bundle-${{ github.run_attempt }}
           path: bundle/
       - uses: actions/download-artifact@v6
+        if: needs.prepare.outputs.has_target == 'true'
         with:
-          name: release-receipt-${{ github.run_attempt }}-30-github
+          name: release-stage-${{ github.run_attempt }}-30-github
           path: report/
       - name: Recheck desired identity and tested bytes immediately before OIDC publication
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python -m release_chain.publishing preflight --directory bundle --receipt report/receipt.json
+        run: python -m release_chain.publishing preflight --directory bundle --receipt report/release-receipt.json
       - name: Publish to PyPI with Trusted Publishing
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
@@ -231,8 +234,8 @@ jobs:
       - uses: actions/upload-artifact@v5
         if: always()
         with:
-          name: release-receipt-${{ github.run_attempt }}-40-publish
-          path: report/receipt.json
+          name: release-stage-${{ github.run_attempt }}-40-publish
+          path: report/release-receipt.json
           if-no-files-found: warn
 
   verify:
@@ -258,18 +261,19 @@ jobs:
           name: validated-release-bundle-${{ github.run_attempt }}
           path: bundle/
       - uses: actions/download-artifact@v6
+        if: needs.prepare.outputs.has_target == 'true'
         with:
-          name: release-receipt-${{ github.run_attempt }}-30-github
+          name: release-stage-${{ github.run_attempt }}-30-github
           path: report/
       - name: Verify PyPI inventory and downloaded bytes before reporting success
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python -m release_chain.publishing verify --directory bundle --receipt report/receipt.json
+        run: python -m release_chain.publishing verify --directory bundle --receipt report/release-receipt.json
       - uses: actions/upload-artifact@v5
         if: always()
         with:
-          name: release-receipt-${{ github.run_attempt }}-50-verify
-          path: report/receipt.json
+          name: release-stage-${{ github.run_attempt }}-50-verify
+          path: report/release-receipt.json
           if-no-files-found: warn
 
   report:

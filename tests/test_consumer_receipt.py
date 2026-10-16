@@ -415,6 +415,8 @@ def test_automatic_triggers_wait_for_a_configured_chain():
     )
     condition = coordinator["jobs"]["reconcile"]["if"]
     assert condition.startswith(
-        "(vars.RELEASE_APP_ID != '' || (github.event_name != 'schedule' && github.event_name != 'workflow_run')) &&"
+        "(vars.RELEASE_APP_ID != '' || "
+        "(github.event_name != 'schedule' && github.event_name != 'workflow_run')) &&"
     )
-    assert coordinator["jobs"]["report"]["if"] == "always() && needs.reconcile.result != 'skipped'"
+    report_if = coordinator["jobs"]["report"]["if"]
+    assert report_if == "always() && needs.reconcile.result != 'skipped'"

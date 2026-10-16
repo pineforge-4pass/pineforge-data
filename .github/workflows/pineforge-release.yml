@@ -24,10 +24,14 @@ concurrency:
 
 jobs:
   reconcile:
+    # Automatic triggers (schedule, workflow_run) run only once the chain is
+    # configured (RELEASE_APP_ID set); a hub dispatch or a manual run without it
+    # still fails loudly.
     if: >-
-      github.event_name != 'workflow_run' ||
+      (vars.RELEASE_APP_ID != '' || (github.event_name != 'schedule' && github.event_name != 'workflow_run')) &&
+      (github.event_name != 'workflow_run' ||
       (github.event.workflow_run.name == 'CI' && github.event.workflow_run.event == 'pull_request') ||
-      github.event.workflow_run.name == 'Release'
+      github.event.workflow_run.name == 'Release')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/create-github-app-token@v2

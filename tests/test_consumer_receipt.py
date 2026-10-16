@@ -406,3 +406,17 @@ def test_successful_manual_pr_run_reports_progress_without_claiming_deploy(
     reporting.publication(REPO, 200, result)
     assert result["state"] == "pr_open" and result["deploy"] is None
     assert client.writes == []
+
+
+def test_automatic_triggers_wait_for_a_configured_chain():
+    root = Path(__file__).parents[1]
+    coordinator = yaml.load(
+        (root / ".github/workflows/pineforge-release.yml").read_text(), Loader=yaml.BaseLoader
+    )
+    condition = coordinator["jobs"]["reconcile"]["if"]
+    assert condition.startswith(
+        "(vars.RELEASE_APP_ID != '' || "
+        "(github.event_name != 'schedule' && github.event_name != 'workflow_run')) &&"
+    )
+    report_if = coordinator["jobs"]["report"]["if"]
+    assert report_if == "always() && needs.reconcile.result != 'skipped'"

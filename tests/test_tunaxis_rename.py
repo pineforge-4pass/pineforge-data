@@ -106,17 +106,12 @@ def paired_artifacts(tmp_path_factory: pytest.TempPathFactory) -> Path:
         check=True,
     )
     subprocess.run(
-        [sys.executable, "-m", "build", "--wheel", "--outdir", str(output), "shim"],
+        [sys.executable, "-m", "build", "--outdir", str(output), "shim"],
         cwd=ROOT,
         check=True,
     )
     subprocess.run(
         [sys.executable, "-m", "build", "--sdist", "--outdir", str(output), "."],
-        cwd=ROOT,
-        check=True,
-    )
-    subprocess.run(
-        [sys.executable, "-m", "build", "--sdist", "--outdir", str(output), "shim"],
         cwd=ROOT,
         check=True,
     )
@@ -142,6 +137,27 @@ def test_real_paired_wheels_have_exact_metadata_and_no_overlap(paired_artifacts)
         assert not set(main_archive.namelist()) & set(shim_archive.namelist())
     files = {path.name: path.read_bytes() for path in paired_artifacts.iterdir()}
     verify_archives(files, version)
+
+
+def test_shim_direct_wheel_matches_wheel_from_sdist(paired_artifacts, tmp_path: Path) -> None:
+    subprocess.run(
+        [sys.executable, "-m", "build", "--wheel", "--outdir", str(tmp_path), "shim"],
+        cwd=ROOT,
+        check=True,
+    )
+    direct = next(tmp_path.glob("pineforge_data-*.whl"))
+    from_sdist = next(paired_artifacts.glob("pineforge_data-*.whl"))
+    with zipfile.ZipFile(direct) as direct_archive, zipfile.ZipFile(from_sdist) as sdist_archive:
+        direct_names = direct_archive.namelist()
+        sdist_names = sdist_archive.namelist()
+        assert len(direct_names) == len(set(direct_names))
+        assert len(sdist_names) == len(set(sdist_names))
+        assert set(direct_names) == set(sdist_names)
+        assert direct_names.count("pineforge_data/__init__.py") == 1
+        assert sdist_names.count("pineforge_data/__init__.py") == 1
+        assert not any(name.startswith(("src/", "tunaxis_data/")) for name in direct_names)
+        for name in direct_names:
+            assert direct_archive.read(name) == sdist_archive.read(name)
 
 
 def test_shim_pin_and_all_extras_cannot_drift(tmp_path: Path) -> None:

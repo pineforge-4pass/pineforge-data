@@ -82,6 +82,22 @@ def pypi_downloads(
     return digests, data
 
 
+def publication_state(version: str, expected: dict[str, str]) -> dict[str, str]:
+    """Retain verified uploads and report each project's remaining work."""
+    states = {}
+    for project in PYPI_PROJECTS:
+        tested = {name: expected[name] for name in filenames(project, version)}
+        observed = pypi_files(version, project)
+        if observed is not None:
+            require(
+                observed.items() <= tested.items(),
+                "PyPI version exists with different bytes",
+            )
+        states["published_" + project.replace("-", "_")] = str(observed == tested).lower()
+    states["published"] = str(all(value == "true" for value in states.values())).lower()
+    return states
+
+
 def candidate_gate(repo: str, pr: dict[str, Any]) -> dict[str, Any]:
     """Re-read the successful PR attempt, never substitute post-merge smoke tests."""
     meta = marker(pr)
@@ -392,13 +408,11 @@ def prepare(
     require(distribution_hashes(dist) == evidence["distributions"], "CI distribution bytes changed")
     (output / "evidence.json").write_bytes(json_bytes(evidence))
     version = package_version(candidate)
-    published = pypi_files(version)
-    if published is not None:
-        require(published == evidence["distributions"], "PyPI version exists with different bytes")
-    report["state"] = "deploying" if published is None else "merged"
+    published = publication_state(version, evidence["distributions"])
+    report["state"] = "merged" if published["published"] == "true" else "deploying"
     return {
         "eligible": "true",
-        "published": str(published is not None).lower(),
+        **published,
         "sha": source,
         "tag": f"v{version}",
         "version": version,
@@ -516,11 +530,13 @@ def main() -> None:
             github_release(Path.cwd(), repo, args.directory, report)
         elif args.command == "preflight":
             current_intent(args.directory / "source", repo)
+            hashes = distribution_hashes(args.directory / "dist")
             require(
-                distribution_hashes(args.directory / "dist")
+                hashes
                 == object_json((args.directory / "evidence.json").read_bytes())["distributions"],
                 "untested upload bytes",
             )
+            publication_state(package_version(args.directory / "source"), hashes)
             stage_distributions(args.directory)
         else:
             verify_publication(repo, args.directory, report)

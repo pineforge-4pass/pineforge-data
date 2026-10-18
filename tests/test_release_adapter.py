@@ -7,6 +7,7 @@ import tarfile
 import zipfile
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
 from xml.etree import ElementTree
 
 import pytest
@@ -491,6 +492,85 @@ def test_publication_stages_exact_files_inside_the_bundle(baseline) -> None:
     assert {path.name: path.read_bytes() for path in dist.iterdir()} == original
 
 
+@pytest.mark.parametrize("existing_project", ["tunaxis-data", "pineforge-data"])
+def test_prepare_reports_only_the_missing_pypi_project(
+    baseline, ready, monkeypatch, existing_project
+) -> None:
+    event, _manifest = ready
+    version = project_version(baseline / "pyproject.toml")
+    artifacts = baseline / "artifacts"
+    artifacts.mkdir()
+    paired_test_archives(artifacts, version)
+    hashes = evidence.distribution_hashes(artifacts)
+    pr = bot_pr(event)
+    source, tree, base = "c" * 40, "d" * 40, "b" * 40
+    pr.update(merged=True, merged_at="2020-01-01T00:05:00Z", merge_commit_sha=source)
+    pr["body"] = automation.body(
+        {"kind": "package", "version": version, "generated_head": pr["head"]["sha"], "base": base}
+    )
+    run = {"event": "push", "head_branch": "main", "head_sha": source, "run_attempt": 1}
+    responses = {
+        "actions/runs/80": run,
+        f"commits/{source}/pulls?per_page=100": [pr],
+        "pulls/7": pr,
+    }
+    monkeypatch.setattr(publishing, "api", lambda repo, route: responses[route])
+    monkeypatch.setenv("RELEASE_BOT_LOGIN", pr["user"]["login"])
+    monkeypatch.setattr(
+        publishing, "git",
+        lambda *args: {
+            ("fetch", "origin", source): "",
+            ("rev-parse", f"{source}^{{tree}}"): tree,
+            ("rev-parse", f"{source}^1"): base,
+        }[args],
+    )
+    monkeypatch.setattr(
+        publishing, "snapshot",
+        lambda revision, target: apply(
+            target, {name: (baseline / name).read_bytes() for name in BASELINE_FILES}
+        ),
+    )
+    monkeypatch.setattr(
+        publishing, "gate_for_run",
+        lambda *args, **kwargs: {"tree": tree, "tested_sha": source, "distributions": hashes},
+    )
+    monkeypatch.setattr(publishing, "current_intent", lambda *args: None)
+
+    def download(command, *, check):
+        assert command[:3] == ["gh", "run", "download"] and check
+        destination = Path(command[-1])
+        destination.mkdir()
+        for artifact in artifacts.iterdir():
+            shutil.copyfile(artifact, destination / artifact.name)
+
+    requested = []
+
+    def fetch(url):
+        requested.append(url)
+        if url != f"https://pypi.org/pypi/{existing_project}/{version}/json":
+            raise HTTPError(url, 404, "project version is missing", None, None)
+        return contract.json_bytes({"urls": [
+            {"filename": name, "digests": {"sha256": digest}}
+            for name, digest in hashes.items()
+            if name.startswith(existing_project.replace("-", "_") + "-")
+        ]})
+
+    monkeypatch.setattr(publishing.subprocess, "run", download)
+    monkeypatch.setattr(publishing, "fetch", fetch)
+    report = automation.receipt(None)
+    outputs = publishing.prepare(baseline, "owner/data", 80, baseline / "bundle", report)
+    assert outputs["eligible"] == "true"
+    assert outputs["published"] == "false"
+    assert report["state"] == "deploying"
+    for project in publishing.PYPI_PROJECTS:
+        assert outputs["published_" + project.replace("-", "_")] == str(
+            project == existing_project
+        ).lower()
+    assert set(requested) == {
+        f"https://pypi.org/pypi/{project}/{version}/json" for project in publishing.PYPI_PROJECTS
+    }
+
+
 def test_public_receipt_cannot_contain_homegrown_or_private_fields(ready) -> None:
     event, _manifest = ready
     report = automation.receipt(event, "test")
@@ -691,6 +771,14 @@ def test_workflows_keep_every_gate_ahead_of_oidc_publication() -> None:
     assert preflight < publish[0][0] < publish[1][0]
     assert publish[0][1]["with"]["packages-dir"] == "bundle/pypi/tunaxis-data/"
     assert publish[1][1]["with"]["packages-dir"] == "bundle/pypi/pineforge-data/"
+    assert publish[0][1]["if"] == "needs.prepare.outputs.published_tunaxis_data != 'true'"
+    assert publish[1][1]["if"] == "needs.prepare.outputs.published_pineforge_data != 'true'"
+    assert all(step["with"]["skip-existing"] == "true" for _index, step in publish)
+    for project in publishing.PYPI_PROJECTS:
+        key = "published_" + project.replace("-", "_")
+        assert release["jobs"]["prepare"]["outputs"][key] == (
+            "${{ steps.release.outputs." + key + " }}"
+        )
     assert release["jobs"]["publish"]["environment"]["name"] == "pypi"
     receiver = yaml.load((workflows / "pineforge-release.yml").read_text(), Loader=yaml.BaseLoader)
     assert receiver["on"]["repository_dispatch"]["types"] == ["pineforge-release"]

@@ -88,6 +88,8 @@ jobs:
       eligible: ${{ steps.release.outputs.eligible }}
       has_target: ${{ steps.release.outputs.has_target }}
       published: ${{ steps.release.outputs.published }}
+      published_tunaxis_data: ${{ steps.release.outputs.published_tunaxis_data }}
+      published_pineforge_data: ${{ steps.release.outputs.published_pineforge_data }}
       sha: ${{ steps.release.outputs.sha }}
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
@@ -228,13 +230,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python -m release_chain.publishing preflight --directory bundle --receipt report/release-receipt.json
       - name: Publish tunaxis-data to PyPI with Trusted Publishing
+        if: needs.prepare.outputs.published_tunaxis_data != 'true'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: bundle/pypi/tunaxis-data/
+          skip-existing: true
       - name: Publish pineforge-data shim to PyPI with Trusted Publishing
+        if: needs.prepare.outputs.published_pineforge_data != 'true'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: bundle/pypi/pineforge-data/
+          skip-existing: true
       - uses: actions/upload-artifact@v5
         if: always()
         with:

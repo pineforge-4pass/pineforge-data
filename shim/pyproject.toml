@@ -39,4 +39,4 @@ include = ["/src/pineforge_data/**"]
 sources = ["src"]
 
 [tool.hatch.build.targets.sdist]
-include = ["/pyproject.toml", "/README.md", "/hatch_build.py", "/src/pineforge_data"]
+include = ["/pyproject.toml", "/README.md", "/LICENSE", "/hatch_build.py", "/src/pineforge_data"]

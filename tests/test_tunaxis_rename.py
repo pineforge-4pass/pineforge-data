@@ -68,6 +68,27 @@ assert canonical.TunaxisBacktestRunner is legacy.TunaxisBacktestRunner
     assert result.returncode == 0, result.stderr
 
 
+def test_legacy_python_module_execution_matches_canonical(tmp_path: Path) -> None:
+    results = []
+    for package in ("tunaxis_data", "pineforge_data"):
+        result = subprocess.run(
+            [
+                sys.executable, "-W", "always::DeprecationWarning",
+                "-m", f"{package}.cli.backtest", "--help",
+            ],
+            cwd=tmp_path,
+            env=dict(os.environ, PYTHONPATH=str(SRC)),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        results.append(result)
+    assert results[0].stdout == results[1].stdout
+    assert "DeprecationWarning" not in results[0].stderr
+    assert results[1].stderr.count("DeprecationWarning: pineforge_data is deprecated") == 1
+
+
 def _wheel_scripts(path: Path) -> dict[str, str]:
     with zipfile.ZipFile(path) as archive:
         members = [name for name in archive.namelist() if name.endswith("/entry_points.txt")]
@@ -169,6 +190,17 @@ def test_real_paired_wheels_have_exact_metadata_and_no_overlap(paired_artifacts)
     } == extras
     with zipfile.ZipFile(main) as main_archive, zipfile.ZipFile(shim) as shim_archive:
         assert not set(main_archive.namelist()) & set(shim_archive.namelist())
+        assert shim_archive.read("pineforge_data/py.typed") == (
+            SRC / "pineforge_data/py.typed"
+        ).read_bytes()
+        main_licenses = [
+            name for name in main_archive.namelist()
+            if name.endswith(".dist-info/licenses/LICENSE")
+        ]
+        assert len(main_licenses) == 1
+        shim_license = f"pineforge_data-{version}.dist-info/licenses/LICENSE"
+        assert main_archive.read(main_licenses[0]) == shim_archive.read(shim_license)
+        assert shim_archive.read(shim_license) == (ROOT / "LICENSE").read_bytes()
     files = {path.name: path.read_bytes() for path in paired_artifacts.iterdir()}
     verify_archives(files, version)
 
@@ -190,7 +222,7 @@ def test_shim_direct_wheel_matches_wheel_from_sdist(paired_artifacts, tmp_path: 
         assert direct_names.count("pineforge_data/__init__.py") == 1
         assert sdist_names.count("pineforge_data/__init__.py") == 1
         assert {name for name in direct_names if name.startswith("pineforge_data/")} == {
-            "pineforge_data/__init__.py"
+            "pineforge_data/__init__.py", "pineforge_data/py.typed"
         }
         assert not any(name.startswith(("src/", "tunaxis_data/")) for name in direct_names)
         for name in direct_names:

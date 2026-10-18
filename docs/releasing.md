@@ -32,6 +32,7 @@ A stable update changes only:
 - `src/tunaxis_data/release_contract.py`: Python image default;
 - `docker/server.Dockerfile`: the same image default and hub source pin;
 - `pyproject.toml`: an independent data package patch increment;
+- `shim/pyproject.toml`: the same package version and exact dependency/extra pins;
 - `src/tunaxis_data/release_lock.json`: complete received event, data version
   and previous identity;
 - `src/tunaxis_data/release_manifest.json`: exact verified manifest bytes.
@@ -60,7 +61,7 @@ Actions job inventory and refuses failed, cancelled, missing or skipped jobs:
 | Release contract | Synchronized defaults, original hub manifest bytes, tag/source, facts and both OCI children |
 | Docker runtime | Existing real backtest, header/ctypes ABI comparison, harness parity, concurrent server/cache behavior; observed runtime and built server labels must agree with the manifest |
 | Database E2E | Existing corpus-backed SQLite/MySQL/Postgres provider E2E against disposable CI resources |
-| Distribution | Build wheel/sdist, strict metadata and native-feed exclusion checks; install each in an isolated environment and exercise a real Pine backtest without importing checkout source |
+| Distribution | Build both projects' wheels/sdists and check metadata/native-feed exclusion; backtest the canonical wheel and sdist in isolated environments and install both local wheels to verify shim imports, warning, and all four CLIs without checkout source |
 
 Dedicated Docker and database jobs check a named, nonempty JUnit inventory and
 allow zero skips. Opt-in Docker/database cases may skip in the ordinary unit
@@ -193,7 +194,7 @@ replace the tested dependency with a moving image alias. Actions write access
 is used only on this consumer to replay its existing `Release` workflow after
 a complete successful landed CI run. It never reruns producer bump logic.
 
-For repair, dispatch `Tunaxis release adapter` to reconcile. To replay a
+For repair, dispatch `PineForge release adapter` to reconcile. To replay a
 publication explicitly, dispatch `Release` from `main` with `ci_run` set to the
 successful landed main CI run ID. Leave the other optional input empty. To
 publish an ordinary data change, leave `ci_run` empty and choose a semantic

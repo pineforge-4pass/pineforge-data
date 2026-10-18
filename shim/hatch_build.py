@@ -9,16 +9,14 @@ from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 class CustomBuildHook(BuildHookInterface):
     def initialize(self, version: str, build_data: dict[str, Any]) -> None:
         root = Path(self.root)
-        source = root / "src/pineforge_data/__init__.py"
-        if source.is_file():
-            # The extracted sdist already selects this source through pyproject.toml.
-            # Force-including it too would add the same wheel member twice.
-            return
-        source = root.parent / "src/pineforge_data/__init__.py"
-        if not source.is_file():
-            raise FileNotFoundError("missing the pineforge_data compatibility alias source")
-        # In a checkout the alias lives outside the shim root, so normal file
-        # selection cannot reach it. Include it once at the target's package path.
-        # Include only the alias module, never generated files such as bytecode.
         destination = "src/pineforge_data" if self.target_name == "sdist" else "pineforge_data"
-        build_data["force_include"][str(source)] = f"{destination}/__init__.py"
+        for name in ("__init__.py", "py.typed"):
+            relative = Path("src/pineforge_data") / name
+            if (root / relative).is_file():
+                # An extracted sdist selects this file normally; do not add it twice.
+                continue
+            source = root.parent / relative
+            if not source.is_file():
+                raise FileNotFoundError(f"missing the pineforge_data alias file: {name}")
+            # A checkout selects only these external source files, never bytecode.
+            build_data["force_include"][str(source)] = f"{destination}/{name}"

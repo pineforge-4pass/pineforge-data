@@ -1,4 +1,4 @@
-"""Standard-library client for the PineForge FastAPI backtest service."""
+"""Standard-library client for the Tunaxis FastAPI backtest service."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ def _scalar_inputs(values: Mapping[str, JsonValue] | None, field: str) -> dict[s
 
 @dataclass(frozen=True, slots=True)
 class FastApiBacktestClient:
-    """Submit normalized bars to a bounded remote PineForge runtime."""
+    """Submit normalized bars to a bounded remote Tunaxis runtime."""
 
     base_url: str
     timeout_seconds: float = 330.0

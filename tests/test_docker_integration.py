@@ -12,7 +12,7 @@ from urllib.request import urlopen
 
 import pytest
 
-from pineforge_data import (
+from tunaxis_data import (
     DEFAULT_RELEASE_IMAGE,
     BacktestOptions,
     Bar,
@@ -20,8 +20,8 @@ from pineforge_data import (
     FastApiBacktestClient,
     Instrument,
 )
-from pineforge_data.backtest import EXPECTED_PF_ABI
-from pineforge_data.release_contract import write_release_inputs
+from tunaxis_data.backtest import EXPECTED_PF_ABI
+from tunaxis_data.release_contract import write_release_inputs
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("PINEFORGE_DOCKER_TEST") != "1",
@@ -37,7 +37,7 @@ def assert_release_identity(runtime: dict[str, Any], *, server: bool = False) ->
     version = DEFAULT_RELEASE_IMAGE.split(":")[-2].split("@", 1)[0]
     assert runtime["release_version"] == version
     assert runtime["engine_version"] == runtime["codegen_version"] == version
-    lock_path = ROOT / "src/pineforge_data/release_lock.json"
+    lock_path = ROOT / "src/tunaxis_data/release_lock.json"
     if lock_path.exists():
         event = json.loads(lock_path.read_text())["event"]
         assert runtime["hub_commit"] == event["hub_commit"]
@@ -241,7 +241,7 @@ def test_server_handles_concurrent_requests_and_reuses_compile_cache() -> None:
     assert build.returncode == 0, f"server image build failed:\n{build.stdout}\n{build.stderr}"
     inspected = json.loads(subprocess.check_output(["docker", "image", "inspect", image]))[0]
     labels = inspected["Config"]["Labels"]
-    lock_path = ROOT / "src/pineforge_data/release_lock.json"
+    lock_path = ROOT / "src/tunaxis_data/release_lock.json"
     if lock_path.exists():
         event = json.loads(lock_path.read_text())["event"]
         assert labels["org.opencontainers.image.revision"] == event["hub_commit"]

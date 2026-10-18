@@ -3,14 +3,14 @@ requires = ["hatchling>=1.26"]
 build-backend = "hatchling.build"
 
 [project]
-name = "pineforge-data"
+name = "tunaxis-data"
 version = "0.3.0"
-description = "Provider-neutral market data adapters and raw-PineScript backtest harness for PineForge"
+description = "Provider-neutral market data adapters and raw-PineScript backtest harness for Tunaxis"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
-authors = [{ name = "PineForge contributors" }]
-keywords = ["pinescript", "backtesting", "market-data"]
+authors = [{ name = "Tunaxis contributors" }]
+keywords = ["tunaxis", "pinescript", "backtesting", "market-data"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "License :: OSI Approved :: Apache Software License",
@@ -23,8 +23,8 @@ classifiers = [
 dependencies = []
 
 [project.scripts]
-pineforge-backtest = "pineforge_data.cli.backtest:main"
-pineforge-backtest-server = "pineforge_data.server:main"
+tunaxis-backtest = "tunaxis_data.cli.backtest:main"
+tunaxis-backtest-server = "tunaxis_data.server:main"
 
 [project.optional-dependencies]
 ccxt = ["ccxt>=4.5.64,<5"]
@@ -51,6 +51,7 @@ release = [
 dev = [
     "build>=1.2",
     "fastapi>=0.139,<0.140",
+    "hatchling>=1.26",
     "httpx2>=2.5,<2.6",
     "mypy>=1.13",
     "pytest>=8.3",
@@ -67,10 +68,10 @@ Issues = "https://github.com/pineforge-4pass/pineforge-data/issues"
 Source = "https://github.com/pineforge-4pass/pineforge-data"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/pineforge_data"]
+packages = ["src/tunaxis_data"]
 
 [tool.hatch.build.targets.sdist]
-exclude = ["/native"]
+exclude = ["/native", "/src/pineforge_data", "/shim"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
@@ -88,5 +89,5 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
-packages = ["pineforge_data"]
+packages = ["tunaxis_data"]
 mypy_path = "src"

@@ -1,4 +1,4 @@
-# Backtesting with PineForge Data
+# Backtesting with Tunaxis Data
 
 The harness accepts raw PineScript. Data acquisition stays in Python while
 transpilation, compilation, and deterministic execution stay in
@@ -26,7 +26,7 @@ are documented in the [server guide](server.md).
 ## CLI reference
 
 ```bash
-pineforge-backtest \
+tunaxis-backtest \
   --pine strategy.pine \
   --provider ccxt \
   --venue bitstamp \
@@ -57,7 +57,7 @@ Use `--warmup-bars` to load source bars before `--start` without allowing the
 strategy to place orders during that earlier interval:
 
 ```bash
-pineforge-backtest \
+tunaxis-backtest \
   --pine strategy.pine \
   --provider ccxt \
   --venue bitstamp \
@@ -69,7 +69,7 @@ pineforge-backtest \
 ```
 
 The warmup bars initialize indicators, higher-timeframe feeds, and persistent
-Pine variables. PineForge suppresses order commands until `--start`, so broker
+Pine variables. Tunaxis suppresses order commands until `--start`, so broker
 state and trade counters begin at the requested backtest boundary. The default
 is `0` for backward compatibility.
 
@@ -133,7 +133,7 @@ guides.
 ## Runtime image policy
 
 The package default is the exact release and OCI digest exported as
-`pineforge_data.DEFAULT_RELEASE_IMAGE`. The server Dockerfile carries the same
+`tunaxis_data.DEFAULT_RELEASE_IMAGE`. The server Dockerfile carries the same
 pin. Release updates commit the verified hub manifest and dependency lock next
 to the package, increment the independently versioned data package, and pass
 the [release gates](releasing.md) before publication. The `missing` pull
@@ -167,7 +167,7 @@ The rolling channel is explicit:
 ```
 
 Use the pinned default for reproducible research. A rolling tag may change
-engine or codegen behavior without a `pineforge-data` version change.
+engine or codegen behavior without a `tunaxis-data` version change.
 
 ## Report envelope
 

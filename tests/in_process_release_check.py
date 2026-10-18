@@ -5,13 +5,13 @@ This script runs inside the release image with the repository's ``src`` on
 ``/in/strategy.pine`` with the image's entrypoint, compiles the library the way
 the entrypoint does, and prints one JSON document on stdout:
 
-- ``layout``: every structure ``pineforge_data`` mirrors, as the C compiler lays
+- ``layout``: every structure ``tunaxis_data`` mirrors, as the C compiler lays
   it out from the image's ``pineforge.h`` (``c``) and as ``ctypes`` does: each
   member's name, offset, size and scalar kind;
 - ``header_abi`` and ``library_abi``: ``PF_ABI_VERSION`` and the compiled
   library's ``pf_abi_version()``;
 - ``release``: the image's own report (``run_json.py``) for that library;
-- ``in_process``: ``PineForgeBacktestRunner``'s report for the same library,
+- ``in_process``: ``TunaxisBacktestRunner``'s report for the same library,
   bars and options, or ``in_process_error`` when the runner refuses it.
 """
 
@@ -27,14 +27,14 @@ import sys
 import tempfile
 from pathlib import Path
 
-from pineforge_data import (
+from tunaxis_data import (
     BacktestOptions,
     Bar,
     EngineBacktestError,
     Instrument,
-    PineForgeBacktestRunner,
+    TunaxisBacktestRunner,
 )
-from pineforge_data.backtest import (
+from tunaxis_data.backtest import (
     _PfEquityPoint,
     _PfEquityStats,
     _PfMetrics,
@@ -44,7 +44,7 @@ from pineforge_data.backtest import (
     _PfTrade,
     _PfTradeStats,
 )
-from pineforge_data.engine import PfBar, PfTradeTick
+from tunaxis_data.engine import PfBar, PfTradeTick
 
 PREFIX = Path(os.environ.get("PINEFORGE_PREFIX", "/opt/pineforge"))
 IN_DIR = Path("/in")
@@ -228,7 +228,7 @@ def release_report(
         "true",
         "--syminfo",
         str(IN_DIR / "syminfo.json"),
-        # PineForgeBacktestRunner sets the chart timezone to the instrument's.
+        # TunaxisBacktestRunner sets the chart timezone to the instrument's.
         "--chart-tz",
         instrument.timezone,
     ]
@@ -260,7 +260,7 @@ def main() -> int:
         in_process: object = None
         in_process_error = None
         try:
-            runner = PineForgeBacktestRunner.load(library)
+            runner = TunaxisBacktestRunner.load(library)
             in_process = runner.run(bars, instrument=instrument, options=options).to_dict()
         except EngineBacktestError as error:
             in_process_error = str(error)

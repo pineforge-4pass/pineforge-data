@@ -8,7 +8,6 @@ import hashlib
 import json
 import re
 import subprocess
-import tomllib
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
@@ -17,11 +16,12 @@ from urllib.request import Request, urlopen
 HUB = "pineforge-4pass/pineforge-release"
 IMAGE = f"ghcr.io/{HUB}"
 SCHEMA = "pineforge/release-ready/v1"
-LOCK = "src/pineforge_data/release_lock.json"
-MANIFEST = "src/pineforge_data/release_manifest.json"
-RUNTIME = "src/pineforge_data/release_contract.py"
+LOCK = "src/tunaxis_data/release_lock.json"
+MANIFEST = "src/tunaxis_data/release_manifest.json"
+RUNTIME = "src/tunaxis_data/release_contract.py"
 DOCKERFILE = "docker/server.Dockerfile"
-UPDATE_FILES = {LOCK, MANIFEST, RUNTIME, DOCKERFILE, "pyproject.toml"}
+SHIM_PROJECT = "shim/pyproject.toml"
+UPDATE_FILES = {LOCK, MANIFEST, RUNTIME, DOCKERFILE, "pyproject.toml", SHIM_PROJECT}
 HEX40 = re.compile(r"[0-9a-f]{40}")
 HEX64 = re.compile(r"[0-9a-f]{64}")
 SEMVER = re.compile(
@@ -357,7 +357,9 @@ def runtime_pin(root: Path) -> str:
 
 
 def package_version(root: Path) -> str:
-    return tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
+    from bump_version import synchronized_version
+
+    return synchronized_version(root / "pyproject.toml")
 
 
 def load_lock(root: Path) -> dict[str, Any] | None:
@@ -365,6 +367,7 @@ def load_lock(root: Path) -> dict[str, Any] | None:
 
 
 def verify_local(root: Path) -> dict[str, Any] | None:
+    package_version(root)
     pin = runtime_pin(root)
     docker = (root / DOCKERFILE).read_text()
     require(f"ARG PINEFORGE_RELEASE_IMAGE={pin}\n" in docker, "runtime/server pin mismatch")
@@ -424,9 +427,8 @@ def update_files(
     current = package_version(root)
     major, minor, patch = version_key(current)
     replacement = f"{major}.{minor}.{patch + 1}"
-    pyproject = (root / "pyproject.toml").read_text()
     # Import the existing version editor rather than duplicating its table rules.
-    from bump_version import replace_project_version
+    from bump_version import version_edits
 
     lock = {
         "event": event,
@@ -467,7 +469,10 @@ def update_files(
     return {
         RUNTIME: runtime,
         DOCKERFILE: docker,
-        "pyproject.toml": replace_project_version(pyproject, current, replacement).encode(),
+        **{
+            str(path.relative_to(root)): text.encode()
+            for path, text in version_edits(root / "pyproject.toml", replacement).items()
+        },
         LOCK: json_bytes(lock),
         MANIFEST: manifest,
     }

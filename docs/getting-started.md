@@ -16,7 +16,7 @@ Install CCXT support for crypto exchanges:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install 'pineforge-data[ccxt]'
+.venv/bin/pip install 'tunaxis-data[ccxt]'
 ```
 
 Available extras:
@@ -37,7 +37,7 @@ instruments.
 ```python
 import asyncio
 
-from pineforge_data import BarRequest, CcxtProvider
+from tunaxis_data import BarRequest, CcxtProvider
 
 
 async def main() -> None:
@@ -64,7 +64,7 @@ excludes a candle that was not closed at the request's observation time.
 ## Run a raw-Pine backtest locally
 
 ```bash
-.venv/bin/pineforge-backtest \
+.venv/bin/tunaxis-backtest \
   --pine strategy.pine \
   --provider ccxt \
   --venue bitstamp \
@@ -87,7 +87,7 @@ If a backtest server is already running:
 ```bash
 export PINEFORGE_SERVER_URL=http://127.0.0.1:8000
 export PINEFORGE_SERVER_API_KEY=change-me
-.venv/bin/pineforge-backtest \
+.venv/bin/tunaxis-backtest \
   --pine strategy.pine \
   --venue bitstamp \
   --symbol BTC/USD \

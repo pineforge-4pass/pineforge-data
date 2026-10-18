@@ -10,7 +10,7 @@ from typing import ClassVar
 
 import pytest
 
-from pineforge_data import (
+from tunaxis_data import (
     FxMacroDataAccessWarning,
     FxMacroDataDataError,
     FxMacroDataHTTPError,
@@ -20,7 +20,7 @@ from pineforge_data import (
     MacroObservation,
     MacroRequest,
 )
-from pineforge_data.providers.fxmacrodata import UrllibTransport
+from tunaxis_data.providers.fxmacrodata import UrllibTransport
 
 FIXTURE = Path(__file__).parent / "fixtures" / "fxmacrodata_usd_non_farm_payrolls.json"
 START_MS = 1_775_001_600_000  # 2026-04-01

@@ -138,13 +138,17 @@ jobs:
       - name: Set reproducible archive timestamps
         run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
       - run: python -m build
+      - name: Build the compatibility shim from the same version
+        run: python -m build --outdir dist shim
       - run: python -m twine check --strict dist/*
       - name: The canonical sdist does not ship the native feed
         run: |
-          if tar -tzf dist/*.tar.gz | grep -E '^[^/]+/native/'; then
-            echo "native/ must stay out of the Python sdist" >&2
-            exit 1
-          fi
+          for archive in dist/tunaxis_data-*.tar.gz; do
+            if tar -tzf "$archive" | grep -E '^[^/]+/native/'; then
+              echo "native/ must stay out of the Tunaxis sdist" >&2
+              exit 1
+            fi
+          done
       - name: Install and backtest both built distributions without importing checkout source
         env:
           PYTHONPATH: scripts
@@ -152,7 +156,7 @@ jobs:
           set -euo pipefail
           version="$(python scripts/bump_version.py current)"
           image="$(python -c 'from pathlib import Path; from release_chain.contract import runtime_pin; print(runtime_pin(Path.cwd()))')"
-          for artifact in "$GITHUB_WORKSPACE"/dist/*; do
+          for artifact in "$GITHUB_WORKSPACE"/dist/tunaxis_data-*; do
             case "$artifact" in
               *.whl) kind=wheel ;;
               *.tar.gz) kind=sdist ;;

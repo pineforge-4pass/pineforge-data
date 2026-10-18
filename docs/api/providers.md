@@ -2,70 +2,70 @@
 
 ## Structural provider protocols
 
-::: pineforge_data.providers.base
+::: tunaxis_data.providers.base
 
 ## Registry and third-party entry points
 
-::: pineforge_data.providers.registry.ProviderFactory
+::: tunaxis_data.providers.registry.ProviderFactory
 
-::: pineforge_data.providers.registry.ProviderRegistry
+::: tunaxis_data.providers.registry.ProviderRegistry
 
-::: pineforge_data.providers.registry.ProviderRegistryError
+::: tunaxis_data.providers.registry.ProviderRegistryError
 
-::: pineforge_data.providers.registry.ProviderNotFoundError
+::: tunaxis_data.providers.registry.ProviderNotFoundError
 
-::: pineforge_data.providers.registry.create_provider
+::: tunaxis_data.providers.registry.create_provider
 
 ## Runtime tabular mapping
 
-::: pineforge_data.providers.tabular.TimestampUnit
+::: tunaxis_data.providers.tabular.TimestampUnit
 
-::: pineforge_data.providers.tabular.SourceColumn
+::: tunaxis_data.providers.tabular.SourceColumn
 
-::: pineforge_data.providers.tabular.BarColumnMapping
+::: tunaxis_data.providers.tabular.BarColumnMapping
 
-::: pineforge_data.providers.tabular.TabularSchema
+::: tunaxis_data.providers.tabular.TabularSchema
 
-::: pineforge_data.providers.tabular.TabularBarProvider
+::: tunaxis_data.providers.tabular.TabularBarProvider
 
-::: pineforge_data.providers.tabular.SchemaMappingError
+::: tunaxis_data.providers.tabular.SchemaMappingError
 
-::: pineforge_data.providers.tabular.TabularDataError
+::: tunaxis_data.providers.tabular.TabularDataError
 
 ## Built-in providers
 
-::: pineforge_data.providers.ccxt.CcxtProvider
+::: tunaxis_data.providers.ccxt.CcxtProvider
 
-::: pineforge_data.providers.local.CsvBarProvider
+::: tunaxis_data.providers.local.CsvBarProvider
 
-::: pineforge_data.providers.local.SqliteBarProvider
+::: tunaxis_data.providers.local.SqliteBarProvider
 
-::: pineforge_data.providers.sqlalchemy.SqlAlchemyBarProvider
+::: tunaxis_data.providers.sqlalchemy.SqlAlchemyBarProvider
 
-::: pineforge_data.providers.fxmacrodata.FxMacroDataProvider
+::: tunaxis_data.providers.fxmacrodata.FxMacroDataProvider
 
-::: pineforge_data.providers.fxmacrodata.FxMacroDataTransport
+::: tunaxis_data.providers.fxmacrodata.FxMacroDataTransport
 
-::: pineforge_data.providers.fxmacrodata.FxMacroDataResponse
+::: tunaxis_data.providers.fxmacrodata.FxMacroDataResponse
 
-::: pineforge_data.providers.fxmacrodata.UrllibTransport
+::: tunaxis_data.providers.fxmacrodata.UrllibTransport
 
 ## Provider errors
 
-::: pineforge_data.providers.ccxt.CcxtError
+::: tunaxis_data.providers.ccxt.CcxtError
 
-::: pineforge_data.providers.ccxt.CcxtDependencyError
+::: tunaxis_data.providers.ccxt.CcxtDependencyError
 
-::: pineforge_data.providers.ccxt.CcxtCapabilityError
+::: tunaxis_data.providers.ccxt.CcxtCapabilityError
 
-::: pineforge_data.providers.ccxt.CcxtDataError
+::: tunaxis_data.providers.ccxt.CcxtDataError
 
-::: pineforge_data.providers.sqlalchemy.SqlAlchemyDependencyError
+::: tunaxis_data.providers.sqlalchemy.SqlAlchemyDependencyError
 
-::: pineforge_data.providers.fxmacrodata.FxMacroDataError
+::: tunaxis_data.providers.fxmacrodata.FxMacroDataError
 
-::: pineforge_data.providers.fxmacrodata.FxMacroDataHTTPError
+::: tunaxis_data.providers.fxmacrodata.FxMacroDataHTTPError
 
-::: pineforge_data.providers.fxmacrodata.FxMacroDataDataError
+::: tunaxis_data.providers.fxmacrodata.FxMacroDataDataError
 
-::: pineforge_data.providers.fxmacrodata.FxMacroDataAccessWarning
+::: tunaxis_data.providers.fxmacrodata.FxMacroDataAccessWarning

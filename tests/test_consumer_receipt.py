@@ -322,27 +322,18 @@ def test_workflow_transport_is_trusted_upload_then_signal():
 
 def test_previous_identity_requires_observed_manifest_provenance(monkeypatch):
     # Byte-identical downloads/assets still cannot manufacture missing prior facts.
-    files = {"previous.whl": b"legacy wheel", "previous.tar.gz": b"legacy sdist"}
-    hashes = {name: contract.sha256(raw) for name, raw in files.items()}
-    metadata = {
-        "urls": [
-            {
-                "filename": name,
-                "digests": {"sha256": digest},
-                "url": "https://files.pythonhosted.org/" + name,
-            }
-            for name, digest in hashes.items()
-        ]
+    files = {
+        "tunaxis_data-0.3.0-py3-none-any.whl": b"legacy main wheel",
+        "tunaxis_data-0.3.0.tar.gz": b"legacy main sdist",
+        "pineforge_data-0.3.0-py3-none-any.whl": b"legacy shim wheel",
+        "pineforge_data-0.3.0.tar.gz": b"legacy shim sdist",
     }
-    monkeypatch.setattr(publishing, "pypi_files", lambda version: hashes)
+    hashes = {name: contract.sha256(raw) for name, raw in files.items()}
+    monkeypatch.setattr(publishing, "pypi_files", lambda version, project=None: hashes)
     monkeypatch.setattr(
         publishing,
-        "fetch",
-        lambda url: (
-            contract.json_bytes(metadata)
-            if url.startswith("https://pypi.org/")
-            else files[url.rsplit("/", 1)[1]]
-        ),
+        "pypi_downloads",
+        lambda version, projects=publishing.PYPI_PROJECTS: (hashes, files),
     )
     monkeypatch.setattr(
         publishing,

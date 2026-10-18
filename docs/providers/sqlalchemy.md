@@ -5,15 +5,15 @@
 
 The `sqlalchemy` provider reflects one table or view through a synchronous
 SQLAlchemy 2.x engine. It supports SQLAlchemy built-in and third-party dialects
-without requiring ORM models or a PineForge-owned DDL.
+without requiring ORM models or a Tunaxis-owned DDL.
 
 ## Install
 
-Install PineForge's database extra and the driver for the target dialect:
+Install Tunaxis's database extra and the driver for the target dialect:
 
 ```bash
-pip install 'pineforge-data[database]' 'psycopg[binary]'  # PostgreSQL
-pip install 'pineforge-data[database]' pymysql             # MySQL
+pip install 'tunaxis-data[database]' 'psycopg[binary]'  # PostgreSQL
+pip install 'tunaxis-data[database]' pymysql             # MySQL
 ```
 
 The `database` extra installs SQLAlchemy, not every database driver. For
@@ -32,7 +32,7 @@ mysql+pymysql://user:password@host/database
 ```python
 import os
 
-from pineforge_data import SqlAlchemyBarProvider
+from tunaxis_data import SqlAlchemyBarProvider
 
 provider = SqlAlchemyBarProvider(
     os.environ["PINEFORGE_DATABASE_URL"],
@@ -48,9 +48,9 @@ provider = SqlAlchemyBarProvider(
 ```
 
 The URL must select a synchronous SQLAlchemy driver. Provider calls run in a
-worker thread so they do not block the async PineForge harness.
+worker thread so they do not block the async Tunaxis harness.
 
-Use a database role with `SELECT` access only. PineForge Data issues reflection
+Use a database role with `SELECT` access only. Tunaxis Data issues reflection
 and select operations, but database permissions remain the strongest safety
 boundary.
 
@@ -63,13 +63,13 @@ for column in schema.columns:
 ```
 
 Reflection loads the exact table/view and optional schema. The returned source
-identity includes the PineForge venue and qualified table, not the connection
+identity includes the Tunaxis venue and qualified table, not the connection
 URL or credentials.
 
 ## Resolve and fetch bars
 
 ```python
-from pineforge_data import BarRequest
+from tunaxis_data import BarRequest
 
 
 async def load_database():
@@ -135,7 +135,7 @@ Keep credentials out of JSON by naming an environment variable:
 
 ```bash
 export PINEFORGE_DATABASE_URL='postgresql+psycopg://user:password@db/market'
-pineforge-backtest \
+tunaxis-backtest \
   --pine strategy.pine \
   --provider sqlalchemy \
   --provider-config database.json \
@@ -165,7 +165,7 @@ original cause.
 
 Only synchronous engines are supported initially. Each provider owns one
 engine and reflected table cache. Query pagination is delegated to the database
-filter and ordering plan; PineForge Data currently materializes the selected
+filter and ordering plan; Tunaxis Data currently materializes the selected
 rows before final normalization and `limit` application.
 
 ## Corpus-backed compatibility test
@@ -179,7 +179,7 @@ python -m pip install -e '.[dev,database-e2e]'
 ./scripts/run_database_e2e.sh
 ```
 
-The three databases receive the same OHLCV slice from the PineForge validation
+The three databases receive the same OHLCV slice from the Tunaxis validation
 corpus. The test constructs providers through the public registry API and
 requires every backend to return identical normalized bars. The containers and
 their volumes are removed when the command exits.

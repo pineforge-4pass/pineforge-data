@@ -1,4 +1,4 @@
-"""Dependency-free interoperability with PineForge's streaming C ABI."""
+"""Dependency-free interoperability with Tunaxis's streaming C ABI."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from .models import Bar, Instrument, TradeTick
 
 
 class PfBar(ctypes.Structure):
-    """``ctypes`` mirror of PineForge's ``pf_bar_t``."""
+    """``ctypes`` mirror of Tunaxis's ``pf_bar_t``."""
 
     _fields_ = [
         ("open", ctypes.c_double),
@@ -23,7 +23,7 @@ class PfBar(ctypes.Structure):
 
 
 class PfTradeTick(ctypes.Structure):
-    """``ctypes`` mirror of PineForge's ``pf_trade_tick_t``."""
+    """``ctypes`` mirror of Tunaxis's ``pf_trade_tick_t``."""
 
     _fields_ = [
         ("timestamp", ctypes.c_int64),
@@ -72,7 +72,7 @@ def pack_trade_ticks(
 
 
 class EngineStreamSink:
-    """Send normalized records to an existing PineForge strategy instance.
+    """Send normalized records to an existing Tunaxis strategy instance.
 
     The caller owns both ``library`` and ``state``. This adapter configures and
     invokes only the streaming functions; it never creates or frees a strategy.
@@ -85,7 +85,7 @@ class EngineStreamSink:
         instrument: Instrument,
     ) -> None:
         if not state:
-            raise ValueError("state must be a non-null PineForge strategy handle")
+            raise ValueError("state must be a non-null Tunaxis strategy handle")
         self._library = library
         self._state = state
         self.instrument = instrument
@@ -182,4 +182,4 @@ class EngineStreamSink:
 
 
 if ctypes.sizeof(PfBar) != 48 or ctypes.sizeof(PfTradeTick) != 32:
-    raise RuntimeError("unsupported platform ABI layout for PineForge streaming records")
+    raise RuntimeError("unsupported platform ABI layout for Tunaxis streaming records")

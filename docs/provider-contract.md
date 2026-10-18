@@ -1,6 +1,6 @@
 # Provider contract
 
-PineForge Data treats a provider and a venue as separate identities:
+Tunaxis Data treats a provider and a venue as separate identities:
 
 - **provider** selects an adapter implementation, such as `ccxt` or a broker SDK;
 - **venue** selects the exchange, broker environment, or data source instance;
@@ -34,7 +34,7 @@ or `None`). An adapter must not manufacture metadata by parsing the symbol.
 ```python
 from collections.abc import Mapping, Sequence
 
-from pineforge_data import (
+from tunaxis_data import (
     Bar,
     BarRequest,
     Instrument,

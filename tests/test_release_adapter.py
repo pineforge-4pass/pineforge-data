@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import copy
+import io
 import shutil
+import tarfile
+import zipfile
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
@@ -12,6 +15,52 @@ from release_chain import automation, contract, evidence, publishing, receipts, 
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests/fixtures/release_chain"
+BASELINE_FILES = (contract.RUNTIME, contract.DOCKERFILE, "pyproject.toml", contract.SHIM_PROJECT)
+EXTRAS = ("ccxt", "database", "database-e2e", "server", "docs", "release", "dev")
+
+
+def paired_test_archives(directory: Path, version: str) -> None:
+    """Create valid, independently parsed wheel/sdist bytes for hash-drift tests."""
+    for project, package in (
+        ("tunaxis-data", "tunaxis_data"),
+        ("pineforge-data", "pineforge_data"),
+    ):
+        normalized = project.replace("-", "_")
+        dist_info = f"{normalized}-{version}.dist-info"
+        lines = [
+            "Metadata-Version: 2.3",
+            f"Name: {project}",
+            f"Version: {version}",
+            *(f"Provides-Extra: {extra}" for extra in EXTRAS),
+        ]
+        if project == "pineforge-data":
+            lines.extend(
+                [f"Requires-Dist: tunaxis-data=={version}"]
+                + [
+                    f"Requires-Dist: tunaxis-data[{extra}]=={version}; extra == '{extra}'"
+                    for extra in EXTRAS
+                ]
+            )
+        metadata = ("\n".join(lines) + "\n\n").encode()
+        wheel = io.BytesIO()
+        with zipfile.ZipFile(wheel, "w", zipfile.ZIP_STORED) as archive:
+            archive.writestr(f"{package}/__init__.py", b"\n")
+            archive.writestr(f"{dist_info}/METADATA", metadata)
+            archive.writestr(
+                f"{dist_info}/WHEEL",
+                b"Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            )
+        (directory / f"{normalized}-{version}-py3-none-any.whl").write_bytes(wheel.getvalue())
+        sdist = io.BytesIO()
+        with tarfile.open(fileobj=sdist, mode="w:gz") as archive:
+            info = tarfile.TarInfo(f"{normalized}-{version}/PKG-INFO")
+            info.size = len(metadata)
+            archive.addfile(info, io.BytesIO(metadata))
+            if project == "pineforge-data":
+                alias = tarfile.TarInfo(f"{normalized}-{version}/src/pineforge_data/__init__.py")
+                alias.size = 1
+                archive.addfile(alias, io.BytesIO(b"\n"))
+        (directory / f"{normalized}-{version}.tar.gz").write_bytes(sdist.getvalue())
 
 
 @pytest.fixture
@@ -24,7 +73,7 @@ def ready() -> tuple[dict[str, Any], bytes]:
 
 @pytest.fixture
 def baseline(tmp_path: Path) -> Path:
-    for name in (contract.RUNTIME, contract.DOCKERFILE, "pyproject.toml"):
+    for name in BASELINE_FILES:
         path = tmp_path / name
         path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(ROOT / name, path)
@@ -36,10 +85,9 @@ def baseline(tmp_path: Path) -> Path:
     (tmp_path / contract.RUNTIME).write_text(f'DEFAULT_RELEASE_IMAGE = (\n    "{pin}"\n)\n')
     docker = tmp_path / contract.DOCKERFILE
     docker.write_text(f"ARG PINEFORGE_RELEASE_IMAGE={pin}\nARG PINEFORGE_HUB_COMMIT=unknown\n")
-    (tmp_path / "pyproject.toml").write_text(
-        '[project]\nname = "pineforge-data"\nversion = "0.3.0"\n\n'
-        '[tool.example]\nversion = "keep-this"\n'
-    )
+    main = (ROOT / "pyproject.toml").read_text()
+    (tmp_path / "pyproject.toml").write_text(main + '\n[tool.example]\nversion = "keep-this"\n')
+    (tmp_path / contract.SHIM_PROJECT).write_text((ROOT / contract.SHIM_PROJECT).read_text())
     return tmp_path
 
 
@@ -359,7 +407,7 @@ def test_failed_consumer_e2e_never_calls_merge_api(ready, baseline, monkeypatch)
         return gate
 
     def snapshot(revision, target):
-        for name in (contract.RUNTIME, contract.DOCKERFILE, "pyproject.toml"):
+        for name in BASELINE_FILES:
             destination = target / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(baseline / name, destination)
@@ -403,8 +451,7 @@ def test_distribution_publication_refuses_different_pypi_bytes(tmp_path, monkeyp
     (bundle / "source/pyproject.toml").write_text('[project]\nversion = "0.3.1"\n')
     dist = bundle / "dist"
     dist.mkdir()
-    (dist / "pineforge_data-0.3.1-py3-none-any.whl").write_bytes(b"tested wheel")
-    (dist / "pineforge_data-0.3.1.tar.gz").write_bytes(b"tested sdist")
+    paired_test_archives(dist, "0.3.1")
     hashes = evidence.distribution_hashes(dist)
     report = automation.receipt(None, "verify")
     (bundle / "evidence.json").write_bytes(contract.json_bytes({"distributions": hashes}))
@@ -455,7 +502,7 @@ def test_duplicate_open_pr_is_reused_without_a_new_commit(ready, baseline, monke
             target,
             {
                 name: (baseline / name).read_bytes()
-                for name in (contract.RUNTIME, contract.DOCKERFILE, "pyproject.toml")
+                for name in BASELINE_FILES
             },
         ),
     )
@@ -513,7 +560,7 @@ def test_newer_pr_exists_before_obsolete_pr_is_closed(ready, baseline, monkeypat
             target,
             {
                 name: (baseline / name).read_bytes()
-                for name in (contract.RUNTIME, contract.DOCKERFILE, "pyproject.toml")
+                for name in BASELINE_FILES
             },
         ),
     )
@@ -605,8 +652,15 @@ def test_workflows_keep_every_gate_ahead_of_oidc_publication() -> None:
     assert set(release["jobs"]["publish"]["needs"]) == {"prepare", "build", "github-release"}
     steps = release["jobs"]["publish"]["steps"]
     preflight = next(i for i, step in enumerate(steps) if "preflight" in step.get("run", ""))
-    publish = next(i for i, step in enumerate(steps) if step.get("uses", "").startswith("pypa/"))
-    assert preflight < publish
+    publish = [
+        (i, step)
+        for i, step in enumerate(steps)
+        if step.get("uses", "").startswith("pypa/")
+    ]
+    assert len(publish) == 2
+    assert preflight < publish[0][0] < publish[1][0]
+    assert publish[0][1]["with"]["packages-dir"].endswith("/tunaxis-data/")
+    assert publish[1][1]["with"]["packages-dir"].endswith("/pineforge-data/")
     assert release["jobs"]["publish"]["environment"]["name"] == "pypi"
     receiver = yaml.load((workflows / "pineforge-release.yml").read_text(), Loader=yaml.BaseLoader)
     assert receiver["on"]["repository_dispatch"]["types"] == ["pineforge-release"]

@@ -4,14 +4,14 @@
 [SQLite API](sqlite.md) · [SQLAlchemy API](sqlalchemy.md)
 
 CSV, SQLite, and SQLAlchemy providers normalize user-owned OHLCV without
-requiring a PineForge DDL. They share one runtime discovery and mapping API:
+requiring a Tunaxis DDL. They share one runtime discovery and mapping API:
 
 ```text
 file / table / view
         ↓ inspect header or reflected metadata
 timestamp, open, high, low, close, volume, [symbol], [timeframe]
         ↓ validate and normalize
-PineForge Bar records
+Tunaxis Bar records
 ```
 
 ## Inspect a source
@@ -19,7 +19,7 @@ PineForge Bar records
 Every tabular provider exposes `inspect_schema()` before rows are normalized:
 
 ```python
-from pineforge_data import CsvBarProvider
+from tunaxis_data import CsvBarProvider
 
 
 async def inspect_file():
@@ -60,7 +60,7 @@ partial overrides; omitted fields are inferred when the source is inspected.
 For a fully custom schema, map all six required OHLCV fields:
 
 ```python
-from pineforge_data import BarColumnMapping
+from tunaxis_data import BarColumnMapping
 
 mapping = BarColumnMapping(
     timestamp="epoch seconds",
@@ -114,7 +114,7 @@ contract suffixes.
 - For a single-timeframe source without that column, set configuration
   `timeframe` to reject requests at another resolution.
 - When neither exists, the request timeframe is an assertion supplied by the
-  caller; PineForge Data cannot verify the source resolution.
+  caller; Tunaxis Data cannot verify the source resolution.
 
 ## Shared normalization guarantees
 

@@ -40,7 +40,7 @@ Create a provider by registry name when configuration comes from a CLI, service,
 or other runtime boundary:
 
 ```python
-from pineforge_data import create_provider
+from tunaxis_data import create_provider
 
 
 async def resolve_btc_usd():
@@ -63,7 +63,7 @@ Programmatic callers may instantiate a concrete provider directly when they
 need constructor options that are not JSON-shaped:
 
 ```python
-from pineforge_data import CcxtProvider
+from tunaxis_data import CcxtProvider
 
 
 async def direct_provider():
@@ -85,7 +85,7 @@ async def close(): ...
 Use exact resolution before fetching bars:
 
 ```python
-from pineforge_data import BarRequest
+from tunaxis_data import BarRequest
 
 
 async def fetch(provider, symbol):
@@ -114,7 +114,7 @@ the first built-in provider implementing both.
 The raw-Pine harness accepts every registered `MarketDataProvider`:
 
 ```bash
-pineforge-backtest \
+tunaxis-backtest \
   --pine strategy.pine \
   --provider PROVIDER \
   --provider-config provider.json \

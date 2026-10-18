@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
 
-from .contract import gh_bytes, json_bytes, object_json, require, sha256
+from .contract import gh_bytes, json_bytes, object_json, require
+from .distributions import paired_hashes
 
 JOBS = (
     "Python 3.11",
@@ -68,14 +69,7 @@ def check_junit(path: Path, suite: str) -> None:
 
 
 def distribution_hashes(directory: Path) -> dict[str, str]:
-    files = [path for path in directory.iterdir() if path.is_file()]
-    require(
-        len(files) == 2
-        and sum(p.suffix == ".whl" for p in files) == 1
-        and sum(p.name.endswith(".tar.gz") for p in files) == 1,
-        "expected exactly one wheel and one sdist",
-    )
-    return {path.name: sha256(path.read_bytes()) for path in sorted(files)}
+    return paired_hashes(directory)
 
 
 def create_evidence(root: Path, directory: Path, needs: dict[str, Any]) -> dict[str, Any]:

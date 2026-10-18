@@ -79,7 +79,7 @@ def _load_exchange(exchange_id: str, config: Mapping[str, object]) -> _AsyncCcxt
     except ModuleNotFoundError as exc:
         if exc.name == "ccxt" or (exc.name and exc.name.startswith("ccxt.")):
             raise CcxtDependencyError(
-                "CCXT is not installed; install pineforge-data[ccxt]"
+                "CCXT is not installed; install tunaxis-data[ccxt]"
             ) from exc
         raise
 
@@ -144,7 +144,7 @@ _CONTRACT_MARKET_TYPES = {MarketType.SWAP, MarketType.FUTURE, MarketType.OPTION}
 
 
 class CcxtProvider:
-    """Normalize one CCXT exchange into PineForge bars and trade ticks.
+    """Normalize one CCXT exchange into Tunaxis bars and trade ticks.
 
     ``Instrument.symbol`` must use CCXT's unified symbol spelling, for example
     ``BTC/USDT``. The adapter owns exchanges it constructs and leaves injected

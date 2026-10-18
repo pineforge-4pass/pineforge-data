@@ -9,7 +9,7 @@ no optional dependency and never modifies the source.
 ## Construct the provider
 
 ```python
-from pineforge_data import CsvBarProvider
+from tunaxis_data import CsvBarProvider
 
 provider = CsvBarProvider(
     "./exports/equity-bars.csv",
@@ -28,7 +28,7 @@ provider = CsvBarProvider(
 )
 ```
 
-The keys are PineForge's canonical fields and the values are exact CSV header
+The keys are Tunaxis's canonical fields and the values are exact CSV header
 names. For example, the mapping above accepts this header:
 
 ```csv
@@ -53,7 +53,7 @@ empty column names fail before data is fetched.
 ## Resolve and fetch bars
 
 ```python
-from pineforge_data import BarRequest
+from tunaxis_data import BarRequest
 
 
 async def load_csv():
@@ -112,7 +112,7 @@ large datasets queried repeatedly.
 ```
 
 ```bash
-pineforge-backtest \
+tunaxis-backtest \
   --pine strategy.pine \
   --provider csv \
   --provider-config csv.json \

@@ -32,7 +32,7 @@ def _load_sqlalchemy() -> ModuleType:
     except ModuleNotFoundError as exc:
         if exc.name == "sqlalchemy" or (exc.name and exc.name.startswith("sqlalchemy.")):
             raise SqlAlchemyDependencyError(
-                "SQLAlchemy is not installed; install pineforge-data[database]"
+                "SQLAlchemy is not installed; install tunaxis-data[database]"
             ) from exc
         raise
 

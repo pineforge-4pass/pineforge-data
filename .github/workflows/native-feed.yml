@@ -17,7 +17,17 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14]
-    runs-on: ${{ matrix.os }}
+        include:
+          - os: ubuntu-24.04
+            runner: >-
+              ${{ github.event_name != 'pull_request_target' &&
+                  contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+                  (github.event_name != 'pull_request' ||
+                   (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+                  fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-latest' }}
+    runs-on: ${{ matrix.runner || matrix.os }}
+    env:
+      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -42,7 +52,14 @@ jobs:
 
   asan-ubsan:
     name: ASan + UBSan
-    runs-on: ubuntu-24.04
+    runs-on: >-
+      ${{ github.event_name != 'pull_request_target' &&
+          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+          (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-latest' }}
+    env:
+      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -62,7 +79,14 @@ jobs:
 
   tsan:
     name: TSan
-    runs-on: ubuntu-24.04
+    runs-on: >-
+      ${{ github.event_name != 'pull_request_target' &&
+          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+          (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-latest' }}
+    env:
+      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7

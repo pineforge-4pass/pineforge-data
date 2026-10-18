@@ -5,6 +5,7 @@ import io
 import shlex
 import shutil
 import subprocess
+import sys
 import tarfile
 import zipfile
 from pathlib import Path
@@ -491,6 +492,75 @@ def test_publication_stages_exact_files_inside_the_bundle(baseline) -> None:
             if name.startswith(project.replace("-", "_") + "-")
         }
         assert {path.name: path.read_bytes() for path in staged.iterdir()} == expected
+    assert {path.name: path.read_bytes() for path in dist.iterdir()} == original
+
+
+@pytest.mark.parametrize("conflicting_project", [None, "tunaxis-data", "pineforge-data"])
+def test_preflight_checks_pypi_digests_before_staging(
+    baseline, monkeypatch, conflicting_project
+) -> None:
+    bundle = baseline / "bundle"
+    apply(
+        bundle / "source",
+        {name: (baseline / name).read_bytes() for name in BASELINE_FILES},
+    )
+    version = project_version(bundle / "source/pyproject.toml")
+    dist = bundle / "dist"
+    dist.mkdir()
+    paired_test_archives(dist, version)
+    original = {path.name: path.read_bytes() for path in dist.iterdir()}
+    hashes = evidence.distribution_hashes(dist)
+    (bundle / "evidence.json").write_bytes(contract.json_bytes({"distributions": hashes}))
+    project_urls = {
+        f"https://pypi.org/pypi/{project}/{version}/json": project
+        for project in publishing.PYPI_PROJECTS
+    }
+    requested = []
+
+    def fetch(url):
+        requested.append(url)
+        project = project_urls[url]
+        entries = []
+        for name, digest in hashes.items():
+            if not name.startswith(project.replace("-", "_") + "-"):
+                continue
+            if project == conflicting_project and name.endswith(".whl"):
+                digest = contract.sha256(b"changed PyPI bytes:" + original[name])
+                assert digest != hashes[name]
+            entries.append({"filename": name, "digests": {"sha256": digest}})
+        return contract.json_bytes({"urls": entries})
+
+    checked_intents = []
+    monkeypatch.setattr(
+        publishing, "current_intent",
+        lambda root, repo: checked_intents.append((root, repo)),
+    )
+    monkeypatch.setattr(publishing, "fetch", fetch)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "owner/data")
+    monkeypatch.setattr(sys, "argv", [
+        "publishing", "preflight", "--directory", str(bundle),
+        "--receipt", str(baseline / "preflight-receipt.json"),
+    ])
+    staging = bundle / "pypi"
+    assert not staging.exists()
+    if conflicting_project is not None:
+        with pytest.raises(ValueError, match="PyPI version exists with different bytes"):
+            publishing.main()
+        assert not staging.exists()
+        assert f"https://pypi.org/pypi/{conflicting_project}/{version}/json" in requested
+    else:
+        publishing.main()
+        assert {path.name for path in staging.iterdir()} == set(publishing.PYPI_PROJECTS)
+        for project in publishing.PYPI_PROJECTS:
+            expected = {
+                name: data for name, data in original.items()
+                if name.startswith(project.replace("-", "_") + "-")
+            }
+            assert {
+                path.name: path.read_bytes() for path in (staging / project).iterdir()
+            } == expected
+        assert set(requested) == set(project_urls)
+    assert checked_intents == [(bundle / "source", "owner/data")]
     assert {path.name: path.read_bytes() for path in dist.iterdir()} == original
 
 

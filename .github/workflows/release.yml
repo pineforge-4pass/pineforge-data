@@ -17,6 +17,11 @@ on:
         description: Optional previously verified data package; opens a tested forward patch rollback PR
         required: false
         type: string
+      claim_placeholder:
+        description: claims the PyPI name tunaxis-data with a 0.0.1 placeholder
+        default: false
+        required: false
+        type: boolean
   workflow_run:
     workflows: [CI]
     types: [completed]
@@ -34,8 +39,112 @@ env:
   PYTHONPATH: scripts
 
 jobs:
+  claim-name:
+    # bump is required and defaults to patch; claim runs pass that default, which
+    # the skipped release jobs never read.
+    # The pypi environment allows only main and v* refs; dispatch claims from main.
+    # The shared concurrency group release prevents a claim from overlapping a release.
+    if: ${{ inputs.claim_placeholder }}
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/project/tunaxis-data/
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Write placeholder package
+        id: claim
+        run: |
+          claim_dir=$RUNNER_TEMP/claim
+          package_dir=$claim_dir/tunaxis_data
+          dist_dir=$claim_dir/dist
+          mkdir -p "$package_dir"
+          cd "$claim_dir"
+          cat > pyproject.toml <<'PYPROJECT'
+          [build-system]
+          requires = ["hatchling"]
+          build-backend = "hatchling.build"
+
+          [project]
+          name = "tunaxis-data"
+          version = "0.0.1"
+          description = "Tunaxis: first release coming soon."
+          readme = "README.md"
+          requires-python = ">=3.11"
+          license = { text = "Apache-2.0" }
+          classifiers = [
+            "Development Status :: 1 - Planning",
+            "License :: OSI Approved :: Apache Software License",
+            "Programming Language :: Python :: 3",
+          ]
+
+          [tool.hatch.build.targets.wheel]
+          packages = ["tunaxis_data"]
+
+          [tool.hatch.build.targets.sdist]
+          include = ["tunaxis_data", "README.md", "pyproject.toml"]
+          PYPROJECT
+          cat > README.md <<'README'
+          Tunaxis: first release coming soon. https://tunaxis.com
+          README
+          cat > tunaxis_data/__init__.py <<'PACKAGE'
+          __version__ = "0.0.1"
+          PACKAGE
+          printf 'directory=%s\ndist=%s\n' "$claim_dir" "$dist_dir" >> "$GITHUB_OUTPUT"
+      - name: Build placeholder distributions
+        working-directory: ${{ steps.claim.outputs.directory }}
+        run: |
+          python -m pip install build
+          python -m build
+      - name: Verify placeholder distributions
+        working-directory: ${{ steps.claim.outputs.directory }}
+        run: |
+          cat > verify.py <<'VERIFY'
+          from pathlib import Path
+          import tarfile
+          import zipfile
+
+          dist = Path('dist')
+          expected = {
+              'tunaxis_data-0.0.1.tar.gz',
+              'tunaxis_data-0.0.1-py3-none-any.whl',
+          }
+          if {path.name for path in dist.iterdir()} != expected:
+              raise SystemExit('Unexpected distribution files')
+          with zipfile.ZipFile(dist / 'tunaxis_data-0.0.1-py3-none-any.whl') as wheel:
+              names = wheel.namelist()
+              metadata = 'tunaxis_data-0.0.1.dist-info/'
+              if (
+                  'tunaxis_data/__init__.py' not in names
+                  or not any(name.startswith(metadata) for name in names)
+                  or any(name != 'tunaxis_data/__init__.py' and not name.startswith(metadata) for name in names)
+              ):
+                  raise SystemExit('Unexpected wheel contents')
+              wheel.extractall('unpacked-wheel')
+          with tarfile.open(dist / 'tunaxis_data-0.0.1.tar.gz') as sdist:
+              sdist.extractall('unpacked-sdist', filter='data')
+          readme = Path('unpacked-sdist/tunaxis_data-0.0.1/README.md')
+          if readme.read_bytes() != b'Tunaxis: first release coming soon. https://tunaxis.com\n':
+              raise SystemExit('Unexpected README contents')
+          VERIFY
+          python verify.py
+          if grep -ri pineforge unpacked-sdist unpacked-wheel; then
+            exit 1
+          else
+            status=$?
+            test "$status" -eq 1
+          fi
+      - name: Publish placeholder to PyPI with Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: ${{ steps.claim.outputs.dist }}
+
   manual-pr:
-    if: github.event_name == 'workflow_dispatch' && inputs.ci_run == ''
+    if: github.event_name == 'workflow_dispatch' && inputs.ci_run == '' && !inputs.claim_placeholder
     runs-on: ubuntu-latest
     concurrency:
       group: data-release-adapter
@@ -81,8 +190,8 @@ jobs:
 
   prepare:
     if: >-
-      (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'push') ||
-      (github.event_name == 'workflow_dispatch' && inputs.ci_run != '')
+      ((github.event_name == 'workflow_run' && github.event.workflow_run.event == 'push') ||
+      (github.event_name == 'workflow_dispatch' && inputs.ci_run != '')) && !inputs.claim_placeholder
     runs-on: ubuntu-latest
     outputs:
       eligible: ${{ steps.release.outputs.eligible }}
@@ -133,7 +242,7 @@ jobs:
           if-no-files-found: warn
 
   build:
-    if: needs.prepare.outputs.eligible == 'true'
+    if: needs.prepare.outputs.eligible == 'true' && !inputs.claim_placeholder
     needs: prepare
     runs-on: ubuntu-latest
     steps:
@@ -161,7 +270,7 @@ jobs:
 
   github-release:
     needs: [prepare, build]
-    if: needs.prepare.outputs.eligible == 'true'
+    if: needs.prepare.outputs.eligible == 'true' && !inputs.claim_placeholder
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -195,7 +304,7 @@ jobs:
           if-no-files-found: warn
 
   publish:
-    if: needs.prepare.outputs.eligible == 'true' && needs.prepare.outputs.published != 'true'
+    if: needs.prepare.outputs.eligible == 'true' && needs.prepare.outputs.published != 'true' && !inputs.claim_placeholder
     needs: [prepare, build, github-release]
     runs-on: ubuntu-latest
     environment:
@@ -242,7 +351,7 @@ jobs:
     if: >-
       always() && needs.prepare.outputs.eligible == 'true' &&
       needs.github-release.result == 'success' &&
-      (needs.publish.result == 'success' || needs.prepare.outputs.published == 'true')
+      (needs.publish.result == 'success' || needs.prepare.outputs.published == 'true') && !inputs.claim_placeholder
     needs: [prepare, github-release, publish]
     runs-on: ubuntu-latest
     permissions:
@@ -277,7 +386,7 @@ jobs:
           if-no-files-found: warn
 
   report:
-    if: always()
+    if: always() && !inputs.claim_placeholder
     needs: [manual-pr, prepare, build, github-release, publish, verify]
     uses: ./.github/workflows/release-report.yml
     permissions:

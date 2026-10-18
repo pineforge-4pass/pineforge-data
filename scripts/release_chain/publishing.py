@@ -173,16 +173,23 @@ def verified_package(
             "previous distribution lacks manifest/facts provenance; "
             "establish a baseline before enablement",
         )
-        wheel_name = next(name for name in downloads if name.endswith(".whl"))
-        wheel = downloads[wheel_name]
-        with zipfile.ZipFile(io.BytesIO(wheel)) as zipped:
-            for name in (LOCK, MANIFEST, RUNTIME):
-                member = name.removeprefix("src/")
-                require(
-                    zipped.namelist().count(member) == 1
-                    and zipped.read(member) == (root / name).read_bytes(),
-                    "served wheel source/manifest/facts differs from the tagged source",
-                )
+        runtime_packages = []
+        for wheel_name, wheel in downloads.items():
+            if not wheel_name.endswith(".whl"):
+                continue
+            with zipfile.ZipFile(io.BytesIO(wheel)) as zipped:
+                for package in ("tunaxis_data", "pineforge_data"):
+                    if f"{package}/{Path(RUNTIME).name}" not in zipped.namelist():
+                        continue
+                    for name in (LOCK, MANIFEST, RUNTIME):
+                        member = f"{package}/{Path(name).name}"
+                        require(
+                            zipped.namelist().count(member) == 1
+                            and zipped.read(member) == (root / name).read_bytes(),
+                            "served wheel source/manifest/facts differs from the tagged source",
+                        )
+                    runtime_packages.append((wheel_name, package))
+        require(len(runtime_packages) == 1, "served wheels need one unique runtime package")
         verify_artifacts(lock["event"])
         actual = served(lock["event"], source, version, files)
     if saved:

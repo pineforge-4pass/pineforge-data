@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import io
 import shutil
+import subprocess
 import tarfile
 import zipfile
 from pathlib import Path
@@ -569,6 +570,101 @@ def test_prepare_reports_only_the_missing_pypi_project(
     assert set(requested) == {
         f"https://pypi.org/pypi/{project}/{version}/json" for project in publishing.PYPI_PROJECTS
     }
+
+
+@pytest.mark.parametrize("changed_runtime", [False, True])
+def test_pineforge_only_locked_release_verifies_its_actual_wheel_package(
+    baseline, ready, monkeypatch, changed_runtime
+) -> None:
+    event, manifest = ready
+    apply(baseline, contract.update_files(baseline, event, manifest))
+    version = project_version(baseline / "pyproject.toml")
+    source = "a" * 40
+    tagged = {
+        name.replace("src/tunaxis_data/", "src/pineforge_data/"): (baseline / name).read_bytes()
+        for name in contract.UPDATE_FILES
+        if name != contract.SHIM_PROJECT
+    }
+    tagged["pyproject.toml"] = tagged["pyproject.toml"].replace(
+        b'name = "tunaxis-data"', b'name = "pineforge-data"'
+    )
+    metadata = f"Metadata-Version: 2.3\nName: pineforge-data\nVersion: {version}\n\n".encode()
+    wheel = io.BytesIO()
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr(f"pineforge_data-{version}.dist-info/METADATA", metadata)
+        archive.writestr("pineforge_data/__init__.py", b"\n")
+        for name, data in tagged.items():
+            if name.startswith("src/"):
+                if changed_runtime and name.endswith("/release_contract.py"):
+                    data += b"\n"
+                archive.writestr(name.removeprefix("src/"), data)
+    sdist = io.BytesIO()
+    with tarfile.open(fileobj=sdist, mode="w:gz") as archive:
+        info = tarfile.TarInfo(f"pineforge_data-{version}/PKG-INFO")
+        info.size = len(metadata)
+        archive.addfile(info, io.BytesIO(metadata))
+    downloads = {
+        f"pineforge_data-{version}-py3-none-any.whl": wheel.getvalue(),
+        f"pineforge_data-{version}.tar.gz": sdist.getvalue(),
+    }
+    hashes = {name: contract.sha256(data) for name, data in downloads.items()}
+    pypi = {"urls": [
+        {
+            "filename": name, "digests": {"sha256": hashes[name]},
+            "url": "https://files.pythonhosted.org/" + name,
+        }
+        for name in downloads
+    ]}
+
+    def fetch(url):
+        if url == f"https://pypi.org/pypi/tunaxis-data/{version}/json":
+            raise HTTPError(url, 404, "not published under this name", None, None)
+        if url == f"https://pypi.org/pypi/pineforge-data/{version}/json":
+            return contract.json_bytes(pypi)
+        return {"https://files.pythonhosted.org/" + name: data for name, data in downloads.items()}[
+            url
+        ]
+
+    def show(command):
+        assert command[:2] == ["git", "show"]
+        revision, name = command[2].split(":", 1)
+        assert revision == source
+        return tagged[name]
+
+    def git_read(command, *, capture_output):
+        assert capture_output
+        return subprocess.CompletedProcess(command, 0, stdout=show(command))
+
+    monkeypatch.setattr(publishing, "fetch", fetch)
+    monkeypatch.setattr(
+        publishing, "api",
+        lambda repo, route: {f"releases/tags/v{version}": {"assets": [
+            {"name": name, "id": index} for index, name in enumerate(downloads)
+        ]}}[route],
+    )
+    monkeypatch.setattr(
+        publishing, "gh_bytes",
+        lambda route, **kwargs: list(downloads.values())[int(route.rsplit("/", 1)[1])],
+    )
+    monkeypatch.setattr(
+        publishing, "git",
+        lambda *args: {
+            ("fetch", "origin", f"refs/tags/v{version}"): "",
+            ("rev-parse", f"v{version}^{{commit}}"): source,
+        }[args],
+    )
+    monkeypatch.setattr(automation.subprocess, "check_output", show)
+    monkeypatch.setattr(automation.subprocess, "run", git_read)
+    verified = []
+    monkeypatch.setattr(publishing, "verify_artifacts", lambda target: verified.append(target))
+    if changed_runtime:
+        with pytest.raises(ValueError, match="served wheel source/manifest/facts differs"):
+            publishing.verified_package("owner/data", version)
+        assert verified == []
+    else:
+        actual = publishing.verified_package("owner/data", version)
+        assert actual == receipts.served(event, source, version, hashes)
+        assert verified == [event]
 
 
 def test_public_receipt_cannot_contain_homegrown_or_private_fields(ready) -> None:

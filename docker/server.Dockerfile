@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1@sha256:87999aa3d42bdc6bea60565083ee17e86d1f3339802f543c0d03998580f9cb89
 
-ARG PINEFORGE_RELEASE_IMAGE=ghcr.io/pineforge-4pass/pineforge-release:1.0.0@sha256:b271873d0e91a9eeeb4595daaded9bdfbdbcd3925d3ec1300a833395e2004c86
+ARG PINEFORGE_RELEASE_IMAGE=ghcr.io/pineforge-4pass/pineforge-release:1.6.0@sha256:3f739e20d35612140b69de41cd12fcf959f381d9b56e18b5c7c8806a612ca022
 
 FROM python:3.11-slim-bookworm@sha256:f5cf0344c9886ff24d34797578d5d7dd6e8911ae0fe5962bb55d0f89603ec361 AS server-builder
 RUN python -m pip install --no-cache-dir --target /opt/pineforge-server-deps \
@@ -9,7 +9,7 @@ RUN python -m pip install --no-cache-dir --target /opt/pineforge-server-deps \
 
 FROM ${PINEFORGE_RELEASE_IMAGE}
 ARG PINEFORGE_RELEASE_IMAGE
-ARG PINEFORGE_HUB_COMMIT=unknown
+ARG PINEFORGE_HUB_COMMIT=efd750e1cecd69414218bb501a44488f88ed0177
 
 USER root
 COPY --from=server-builder /opt/pineforge-server-deps /opt/pineforge-server-deps

@@ -1,0 +1,55 @@
+{
+  "event": {
+    "event_id": "sha256:9fe363b741a1b9046a8b1c162fa6ebcc8ff20f4620f6a2e4799c0310b50e9e5c",
+    "facts": {
+      "commit": "139171211d18c6da4c939089522cb7c92b7bdace",
+      "path": "facts/facts.json",
+      "release_key": "1.6.0",
+      "sha256": "1f3023ebc69b47ed320da108d18bd8b7c36785e0a95e411cd45c43b613f16a65"
+    },
+    "hub_commit": "efd750e1cecd69414218bb501a44488f88ed0177",
+    "image": {
+      "amd64_digest": "sha256:fb0e373817415a9f889f4d86849465c822096e07cb447519c2eb4cd1660eecf5",
+      "arm64_digest": "sha256:2e419dd8dd15ef2dcca15d2fe7cdaa38b96d1abd448299c60f4f303e876e23c9",
+      "digest": "sha256:3f739e20d35612140b69de41cd12fcf959f381d9b56e18b5c7c8806a612ca022",
+      "repository": "ghcr.io/pineforge-4pass/pineforge-release"
+    },
+    "manifest": {
+      "asset": "release-manifest.json",
+      "sha256": "9fe363b741a1b9046a8b1c162fa6ebcc8ff20f4620f6a2e4799c0310b50e9e5c"
+    },
+    "prerelease": false,
+    "release_version": "1.6.0",
+    "run_id": 38995200706,
+    "schema": "pineforge/release-ready/v1",
+    "versions": {
+      "codegen": {
+        "commit": "7300166636936d967d576693b3d92b249a02d805",
+        "npm_integrity": "sha512-9ku0cUCuDjbGQ+7i8ofMBSxKiBscXCSDhgLEIvOjaD318X7mxWNlxbJPqwn08J5UUaHLihKAndU1qCrpJNgYqA==",
+        "npm_version": "1.6.0",
+        "pypi_version": "1.6.0",
+        "sdist_sha256": "76a2b23568746baebf2be15924692e879476e3e7dfcbc1eab76f245b3c12ba5c",
+        "version": "1.6.0"
+      },
+      "engine": {
+        "commit": "1e48cfd6b029666542114d21d2cd98f1cf312f60",
+        "tag": "v1.6.0",
+        "version": "1.6.0"
+      },
+      "hpo": {
+        "commit": "7aefe6818d37196e5e393893b277b0f657adaafe",
+        "package_version": "1.6.0",
+        "sdist_sha256": "ba751a4fcaba611b3f5792d562b9aafa9012a21efe72bc3d6e6deec56724b1ff",
+        "tag": "v1.6.0",
+        "version": "1.6.0",
+        "wheel_sha256": "1b170851e679b5e35b7da510e5f18b41562af533c85b90af5b6289a1f5c18aa3"
+      }
+    }
+  },
+  "package_version": "0.3.1",
+  "previous": {
+    "event_id": null,
+    "image": "ghcr.io/pineforge-4pass/pineforge-release:1.0.0@sha256:b271873d0e91a9eeeb4595daaded9bdfbdbcd3925d3ec1300a833395e2004c86",
+    "package_version": "0.3.0"
+  }
+}

@@ -6,13 +6,18 @@ import subprocess
 import sys
 import tomllib
 import zipfile
+from configparser import ConfigParser
 from email.parser import BytesParser
+from importlib.metadata import EntryPoint
 from pathlib import Path
 
 import pytest
 from bump_version import synchronized_version
 from release_chain.contract import object_json
 from release_chain.distributions import verify_archives
+
+from tunaxis_data.cli.backtest import main as backtest_main
+from tunaxis_data.server import main as server_main
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -63,37 +68,67 @@ assert canonical.TunaxisBacktestRunner is legacy.TunaxisBacktestRunner
     assert result.returncode == 0, result.stderr
 
 
-def test_new_and_old_console_help_are_identical_subprocesses(tmp_path: Path) -> None:
-    wrappers = []
-    for name, target in (
-        ("tunaxis-backtest", "tunaxis_data.cli.backtest"),
-        ("pineforge-backtest", "tunaxis_data.cli.backtest"),
-        ("tunaxis-backtest-server", "tunaxis_data.server"),
-        ("pineforge-backtest-server", "tunaxis_data.server"),
+def _wheel_scripts(path: Path) -> dict[str, str]:
+    with zipfile.ZipFile(path) as archive:
+        members = [name for name in archive.namelist() if name.endswith("/entry_points.txt")]
+        assert len(members) == 1
+        config = ConfigParser(interpolation=None)
+        config.read_string(archive.read(members[0]).decode("utf-8"))
+    return dict(config["console_scripts"])
+
+
+def test_new_and_old_console_help_are_identical_subprocesses(
+    paired_artifacts, tmp_path: Path
+) -> None:
+    expected = {
+        "tunaxis-data": {
+            "tunaxis-backtest": backtest_main,
+            "tunaxis-backtest-server": server_main,
+        },
+        "pineforge-data": {
+            "pineforge-backtest": backtest_main,
+            "pineforge-backtest-server": server_main,
+        },
+    }
+    wheels = []
+    for project, pyproject in (
+        ("tunaxis-data", ROOT / "pyproject.toml"),
+        ("pineforge-data", ROOT / "shim/pyproject.toml"),
     ):
-        path = tmp_path / name
-        path.write_text(
-            "import sys\n"
-            f"from {target} import main\n"
-            "raise SystemExit(main())\n",
-            encoding="utf-8",
-        )
-        wrappers.append(path)
-    outputs = []
-    environment = dict(os.environ, PYTHONPATH=str(SRC))
-    for path in wrappers:
+        declarations = tomllib.loads(pyproject.read_text())["project"]["scripts"]
+        wheel = next(paired_artifacts.glob(project.replace("-", "_") + "-*.whl"))
+        packaged = _wheel_scripts(wheel)
+        assert packaged == declarations
+        assert set(packaged) == set(expected[project])
+        for name, target in packaged.items():
+            assert EntryPoint(name=name, value=target, group="console_scripts").load() is (
+                expected[project][name]
+            )
+        wheels.append(str(wheel))
+    installed = tmp_path / "installed"
+    subprocess.run(
+        [
+            sys.executable, "-m", "pip", "install", "--no-index", "--no-deps",
+            "--target", str(installed), *wheels,
+        ],
+        cwd=tmp_path,
+        check=True,
+    )
+    outputs = {}
+    environment = dict(os.environ, PYTHONPATH=str(installed))
+    for name in (*expected["tunaxis-data"], *expected["pineforge-data"]):
         result = subprocess.run(
-            [sys.executable, str(path), "--help"],
-            cwd=ROOT,
+            [sys.executable, str(installed / "bin" / name), "--help"],
+            cwd=tmp_path,
             env=environment,
             text=True,
             capture_output=True,
             check=False,
         )
         assert result.returncode == 0, result.stderr
-        outputs.append(result.stdout)
-    assert outputs[0] == outputs[1]
-    assert outputs[2] == outputs[3]
+        outputs[name] = result.stdout
+    assert outputs["tunaxis-backtest"] == outputs["pineforge-backtest"]
+    assert outputs["tunaxis-backtest-server"] == outputs["pineforge-backtest-server"]
 
 
 @pytest.fixture(scope="module")

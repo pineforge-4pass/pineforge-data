@@ -15,6 +15,7 @@ from release_chain import automation, contract, evidence, publishing, receipts, 
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests/fixtures/release_chain"
+BASELINE_FILES = (contract.RUNTIME, contract.DOCKERFILE, "pyproject.toml", contract.SHIM_PROJECT)
 EXTRAS = ("ccxt", "database", "database-e2e", "server", "docs", "release", "dev")
 
 
@@ -72,7 +73,7 @@ def ready() -> tuple[dict[str, Any], bytes]:
 
 @pytest.fixture
 def baseline(tmp_path: Path) -> Path:
-    for name in (contract.RUNTIME, contract.DOCKERFILE, "pyproject.toml", contract.SHIM_PROJECT):
+    for name in BASELINE_FILES:
         path = tmp_path / name
         path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(ROOT / name, path)
@@ -406,7 +407,7 @@ def test_failed_consumer_e2e_never_calls_merge_api(ready, baseline, monkeypatch)
         return gate
 
     def snapshot(revision, target):
-        for name in (contract.RUNTIME, contract.DOCKERFILE, "pyproject.toml"):
+        for name in BASELINE_FILES:
             destination = target / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(baseline / name, destination)
@@ -501,7 +502,7 @@ def test_duplicate_open_pr_is_reused_without_a_new_commit(ready, baseline, monke
             target,
             {
                 name: (baseline / name).read_bytes()
-                for name in (contract.RUNTIME, contract.DOCKERFILE, "pyproject.toml")
+                for name in BASELINE_FILES
             },
         ),
     )
@@ -559,7 +560,7 @@ def test_newer_pr_exists_before_obsolete_pr_is_closed(ready, baseline, monkeypat
             target,
             {
                 name: (baseline / name).read_bytes()
-                for name in (contract.RUNTIME, contract.DOCKERFILE, "pyproject.toml")
+                for name in BASELINE_FILES
             },
         ),
     )

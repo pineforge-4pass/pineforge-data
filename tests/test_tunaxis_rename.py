@@ -154,6 +154,9 @@ def test_shim_direct_wheel_matches_wheel_from_sdist(paired_artifacts, tmp_path: 
         assert set(direct_names) == set(sdist_names)
         assert direct_names.count("pineforge_data/__init__.py") == 1
         assert sdist_names.count("pineforge_data/__init__.py") == 1
+        assert {name for name in direct_names if name.startswith("pineforge_data/")} == {
+            "pineforge_data/__init__.py"
+        }
         assert not any(name.startswith(("src/", "tunaxis_data/")) for name in direct_names)
         for name in direct_names:
             assert direct_archive.read(name) == sdist_archive.read(name)

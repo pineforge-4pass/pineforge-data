@@ -36,7 +36,14 @@ env:
 jobs:
   manual-pr:
     if: github.event_name == 'workflow_dispatch' && inputs.ci_run == ''
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name != 'pull_request_target' &&
+          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+          (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-latest' }}
+    env:
+      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     concurrency:
       group: data-release-adapter
       cancel-in-progress: false
@@ -83,7 +90,14 @@ jobs:
     if: >-
       (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'push') ||
       (github.event_name == 'workflow_dispatch' && inputs.ci_run != '')
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name != 'pull_request_target' &&
+          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+          (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-latest' }}
+    env:
+      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     outputs:
       eligible: ${{ steps.release.outputs.eligible }}
       has_target: ${{ steps.release.outputs.has_target }}
@@ -135,7 +149,14 @@ jobs:
   build:
     if: needs.prepare.outputs.eligible == 'true'
     needs: prepare
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name != 'pull_request_target' &&
+          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+          (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-latest' }}
+    env:
+      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     steps:
       - uses: actions/checkout@v7
         with:
@@ -162,7 +183,14 @@ jobs:
   github-release:
     needs: [prepare, build]
     if: needs.prepare.outputs.eligible == 'true'
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name != 'pull_request_target' &&
+          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+          (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-latest' }}
+    env:
+      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     permissions:
       contents: write
       actions: read
@@ -197,7 +225,14 @@ jobs:
   publish:
     if: needs.prepare.outputs.eligible == 'true' && needs.prepare.outputs.published != 'true'
     needs: [prepare, build, github-release]
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name != 'pull_request_target' &&
+          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+          (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-latest' }}
+    env:
+      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     environment:
       name: pypi
       url: https://pypi.org/project/pineforge-data/
@@ -244,7 +279,14 @@ jobs:
       needs.github-release.result == 'success' &&
       (needs.publish.result == 'success' || needs.prepare.outputs.published == 'true')
     needs: [prepare, github-release, publish]
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name != 'pull_request_target' &&
+          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+          (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-latest' }}
+    env:
+      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     permissions:
       contents: write
       actions: read

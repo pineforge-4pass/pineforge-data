@@ -86,7 +86,8 @@ def body(metadata: dict[str, Any]) -> str:
         "after their own CI and runtime E2E.\n\n"
         "Required: Python 3.11/3.12/3.13, manifest/source/OCI verification, real Docker "
         "harness and ABI checks, concurrent server/cache checks, disposable database E2E, "
-        "and installation/backtesting of both distributions. `release/ready` must pass "
+        "canonical wheel/sdist backtests and installed shim/import/CLI compatibility checks. "
+        "`release/ready` must pass "
         "for the current head and base. Publication reuses the landed commit's CI artifacts.\n\n"
         f"<!-- pineforge-data-release {json.dumps(metadata, sort_keys=True)} -->\n"
     )

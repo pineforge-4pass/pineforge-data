@@ -149,7 +149,20 @@ jobs:
               exit 1
             fi
           done
-      - name: Install and backtest both built distributions without importing checkout source
+      - name: Install both wheels and check shim imports and console scripts
+        run: |
+          set -euo pipefail
+          shim_environment="$RUNNER_TEMP/paired-wheel-install"
+          python -m venv "$shim_environment"
+          main_wheels=("$GITHUB_WORKSPACE"/dist/tunaxis_data-*.whl)
+          shim_wheels=("$GITHUB_WORKSPACE"/dist/pineforge_data-*.whl)
+          test "${#main_wheels[@]}" -eq 1
+          test "${#shim_wheels[@]}" -eq 1
+          "$shim_environment/bin/python" -I -m pip install \
+            "${main_wheels[0]}" "${shim_wheels[0]}[server]"
+          "$shim_environment/bin/python" -I scripts/exercise_shim.py \
+            --source "$GITHUB_WORKSPACE/src"
+      - name: Install and backtest the canonical wheel and sdist without checkout imports
         env:
           PYTHONPATH: scripts
         run: |

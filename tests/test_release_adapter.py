@@ -843,6 +843,22 @@ def test_workflows_keep_every_gate_ahead_of_oidc_publication() -> None:
     assert set(ci["jobs"]["ready"]["needs"]) == evidence.NEEDS
     assert ci["jobs"]["ready"]["if"] == "always()"
     assert ci["jobs"]["ready"]["name"] == "release/ready"
+    distribution_steps = ci["jobs"]["distribution"]["steps"]
+    shim_build = next(
+        i for i, step in enumerate(distribution_steps)
+        if step.get("run") == "python -m build --outdir dist shim"
+    )
+    shim_install = next(
+        i for i, step in enumerate(distribution_steps)
+        if "scripts/exercise_shim.py" in step.get("run", "")
+    )
+    assert shim_build < shim_install
+    install_commands = distribution_steps[shim_install]["run"]
+    assert 'python -m venv "$shim_environment"' in install_commands
+    assert '/dist/tunaxis_data-*.whl' in install_commands
+    assert '/dist/pineforge_data-*.whl' in install_commands
+    assert '"$shim_environment/bin/python" -I -m pip install' in install_commands
+    assert '"$shim_environment/bin/python" -I scripts/exercise_shim.py' in install_commands
     for job, suite, enabled in (
         ("docker", "docker", "PINEFORGE_DOCKER_TEST=1"),
         ("database-e2e", "database", None),

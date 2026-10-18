@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import io
+import shlex
 import shutil
 import subprocess
 import tarfile
@@ -890,7 +891,14 @@ def test_workflows_keep_every_gate_ahead_of_oidc_publication() -> None:
     assert release["on"]["workflow_run"]["workflows"] == ["CI"]
     assert set(release["jobs"]["publish"]["needs"]) == {"prepare", "build", "github-release"}
     steps = release["jobs"]["publish"]["steps"]
-    preflight = next(i for i, step in enumerate(steps) if "preflight" in step.get("run", ""))
+    preflight = next(
+        i for i, step in enumerate(steps)
+        if shlex.split(step.get("run", ""))[:4] == [
+            "python", "-m", "release_chain.publishing", "preflight"
+        ]
+    )
+    preflight_command = shlex.split(steps[preflight]["run"])
+    assert preflight_command[preflight_command.index("--directory") + 1] == "bundle"
     publish = [
         (i, step)
         for i, step in enumerate(steps)

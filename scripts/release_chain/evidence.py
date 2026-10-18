@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
 
-from .contract import gh_bytes, json_bytes, object_json, require, sha256
+from .contract import gh_bytes, json_bytes, object_json, require
 from .distributions import paired_hashes
 
 JOBS = (

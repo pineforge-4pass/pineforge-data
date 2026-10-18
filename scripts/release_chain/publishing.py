@@ -35,7 +35,6 @@ from .evidence import distribution_hashes, gate_for_run
 from .receipts import candidate as record_candidate
 from .receipts import served, timestamp
 
-
 PYPI_PROJECTS = ("tunaxis-data", "pineforge-data")
 
 
@@ -60,13 +59,13 @@ def pypi_downloads(
     """Download and hash the requested PyPI projects, checking their metadata."""
     inventories = [pypi_files(version, project) for project in projects]
     require(
-        all(inventory is not None for inventory in inventories),
+        all(project_inventory is not None for project_inventory in inventories),
         "required PyPI project is missing",
     )
     digests: dict[str, str] = {}
-    for inventory in inventories:
-        assert inventory is not None
-        digests.update(inventory)
+    for project_inventory in inventories:
+        assert project_inventory is not None
+        digests.update(project_inventory)
     data: dict[str, bytes] = {}
     for project in projects:
         metadata = object_json(fetch(f"https://pypi.org/pypi/{project}/{version}/json"))

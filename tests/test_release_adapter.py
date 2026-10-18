@@ -463,6 +463,28 @@ def test_distribution_publication_refuses_different_pypi_bytes(tmp_path, monkeyp
     assert report["deployed"] is None
 
 
+def test_publication_stages_exact_files_inside_the_bundle(baseline) -> None:
+    bundle = baseline / "bundle"
+    apply(
+        bundle / "source",
+        {name: (baseline / name).read_bytes() for name in BASELINE_FILES},
+    )
+    dist = bundle / "dist"
+    dist.mkdir()
+    paired_test_archives(dist, contract.package_version(baseline))
+    original = {path.name: path.read_bytes() for path in dist.iterdir()}
+    publishing.stage_distributions(bundle)
+    for project in publishing.PYPI_PROJECTS:
+        staged = bundle / "pypi" / project
+        expected = {
+            name: data
+            for name, data in original.items()
+            if name.startswith(project.replace("-", "_") + "-")
+        }
+        assert {path.name: path.read_bytes() for path in staged.iterdir()} == expected
+    assert {path.name: path.read_bytes() for path in dist.iterdir()} == original
+
+
 def test_public_receipt_cannot_contain_homegrown_or_private_fields(ready) -> None:
     event, _manifest = ready
     report = automation.receipt(event, "test")
@@ -659,8 +681,8 @@ def test_workflows_keep_every_gate_ahead_of_oidc_publication() -> None:
     ]
     assert len(publish) == 2
     assert preflight < publish[0][0] < publish[1][0]
-    assert publish[0][1]["with"]["packages-dir"].endswith("/tunaxis-data/")
-    assert publish[1][1]["with"]["packages-dir"].endswith("/pineforge-data/")
+    assert publish[0][1]["with"]["packages-dir"] == "bundle/pypi/tunaxis-data/"
+    assert publish[1][1]["with"]["packages-dir"] == "bundle/pypi/pineforge-data/"
     assert release["jobs"]["publish"]["environment"]["name"] == "pypi"
     receiver = yaml.load((workflows / "pineforge-release.yml").read_text(), Loader=yaml.BaseLoader)
     assert receiver["on"]["repository_dispatch"]["types"] == ["pineforge-release"]

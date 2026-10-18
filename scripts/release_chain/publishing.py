@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -30,7 +31,7 @@ from .contract import (
     verify_artifacts,
     verify_local,
 )
-from .distributions import verify_archives
+from .distributions import filenames, verify_archives
 from .evidence import distribution_hashes, gate_for_run
 from .receipts import candidate as record_candidate
 from .receipts import served, timestamp
@@ -481,6 +482,16 @@ def verify_publication(repo: str, directory: Path, report: dict[str, Any]) -> No
     subprocess.run(["gh", "release", "edit", f"v{version}", "--repo", repo, "--latest"], check=True)
 
 
+def stage_distributions(directory: Path) -> None:
+    """Split verified artifacts inside the bundle mounted by container actions."""
+    version = package_version(directory / "source")
+    for project in PYPI_PROJECTS:
+        destination = directory / "pypi" / project
+        destination.mkdir(parents=True, exist_ok=True)
+        for name in filenames(project, version):
+            shutil.copyfile(directory / "dist" / name, destination / name)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("prepare", "github-release", "preflight", "verify"))
@@ -510,6 +521,7 @@ def main() -> None:
                 == object_json((args.directory / "evidence.json").read_bytes())["distributions"],
                 "untested upload bytes",
             )
+            stage_distributions(args.directory)
         else:
             verify_publication(repo, args.directory, report)
     except Exception:

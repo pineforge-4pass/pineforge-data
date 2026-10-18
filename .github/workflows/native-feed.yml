@@ -107,13 +107,38 @@ jobs:
             -DPINEFORGE_FEED_SANITIZER=thread \
             "-DPINEFORGE_FEED_TSAN_OPTIONS_EXTRA=halt_on_error=0 second_deadlock_stack=1 log_path=$RUNNER_TEMP/tsan/report"
           cmake --build build-feed -j4
-          ctest --test-dir build-feed --output-on-failure
+      - name: ctest as is (all CPUs)
+        id: ctest_all
+        continue-on-error: true
+        run: |
+          export LD_LIBRARY_PATH="$RUNNER_TEMP/curl/lib:${LD_LIBRARY_PATH:-}"
+          mkdir -p "$RUNNER_TEMP/tsan/all-cpus"
+          { echo "nproc=$(nproc)"; uname -r; ulimit -s; cat /proc/sys/vm/overcommit_memory; } | tee "$RUNNER_TEMP/tsan/host.txt"
+          rc=0
+          ctest --test-dir build-feed --output-on-failure 2>&1 | tee "$RUNNER_TEMP/tsan/ctest-all-cpus.log" || rc=${PIPESTATUS[0]}
+          for f in "$RUNNER_TEMP"/tsan/report.*; do if [ -e "$f" ]; then mv "$f" "$RUNNER_TEMP/tsan/all-cpus/"; fi; done
+          echo "ctest exit $rc" | tee -a "$RUNNER_TEMP/tsan/host.txt"
+          exit "$rc"
+      - name: ctest again under taskset -c 0,1
+        id: ctest_two
+        continue-on-error: true
+        run: |
+          export LD_LIBRARY_PATH="$RUNNER_TEMP/curl/lib:${LD_LIBRARY_PATH:-}"
+          mkdir -p "$RUNNER_TEMP/tsan/two-cpus"
+          rc=0
+          taskset -c 0,1 ctest --test-dir build-feed --output-on-failure 2>&1 | tee "$RUNNER_TEMP/tsan/ctest-two-cpus.log" || rc=${PIPESTATUS[0]}
+          for f in "$RUNNER_TEMP"/tsan/report.*; do if [ -e "$f" ]; then mv "$f" "$RUNNER_TEMP/tsan/two-cpus/"; fi; done
+          echo "taskset ctest exit $rc" | tee -a "$RUNNER_TEMP/tsan/host.txt"
+          exit "$rc"
       - uses: actions/upload-artifact@v5
         if: always()
         with:
           name: tsan-reports-${{ github.job }}-${{ runner.name }}
           path: ${{ runner.temp }}/tsan
           if-no-files-found: warn
+      - name: Fail the job if either ctest run failed
+        if: steps.ctest_all.outcome == 'failure' || steps.ctest_two.outcome == 'failure'
+        run: exit 1
 
   tsan-hosted:
     # TEMPORARY (TX-DATA-TSAN): identical to `tsan` except it always runs on the hosted runner, for one comparison run.

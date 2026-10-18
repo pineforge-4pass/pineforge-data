@@ -494,8 +494,9 @@ def test_publication_stages_exact_files_inside_the_bundle(baseline) -> None:
 
 
 @pytest.mark.parametrize("existing_project", ["tunaxis-data", "pineforge-data"])
-def test_prepare_reports_only_the_missing_pypi_project(
-    baseline, ready, monkeypatch, existing_project
+@pytest.mark.parametrize("conflicting_digest", [False, True])
+def test_prepare_reuses_identical_pypi_projects_and_rejects_conflicting_digests(
+    baseline, ready, monkeypatch, existing_project, conflicting_digest
 ) -> None:
     event, _manifest = ready
     version = project_version(baseline / "pyproject.toml")
@@ -503,6 +504,14 @@ def test_prepare_reports_only_the_missing_pypi_project(
     artifacts.mkdir()
     paired_test_archives(artifacts, version)
     hashes = evidence.distribution_hashes(artifacts)
+    conflicting_name = next(
+        name for name in hashes
+        if name.startswith(existing_project.replace("-", "_") + "-") and name.endswith(".whl")
+    )
+    different_digest = contract.sha256(
+        b"changed PyPI bytes:" + (artifacts / conflicting_name).read_bytes()
+    )
+    assert different_digest != hashes[conflicting_name]
     pr = bot_pr(event)
     source, tree, base = "c" * 40, "d" * 40, "b" * 40
     pr.update(merged=True, merged_at="2020-01-01T00:05:00Z", merge_commit_sha=source)
@@ -551,7 +560,9 @@ def test_prepare_reports_only_the_missing_pypi_project(
         if url != f"https://pypi.org/pypi/{existing_project}/{version}/json":
             raise HTTPError(url, 404, "project version is missing", None, None)
         return contract.json_bytes({"urls": [
-            {"filename": name, "digests": {"sha256": digest}}
+            {"filename": name, "digests": {"sha256": (
+                different_digest if conflicting_digest and name == conflicting_name else digest
+            )}}
             for name, digest in hashes.items()
             if name.startswith(existing_project.replace("-", "_") + "-")
         ]})
@@ -559,17 +570,23 @@ def test_prepare_reports_only_the_missing_pypi_project(
     monkeypatch.setattr(publishing.subprocess, "run", download)
     monkeypatch.setattr(publishing, "fetch", fetch)
     report = automation.receipt(None)
-    outputs = publishing.prepare(baseline, "owner/data", 80, baseline / "bundle", report)
-    assert outputs["eligible"] == "true"
-    assert outputs["published"] == "false"
-    assert report["state"] == "deploying"
-    for project in publishing.PYPI_PROJECTS:
-        assert outputs["published_" + project.replace("-", "_")] == str(
-            project == existing_project
-        ).lower()
-    assert set(requested) == {
-        f"https://pypi.org/pypi/{project}/{version}/json" for project in publishing.PYPI_PROJECTS
-    }
+    if conflicting_digest:
+        with pytest.raises(ValueError, match="PyPI version exists with different bytes"):
+            publishing.prepare(baseline, "owner/data", 80, baseline / "bundle", report)
+        assert f"https://pypi.org/pypi/{existing_project}/{version}/json" in requested
+    else:
+        outputs = publishing.prepare(baseline, "owner/data", 80, baseline / "bundle", report)
+        assert outputs["eligible"] == "true"
+        assert outputs["published"] == "false"
+        assert report["state"] == "deploying"
+        for project in publishing.PYPI_PROJECTS:
+            assert outputs["published_" + project.replace("-", "_")] == str(
+                project == existing_project
+            ).lower()
+        assert set(requested) == {
+            f"https://pypi.org/pypi/{project}/{version}/json"
+            for project in publishing.PYPI_PROJECTS
+        }
 
 
 @pytest.mark.parametrize("changed_runtime", [False, True])

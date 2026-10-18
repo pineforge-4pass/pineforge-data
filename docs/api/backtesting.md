@@ -14,9 +14,9 @@ refuses any other library before any strategy call, with an
 `EngineBacktestError` that says what to do. Libraries without
 `pf_abi_version` (engine v0.10.1 or earlier), ABI 2 (engine v0.10.2 through
 v0.12.3) and ABI 3 (engine v0.13.x) need a rebuild with engine 1.x;
-tunaxis-data 0.2.0 still reads ABI 2. A newer ABI needs a newer
-tunaxis-data. The release container and the FastAPI server do not use this
-class.
+the historical `pineforge-data 0.2.0` release still reads ABI 2. Current releases
+are named `tunaxis-data`. A newer ABI needs a newer `tunaxis-data` release.
+The release container and the FastAPI server do not use this class.
 
 A trade's `max_runup` and `max_drawdown` are whole-trade excursions in account
 currency, net of entry fees, as engine 1.0's `pineforge.h` documents them.

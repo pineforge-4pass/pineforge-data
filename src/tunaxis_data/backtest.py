@@ -23,7 +23,7 @@ EXPECTED_PF_ABI = 4
 _REFUSED_ABI_HINTS = {
     2: (
         "engine v0.10.2 to v0.12.3 built it: rebuild the strategy with engine 1.x, "
-        "or read it with tunaxis-data 0.2.0"
+        "or read it with the historical pineforge-data 0.2.0 release (now tunaxis-data)"
     ),
     3: "engine v0.13.0 to v0.13.1 built it: rebuild the strategy with engine 1.x",
 }

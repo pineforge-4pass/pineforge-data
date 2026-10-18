@@ -161,6 +161,9 @@ def test_runner_refuses_pre_1_0_libraries_with_a_rebuild_hint(abi: int, engine: 
 
     assert engine in str(error.value)
     assert "rebuild" in str(error.value)
+    if abi == 2:
+        assert "pineforge-data 0.2.0" in str(error.value)
+        assert "tunaxis-data 0.2.0" not in str(error.value)
     assert fake.strategy_create.calls == []
 
 

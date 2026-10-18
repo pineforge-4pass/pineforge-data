@@ -6,8 +6,7 @@ on:
   workflow_run:
     workflows: [CI, Release]
     types: [completed]
-  schedule:
-    - cron: '9,24,39,54 * * * *'
+  # schedule (9,24,39,54 * * * *) removed 2026-10-18: every run failed and Actions cost is capped (owner); dispatch and the triggers above remain.
   workflow_dispatch:
     inputs:
       publication_run:

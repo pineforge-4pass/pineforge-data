@@ -101,7 +101,11 @@ if(BUILD_TESTING)
   add_test(NAME feed-mock COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/mock_venue.py $<TARGET_FILE:pineforge-feed>)
   set_tests_properties(feed-mock PROPERTIES TIMEOUT 420)
   if(PINEFORGE_FEED_SANITIZER STREQUAL "thread")
+    # CTest replaces the whole environment variable, so options exported by the job never reach the tests:
+    # extra options (for example a log_path to keep reports) must come in here, after the defaults (the last
+    # occurrence of an option wins in TSan's parser).
+    set(PINEFORGE_FEED_TSAN_OPTIONS_EXTRA "" CACHE STRING "Extra TSAN_OPTIONS appended after the defaults")
     set_tests_properties(feed-unit feed-export-unit feed-mock feed-mock-export PROPERTIES ENVIRONMENT
-      "TSAN_OPTIONS=halt_on_error=1 suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/tsan.supp")
+      "TSAN_OPTIONS=halt_on_error=1 suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/tsan.supp ${PINEFORGE_FEED_TSAN_OPTIONS_EXTRA}")
   endif()
 endif()

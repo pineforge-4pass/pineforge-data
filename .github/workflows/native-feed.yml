@@ -104,7 +104,8 @@ jobs:
           export LD_LIBRARY_PATH="$RUNNER_TEMP/curl/lib:${LD_LIBRARY_PATH:-}"
           cmake -S native/feed -B build-feed -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_CXX_COMPILER=clang++-18 -DCMAKE_C_COMPILER=clang-18 -DCURL_DIR="$RUNNER_TEMP/curl/lib/cmake/CURL" \
-            -DPINEFORGE_FEED_SANITIZER=thread
+            -DPINEFORGE_FEED_SANITIZER=thread \
+            "-DPINEFORGE_FEED_TSAN_OPTIONS_EXTRA=halt_on_error=0 second_deadlock_stack=1 log_path=$RUNNER_TEMP/tsan/report"
           cmake --build build-feed -j4
           ctest --test-dir build-feed --output-on-failure
       - uses: actions/upload-artifact@v5
@@ -131,7 +132,8 @@ jobs:
           export LD_LIBRARY_PATH="$RUNNER_TEMP/curl/lib:${LD_LIBRARY_PATH:-}"
           cmake -S native/feed -B build-feed -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_CXX_COMPILER=clang++-18 -DCMAKE_C_COMPILER=clang-18 -DCURL_DIR="$RUNNER_TEMP/curl/lib/cmake/CURL" \
-            -DPINEFORGE_FEED_SANITIZER=thread
+            -DPINEFORGE_FEED_SANITIZER=thread \
+            "-DPINEFORGE_FEED_TSAN_OPTIONS_EXTRA=halt_on_error=0 second_deadlock_stack=1 log_path=$RUNNER_TEMP/tsan/report"
           cmake --build build-feed -j4
           ctest --test-dir build-feed --output-on-failure
       - uses: actions/upload-artifact@v5

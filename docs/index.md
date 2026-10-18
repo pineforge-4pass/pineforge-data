@@ -1,7 +1,7 @@
-# PineForge Data documentation
+# Tunaxis Data documentation
 
-PineForge Data connects external market data providers to deterministic
-PineForge backtests. It owns provider transport, market discovery, normalized
+Tunaxis Data connects external market data providers to deterministic
+Tunaxis backtests. It owns provider transport, market discovery, normalized
 records, data provenance, and the local or remote handoff to
 `pineforge-release`.
 
@@ -33,7 +33,7 @@ exchange / CSV / database
 
 ## Package boundaries
 
-- `pineforge-data` is Python-only and owns external data integration.
+- `tunaxis-data` is Python-only and owns external data integration.
 - `pineforge-release` owns Pine transpilation, C++ compilation, and the engine
   runtime image.
 - `pineforge-engine` receives normalized arrays and must not depend on provider
@@ -49,7 +49,7 @@ exchange / CSV / database
   identify it;
 - exact catalog resolution distinguishes spot, swaps, futures, and options;
 - user-owned tabular schemas are reflected and mapped explicitly rather than
-  requiring a PineForge-owned DDL;
+  requiring a Tunaxis-owned DDL;
 - macro observations retain release and vintage timestamps to avoid revised-
   data lookahead;
 - backtest reports identify both the resolved market and runtime versions.

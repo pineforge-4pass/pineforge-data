@@ -5,7 +5,7 @@ from collections.abc import Mapping, Sequence
 
 import pytest
 
-from pineforge_data import (
+from tunaxis_data import (
     AssetClass,
     BarRequest,
     CcxtCapabilityError,

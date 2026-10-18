@@ -92,7 +92,7 @@ capabilities, `no-new-privileges`, and a writable cache volume.
 ## Release provenance
 
 The server and local Docker runtime share the digest in
-`pineforge_data.DEFAULT_RELEASE_IMAGE`. Automated dependency PRs also pin the
+`tunaxis_data.DEFAULT_RELEASE_IMAGE`. Automated dependency PRs also pin the
 hub commit in the server Dockerfile. Local Docker responses report the image's
 OCI revision as `runtime.hub_commit`; server responses report the corresponding
 build pin. CI inspects the built server's inherited OCI labels and compares

@@ -129,7 +129,7 @@ def _validate_overrides(overrides: Mapping[str, str] | None) -> dict[str, str]:
 
 @dataclass(frozen=True, slots=True)
 class BarColumnMapping:
-    """Map canonical PineForge bar fields to arbitrary source column names."""
+    """Map canonical Tunaxis bar fields to arbitrary source column names."""
 
     timestamp: str
     open: str

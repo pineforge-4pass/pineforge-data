@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from pineforge_data import (
+from tunaxis_data import (
     BarColumnMapping,
     BarRequest,
     CsvBarProvider,

@@ -26,7 +26,7 @@ from their market catalog.
 ### Spot example
 
 ```python
-from pineforge_data import AssetClass, Instrument, MarketType
+from tunaxis_data import AssetClass, Instrument, MarketType
 
 spot = Instrument(
     symbol="BTC/USD",
@@ -42,7 +42,7 @@ spot = Instrument(
 ### Contract example
 
 ```python
-from pineforge_data import ContractSpec, Instrument, MarketType
+from tunaxis_data import ContractSpec, Instrument, MarketType
 
 swap = Instrument(
     symbol="BTC/USDT:USDT",

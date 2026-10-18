@@ -149,7 +149,7 @@ class Bar:
 
 @dataclass(frozen=True, slots=True)
 class TradeTick:
-    """One normalized executed trade ready for the PineForge stream ABI."""
+    """One normalized executed trade ready for the Tunaxis stream ABI."""
 
     instrument: Instrument
     timestamp_ms: int

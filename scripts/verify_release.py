@@ -9,6 +9,8 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+from bump_version import synchronized_version
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -42,7 +44,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pyproject", type=Path, default=ROOT / "pyproject.toml")
     args = parser.parse_args(argv)
     try:
-        version = project_version(args.pyproject)
+        version = synchronized_version(args.pyproject)
         verify_release_tag(args.tag, version)
     except (OSError, tomllib.TOMLDecodeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)

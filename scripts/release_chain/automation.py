@@ -7,16 +7,18 @@ import re
 import subprocess
 import tempfile
 import time
+import tomllib
 from pathlib import Path
 from typing import Any
 
-from bump_version import bumped_version, replace_project_version
+from bump_version import bumped_version, version_edits
 
 from .contract import (
     DOCKERFILE,
     LOCK,
     MANIFEST,
     RUNTIME,
+    SHIM_PROJECT,
     UPDATE_FILES,
     gh_bytes,
     hub_manifest,
@@ -80,7 +82,8 @@ def inventory(repo: str, endpoint: str, key: str | None = None) -> list[Any]:
 
 def body(metadata: dict[str, Any]) -> str:
     return (
-        f"Publish pineforge-data {metadata['version']} after its own CI and runtime E2E.\n\n"
+        f"Publish tunaxis-data and its pineforge-data shim {metadata['version']} "
+        "after their own CI and runtime E2E.\n\n"
         "Required: Python 3.11/3.12/3.13, manifest/source/OCI verification, real Docker "
         "harness and ABI checks, concurrent server/cache checks, disposable database E2E, "
         "and installation/backtesting of both distributions. `release/ready` must pass "
@@ -98,8 +101,13 @@ def finish(report: dict[str, Any], path: Path) -> None:
 
 
 def snapshot(revision: str, root: Path) -> None:
-    for name in (RUNTIME, DOCKERFILE, "pyproject.toml", LOCK, MANIFEST):
-        result = subprocess.run(["git", "show", f"{revision}:{name}"], capture_output=True)
+    project = subprocess.check_output(["git", "show", f"{revision}:pyproject.toml"])
+    legacy = tomllib.loads(project.decode())["project"]["name"] == "pineforge-data"
+    for name in (RUNTIME, DOCKERFILE, "pyproject.toml", SHIM_PROJECT, LOCK, MANIFEST):
+        if name == SHIM_PROJECT and legacy:
+            continue
+        source = name.replace("src/tunaxis_data/", "src/pineforge_data/") if legacy else name
+        result = subprocess.run(["git", "show", f"{revision}:{source}"], capture_output=True)
         if result.returncode:
             require(name in {LOCK, MANIFEST}, f"missing source {name}")
             continue
@@ -113,9 +121,8 @@ def manual_patch(root: Path, part: str) -> dict[str, bytes]:
     current = package_version(root)
     version = bumped_version(current, part)  # type: ignore[arg-type]
     patch = {
-        "pyproject.toml": replace_project_version(
-            (root / "pyproject.toml").read_text(), current, version
-        ).encode()
+        str(path.relative_to(root)): text.encode()
+        for path, text in version_edits(root / "pyproject.toml", version).items()
     }
     lock = load_lock(root)
     if lock:
@@ -198,7 +205,7 @@ def create_pr(
         git("config", "user.name", bot)
         git("config", "user.email", email)
         git("add", "--", *sorted(patch))
-        git("commit", "-m", f"Update PineForge data release to {metadata['version']}")
+        git("commit", "-m", f"Update Tunaxis data release to {metadata['version']}")
         head = git("rev-parse", "HEAD")
         git("push", "origin", f"HEAD:refs/heads/{branch}")  # No base push or force push.
     metadata.update(generated_head=head, base=base)
@@ -209,7 +216,7 @@ def create_pr(
         {
             "base": "main",
             "head": branch,
-            "title": f"Release pineforge-data {metadata['version']}",
+            "title": f"Release tunaxis-data and pineforge-data shim {metadata['version']}",
             "body": body(metadata),
         },
     )

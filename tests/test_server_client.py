@@ -6,7 +6,7 @@ from urllib.request import Request
 
 import pytest
 
-from pineforge_data import BacktestOptions, Bar, FastApiBacktestClient, Instrument
+from tunaxis_data import BacktestOptions, Bar, FastApiBacktestClient, Instrument
 
 
 class FakeResponse:
@@ -38,7 +38,7 @@ def test_client_posts_normalized_request(monkeypatch: pytest.MonkeyPatch) -> Non
             }
         )
 
-    monkeypatch.setattr("pineforge_data.server_client.urlopen", fake_urlopen)
+    monkeypatch.setattr("tunaxis_data.server_client.urlopen", fake_urlopen)
     instrument = Instrument("BTC/USD", venue="kraken")
     bars = [Bar(instrument, 1_000, 10, 12, 9, 11, 5, "ccxt:kraken")]
     client = FastApiBacktestClient("http://localhost:8000", timeout_seconds=30, api_key="secret")

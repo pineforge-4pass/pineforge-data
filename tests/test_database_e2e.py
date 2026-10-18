@@ -12,7 +12,7 @@ from typing import Any, cast
 
 import pytest
 
-from pineforge_data import BarRequest, TabularBarProvider, create_provider
+from tunaxis_data import BarRequest, TabularBarProvider, create_provider
 
 ROOT = Path(__file__).resolve().parents[1]
 SAMPLE_PATH = ROOT / "tests/fixtures/corpus_ohlcv_ETH-USDT-USDT_1m_sample.csv"

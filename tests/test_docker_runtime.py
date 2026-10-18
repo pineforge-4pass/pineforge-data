@@ -5,7 +5,7 @@ import subprocess
 
 import pytest
 
-from pineforge_data import (
+from tunaxis_data import (
     DEFAULT_RELEASE_IMAGE,
     DockerBacktestRuntime,
     DockerPrerequisiteError,
@@ -55,7 +55,7 @@ def test_missing_policy_pulls_once(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_completed_error_prefers_stderr() -> None:
-    from pineforge_data.docker_runtime import _completed_error
+    from tunaxis_data.docker_runtime import _completed_error
 
     completed = subprocess.CompletedProcess(["docker"], 1, "stdout", "stderr")
 

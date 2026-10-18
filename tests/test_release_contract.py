@@ -6,14 +6,14 @@ from pathlib import Path
 
 import pytest
 
-from pineforge_data import (
+from tunaxis_data import (
     DEFAULT_RELEASE_IMAGE,
     BacktestOptions,
     Bar,
     Instrument,
     ReleaseContractError,
 )
-from pineforge_data.release_contract import (
+from tunaxis_data.release_contract import (
     normalize_release_version,
     parse_release_report,
     release_environment,

@@ -1,14 +1,14 @@
-# PineForge Data
+# Tunaxis Data
 
-[![PyPI](https://img.shields.io/pypi/v/pineforge-data.svg)](https://pypi.org/project/pineforge-data/)
-[![Python](https://img.shields.io/pypi/pyversions/pineforge-data.svg)](https://pypi.org/project/pineforge-data/)
+[![PyPI](https://img.shields.io/pypi/v/tunaxis-data.svg)](https://pypi.org/project/tunaxis-data/)
+[![Python](https://img.shields.io/pypi/pyversions/tunaxis-data.svg)](https://pypi.org/project/tunaxis-data/)
 [![CI](https://github.com/pineforge-4pass/pineforge-data/actions/workflows/ci.yml/badge.svg)](https://github.com/pineforge-4pass/pineforge-data/actions/workflows/ci.yml)
 [![Documentation](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://pineforge-4pass.github.io/pineforge-data/)
 
 Fetch normalized market data and run raw PineScript strategies through
-PineForge.
+Tunaxis.
 
-PineForge Data provides Python adapters for exchanges, CSV files, SQLite, and
+Tunaxis Data provides Python adapters for exchanges, CSV files, SQLite, and
 SQLAlchemy-compatible databases. Its backtest harness sends normalized OHLCV
 to the `pineforge-release` container, which transpiles the PineScript, compiles
 it, and runs `pineforge-engine`.
@@ -16,7 +16,7 @@ it, and runs `pineforge-engine`.
 ```text
 exchange / CSV / database
           ↓
-    pineforge-data
+    tunaxis-data
           ↓
  pineforge-release container
           ↓
@@ -26,6 +26,13 @@ exchange / CSV / database
 The provider layer is Python-only. You do not need a C++ compiler, Git
 submodules, or local engine and codegen checkouts.
 
+## Formerly PineForge
+
+Tunaxis Data was formerly published as `pineforge-data`. The old distribution
+now forwards to `tunaxis-data`; `import pineforge_data` and the
+`pineforge-backtest` and `pineforge-backtest-server` commands keep working with
+a `DeprecationWarning` for the old import.
+
 ## Quick start
 
 You need Python 3.11 or newer. Docker is required only for backtests; fetching
@@ -34,7 +41,7 @@ and normalizing data does not use Docker.
 ### 1. Install an exchange provider
 
 ```bash
-python -m pip install 'pineforge-data[ccxt]'
+python -m pip install 'tunaxis-data[ccxt]'
 ```
 
 ### 2. Fetch confirmed OHLCV
@@ -42,7 +49,7 @@ python -m pip install 'pineforge-data[ccxt]'
 ```python
 import asyncio
 
-from pineforge_data import BarRequest, CcxtProvider
+from tunaxis_data import BarRequest, CcxtProvider
 
 
 async def main() -> None:
@@ -87,7 +94,7 @@ if ta.crossunder(fast, slow)
 Then run:
 
 ```bash
-pineforge-backtest \
+tunaxis-backtest \
   --pine strategy.pine \
   --provider ccxt \
   --venue bitstamp \
@@ -114,18 +121,18 @@ credentials remain on the host.
 
 ## Bring your own data
 
-PineForge does not require a fixed table definition. Local providers inspect
+Tunaxis does not require a fixed table definition. Local providers inspect
 headers or reflected database columns at runtime, infer common OHLCV names,
 and accept an explicit mapping when your schema uses different names.
 
 | Source | Install | Guide |
 |---|---|---|
-| CSV | `pip install pineforge-data` | [CSV API](https://pineforge-4pass.github.io/pineforge-data/providers/csv/) |
-| SQLite | `pip install pineforge-data` | [SQLite API](https://pineforge-4pass.github.io/pineforge-data/providers/sqlite/) |
-| SQLAlchemy database | `pip install 'pineforge-data[database]'` plus a database driver | [SQLAlchemy API](https://pineforge-4pass.github.io/pineforge-data/providers/sqlalchemy/) |
-| CCXT exchange | `pip install 'pineforge-data[ccxt]'` | [CCXT API](https://pineforge-4pass.github.io/pineforge-data/providers/ccxt/) |
+| CSV | `pip install tunaxis-data` | [CSV API](https://pineforge-4pass.github.io/pineforge-data/providers/csv/) |
+| SQLite | `pip install tunaxis-data` | [SQLite API](https://pineforge-4pass.github.io/pineforge-data/providers/sqlite/) |
+| SQLAlchemy database | `pip install 'tunaxis-data[database]'` plus a database driver | [SQLAlchemy API](https://pineforge-4pass.github.io/pineforge-data/providers/sqlalchemy/) |
+| CCXT exchange | `pip install 'tunaxis-data[ccxt]'` | [CCXT API](https://pineforge-4pass.github.io/pineforge-data/providers/ccxt/) |
 
-The same `pineforge-backtest` command supports `--provider csv`, `sqlite`, and
+The same `tunaxis-backtest` command supports `--provider csv`, `sqlite`, and
 `sqlalchemy`. See the [backtesting guide](https://pineforge-4pass.github.io/pineforge-data/backtesting/)
 for provider configuration, warmup behavior, strategy inputs, reports, and
 local versus remote execution.

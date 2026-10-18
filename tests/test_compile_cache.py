@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from pineforge_data import CompileCache
+from tunaxis_data import CompileCache
 
 
 def test_compile_cache_commits_and_reports_hits(tmp_path) -> None:

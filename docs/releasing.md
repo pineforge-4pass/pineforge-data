@@ -1,6 +1,6 @@
 # Releasing to PyPI
 
-PineForge Data publishes pure-Python wheels and source distributions through
+Tunaxis Data publishes pure-Python wheels and source distributions through
 PyPI Trusted Publishing in the existing `release.yml` workflow and `pypi`
 environment. Stable hub releases automatically open a dependency PR, pass this
 repository's CI and runtime E2E, merge under branch protection, and publish the
@@ -29,12 +29,12 @@ replace or downgrade.
 
 A stable update changes only:
 
-- `src/pineforge_data/release_contract.py`: Python image default;
+- `src/tunaxis_data/release_contract.py`: Python image default;
 - `docker/server.Dockerfile`: the same image default and hub source pin;
 - `pyproject.toml`: an independent data package patch increment;
-- `src/pineforge_data/release_lock.json`: complete received event, data version
+- `src/tunaxis_data/release_lock.json`: complete received event, data version
   and previous identity;
-- `src/pineforge_data/release_manifest.json`: exact verified manifest bytes.
+- `src/tunaxis_data/release_manifest.json`: exact verified manifest bytes.
 
 The lock and manifest are created by the first real ready event; synthetic test
 fixtures never become production defaults. Until then only the original 1.0.0
@@ -193,7 +193,7 @@ replace the tested dependency with a moving image alias. Actions write access
 is used only on this consumer to replay its existing `Release` workflow after
 a complete successful landed CI run. It never reruns producer bump logic.
 
-For repair, dispatch `PineForge release adapter` to reconcile. To replay a
+For repair, dispatch `Tunaxis release adapter` to reconcile. To replay a
 publication explicitly, dispatch `Release` from `main` with `ci_run` set to the
 successful landed main CI run ID. Leave the other optional input empty. To
 publish an ordinary data change, leave `ci_run` empty and choose a semantic
@@ -243,7 +243,7 @@ Keep the PyPI Trusted Publisher configured exactly as follows:
 
 | Field | Value |
 |---|---|
-| PyPI project | `pineforge-data` |
+| PyPI projects | `tunaxis-data` first, then `pineforge-data` compatibility shim |
 | GitHub owner | `pineforge-4pass` |
 | Repository | `pineforge-data` |
 | Workflow | `release.yml` |

@@ -45,7 +45,7 @@ external package registers a factory without changing this repository's CLI:
 
 ```toml
 [project.entry-points."pineforge_data.providers"]
-example = "example_pineforge:provider_factory"
+example = "example_tunaxis:provider_factory"
 ```
 
 The callable receives `(venue, config)` and returns a structural

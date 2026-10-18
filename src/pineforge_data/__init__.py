@@ -1,138 +1,67 @@
-"""Provider-neutral market and macro data contracts for PineForge."""
+"""Deprecated import alias for :mod:`tunaxis_data` (shipped by pineforge-data)."""
 
-from .backtest import (
-    BacktestOptions,
-    BacktestReport,
-    EngineBacktestError,
-    MagnifierDistribution,
-    PineForgeBacktestRunner,
-)
-from .compile_cache import CompileCache
-from .docker_runtime import (
-    DockerBacktestRuntime,
-    DockerExecutionError,
-    DockerPrerequisiteError,
-)
-from .engine import EngineStreamSink, PfBar, PfTradeTick, pack_bars, pack_trade_ticks
-from .errors import EngineStreamError
-from .models import (
-    AssetClass,
-    Bar,
-    ContractSpec,
-    Instrument,
-    MacroObservation,
-    MarketListing,
-    MarketType,
-    OptionType,
-    TradeTick,
-)
-from .providers import (
-    BarColumnMapping,
-    CcxtCapabilityError,
-    CcxtDataError,
-    CcxtDependencyError,
-    CcxtError,
-    CcxtProvider,
-    CsvBarProvider,
-    FxMacroDataAccessWarning,
-    FxMacroDataDataError,
-    FxMacroDataError,
-    FxMacroDataHTTPError,
-    FxMacroDataProvider,
-    FxMacroDataResponse,
-    FxMacroDataTransport,
-    HistoricalBarProvider,
-    LiveTradeProvider,
-    MacroDataProvider,
-    MarketCatalogProvider,
-    MarketDataProvider,
-    MarketNotFoundError,
-    ProviderFactory,
-    ProviderNotFoundError,
-    ProviderRegistry,
-    ProviderRegistryError,
-    SchemaMappingError,
-    SourceColumn,
-    SqlAlchemyBarProvider,
-    SqlAlchemyDependencyError,
-    SqliteBarProvider,
-    TabularBarProvider,
-    TabularDataError,
-    TabularSchema,
-    TimestampUnit,
-    create_provider,
-    default_registry,
-)
-from .release_contract import DEFAULT_RELEASE_IMAGE, ReleaseContractError
-from .requests import BarRequest, MacroRequest, MarketQuery, TradeSubscription
-from .server_client import BacktestServerError, FastApiBacktestClient
+from __future__ import annotations
 
-__all__ = [
-    "DEFAULT_RELEASE_IMAGE",
-    "AssetClass",
-    "BacktestOptions",
-    "BacktestReport",
-    "BacktestServerError",
-    "Bar",
-    "BarColumnMapping",
-    "BarRequest",
-    "CcxtCapabilityError",
-    "CcxtDataError",
-    "CcxtDependencyError",
-    "CcxtError",
-    "CcxtProvider",
-    "CompileCache",
-    "ContractSpec",
-    "CsvBarProvider",
-    "DockerBacktestRuntime",
-    "DockerExecutionError",
-    "DockerPrerequisiteError",
-    "EngineBacktestError",
-    "EngineStreamError",
-    "EngineStreamSink",
-    "FastApiBacktestClient",
-    "FxMacroDataAccessWarning",
-    "FxMacroDataDataError",
-    "FxMacroDataError",
-    "FxMacroDataHTTPError",
-    "FxMacroDataProvider",
-    "FxMacroDataResponse",
-    "FxMacroDataTransport",
-    "HistoricalBarProvider",
-    "Instrument",
-    "LiveTradeProvider",
-    "MacroDataProvider",
-    "MacroObservation",
-    "MacroRequest",
-    "MagnifierDistribution",
-    "MarketCatalogProvider",
-    "MarketDataProvider",
-    "MarketListing",
-    "MarketNotFoundError",
-    "MarketQuery",
-    "MarketType",
-    "OptionType",
-    "PfBar",
-    "PfTradeTick",
-    "PineForgeBacktestRunner",
-    "ProviderFactory",
-    "ProviderNotFoundError",
-    "ProviderRegistry",
-    "ProviderRegistryError",
-    "ReleaseContractError",
-    "SchemaMappingError",
-    "SourceColumn",
-    "SqlAlchemyBarProvider",
-    "SqlAlchemyDependencyError",
-    "SqliteBarProvider",
-    "TabularBarProvider",
-    "TabularDataError",
-    "TabularSchema",
-    "TimestampUnit",
-    "TradeSubscription",
-    "TradeTick",
-    "create_provider",
-    "default_registry",
-    "pack_bars",
-    "pack_trade_ticks",
-]
+import importlib
+import importlib.abc
+import importlib.machinery
+import importlib.util
+import sys
+import warnings
+from types import CodeType, ModuleType
+from typing import Any
+
+
+class _AliasLoader(importlib.abc.Loader):
+    """Reuse the canonical module without changing its import metadata."""
+
+    def __init__(self, canonical: str) -> None:
+        self.canonical = canonical
+        self.spec: importlib.machinery.ModuleSpec | None = None
+
+    def create_module(self, spec: importlib.machinery.ModuleSpec) -> ModuleType:
+        module = importlib.import_module(self.canonical)
+        self.spec = module.__spec__
+        return module
+
+    def exec_module(self, module: ModuleType) -> None:
+        # Import machinery temporarily assigns the alias spec to the shared object.
+        # Preserve canonical metadata for reload(), resources and later imports.
+        module.__spec__ = self.spec
+
+    def get_code(self, fullname: str) -> CodeType | None:
+        # runpy uses get_code rather than exec_module for `python -m old.module`.
+        spec = importlib.util.find_spec(self.canonical)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot find {self.canonical}")
+        loader: Any = spec.loader
+        return loader.get_code(self.canonical)  # type: ignore[no-any-return]
+
+
+class _AliasFinder(importlib.abc.MetaPathFinder):
+    def find_spec(
+        self,
+        fullname: str,
+        path: Any = None,
+        target: ModuleType | None = None,
+    ) -> importlib.machinery.ModuleSpec | None:
+        if not fullname.startswith("pineforge_data."):
+            return None
+        canonical = "tunaxis_data" + fullname[len("pineforge_data") :]
+        spec = importlib.util.find_spec(canonical)
+        if spec is None:
+            return None
+        return importlib.util.spec_from_loader(
+            fullname,
+            _AliasLoader(canonical),
+            is_package=spec.submodule_search_locations is not None,
+        )
+
+
+warnings.warn(
+    "pineforge_data is deprecated; import tunaxis_data and install tunaxis-data instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)
+sys.meta_path.insert(0, _AliasFinder())
+sys.modules[__name__] = importlib.import_module("tunaxis_data")

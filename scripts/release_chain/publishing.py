@@ -30,19 +30,56 @@ from .contract import (
     verify_artifacts,
     verify_local,
 )
+from .distributions import verify_archives
 from .evidence import distribution_hashes, gate_for_run
 from .receipts import candidate as record_candidate
 from .receipts import served, timestamp
 
 
-def pypi_files(version: str) -> dict[str, str] | None:
-    try:
-        value = object_json(fetch(f"https://pypi.org/pypi/pineforge-data/{version}/json"))
-    except HTTPError as exc:
-        if exc.code == 404:
-            return None
-        raise
-    return {entry["filename"]: entry["digests"]["sha256"] for entry in value["urls"]}
+PYPI_PROJECTS = ("tunaxis-data", "pineforge-data")
+
+
+def pypi_files(version: str, project: str | None = None) -> dict[str, str] | None:
+    """Return the immutable inventory for both projects, or one named project."""
+    projects = (project,) if project else PYPI_PROJECTS
+    result: dict[str, str] = {}
+    for name in projects:
+        try:
+            value = object_json(fetch(f"https://pypi.org/pypi/{name}/{version}/json"))
+        except HTTPError as exc:
+            if exc.code == 404:
+                return None
+            raise
+        result.update({entry["filename"]: entry["digests"]["sha256"] for entry in value["urls"]})
+    return result
+
+
+def pypi_downloads(
+    version: str, projects: tuple[str, ...] = PYPI_PROJECTS
+) -> tuple[dict[str, str], dict[str, bytes]]:
+    """Download and hash the requested PyPI projects, checking their metadata."""
+    inventories = [pypi_files(version, project) for project in projects]
+    require(
+        all(inventory is not None for inventory in inventories),
+        "required PyPI project is missing",
+    )
+    digests: dict[str, str] = {}
+    for inventory in inventories:
+        assert inventory is not None
+        digests.update(inventory)
+    data: dict[str, bytes] = {}
+    for project in projects:
+        metadata = object_json(fetch(f"https://pypi.org/pypi/{project}/{version}/json"))
+        for entry in metadata["urls"]:
+            require(
+                entry["url"].startswith("https://files.pythonhosted.org/"),
+                "unexpected PyPI source",
+            )
+            raw = fetch(entry["url"])
+            require(sha256(raw) == digests[entry["filename"]], "PyPI bytes differ")
+            data[entry["filename"]] = raw
+    verify_archives(data, version, legacy=projects == ("pineforge-data",))
+    return digests, data
 
 
 def candidate_gate(repo: str, pr: dict[str, Any]) -> dict[str, Any]:
@@ -77,28 +114,24 @@ def verified_package(
     repo: str, version: str, saved: dict[str, Any] | None = None
 ) -> dict[str, str]:
     """Observe immutable PyPI bytes, matching GitHub assets and tagged source/facts."""
-    files = pypi_files(version)
+    main_files = pypi_files(version, "tunaxis-data")
+    shim_files = pypi_files(version, "pineforge-data")
+    legacy = main_files is None and shim_files is not None
+    files = (
+        shim_files
+        if legacy
+        else ({**main_files, **shim_files} if main_files and shim_files else None)
+    )
     require(
         files is not None
-        and len(files) == 2
-        and sum(name.endswith(".whl") for name in files) == 1
-        and sum(name.endswith(".tar.gz") for name in files) == 1,
-        "previous publication needs a wheel and sdist",
+        and len(files) == (2 if legacy else 4)
+        and sum(name.endswith(".whl") for name in files) == (1 if legacy else 2)
+        and sum(name.endswith(".tar.gz") for name in files) == (1 if legacy else 2),
+        "publication needs the required wheel and sdist inventory",
     )
-    metadata = object_json(fetch(f"https://pypi.org/pypi/pineforge-data/{version}/json"))
-    require(
-        {entry["filename"]: entry["digests"]["sha256"] for entry in metadata["urls"]} == files,
-        "PyPI inventory moved during verification",
-    )
-    downloads = {}
-    for entry in metadata["urls"]:
-        require(
-            entry["url"].startswith("https://files.pythonhosted.org/"), "unexpected PyPI source"
-        )
-        downloads[entry["filename"]] = fetch(entry["url"])
-        require(
-            sha256(downloads[entry["filename"]]) == files[entry["filename"]], "PyPI bytes differ"
-        )
+    projects = ("pineforge-data",) if legacy else PYPI_PROJECTS
+    observed, downloads = pypi_downloads(version, projects)
+    require(observed == files, "PyPI inventory moved during verification")
     release = api(repo, f"releases/tags/v{version}")
     for name, digest in files.items():
         assets = [asset for asset in release["assets"] if asset["name"] == name]
@@ -124,7 +157,8 @@ def verified_package(
             "previous distribution lacks manifest/facts provenance; "
             "establish a baseline before enablement",
         )
-        wheel = next(data for name, data in downloads.items() if name.endswith(".whl"))
+        wheel_name = next(name for name in downloads if name.endswith(".whl"))
+        wheel = downloads[wheel_name]
         with zipfile.ZipFile(io.BytesIO(wheel)) as zipped:
             for name in (LOCK, MANIFEST, RUNTIME):
                 member = name.removeprefix("src/")
@@ -401,7 +435,7 @@ def github_release(root: Path, repo: str, directory: Path, report: dict[str, Any
                 "--target",
                 source,
                 "--title",
-                f"pineforge-data {tag}",
+                f"tunaxis-data and pineforge-data shim {tag}",
                 "--generate-notes",
                 "--latest=false",
             ],
@@ -435,16 +469,8 @@ def verify_publication(repo: str, directory: Path, report: dict[str, Any]) -> No
     else:
         raise ValueError("PyPI publication has no verifiable distribution inventory")
     # Read both immutable downloads, rather than treating a publish action as verification.
-    metadata = object_json(fetch(f"https://pypi.org/pypi/pineforge-data/{version}/json"))
-    for entry in metadata["urls"]:
-        require(
-            entry["url"].startswith("https://files.pythonhosted.org/"),
-            "unexpected PyPI download source",
-        )
-        require(
-            sha256(fetch(entry["url"])) == expected[entry["filename"]],
-            "PyPI download bytes disagree with tested distribution",
-        )
+    observed, _downloads = pypi_downloads(version)
+    require(observed == expected, "PyPI download bytes disagree with tested distribution")
     lock = verify_local(candidate)
     if lock:
         report["deployed"] = served(lock["event"], report["pr"]["merge"], version, expected)

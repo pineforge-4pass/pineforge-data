@@ -2,13 +2,13 @@
 
 [Provider catalog](../providers.md) · [Normalized data model](../data-model.md)
 
-The `ccxt` provider adapts CCXT's unified async API into PineForge market
+The `ccxt` provider adapts CCXT's unified async API into Tunaxis market
 listings, confirmed historical OHLCV, and ordered public trade ticks.
 
 ## Install
 
 ```bash
-pip install 'pineforge-data[ccxt]'
+pip install 'tunaxis-data[ccxt]'
 ```
 
 The registry name is `ccxt`. The venue is an exact CCXT exchange ID such as
@@ -17,7 +17,7 @@ The registry name is `ccxt`. The venue is an exact CCXT exchange ID such as
 ## Construct the provider
 
 ```python
-from pineforge_data import CcxtProvider
+from tunaxis_data import CcxtProvider
 
 provider = CcxtProvider(
     "kraken",
@@ -39,7 +39,7 @@ clients.
 ## Discover markets
 
 ```python
-from pineforge_data import CcxtProvider, MarketQuery, MarketType
+from tunaxis_data import CcxtProvider, MarketQuery, MarketType
 
 
 async def list_linear_swaps():
@@ -72,7 +72,7 @@ Normalized catalog metadata includes:
 ## Fetch confirmed historical bars
 
 ```python
-from pineforge_data import BarRequest, CcxtProvider
+from tunaxis_data import BarRequest, CcxtProvider
 
 
 async def fetch_swap_bars():
@@ -99,12 +99,12 @@ Historical behavior:
 - includes only timestamps in `[start_ms, end_ms)`;
 - excludes a candle whose close time is later than the observation time.
 
-Exchange gaps remain gaps. PineForge Data does not synthesize missing candles.
+Exchange gaps remain gaps. Tunaxis Data does not synthesize missing candles.
 
 ## Stream public trades
 
 ```python
-from pineforge_data import CcxtProvider, TradeSubscription
+from tunaxis_data import CcxtProvider, TradeSubscription
 
 
 async def print_next_trade():
@@ -129,7 +129,7 @@ sequence, so the next emitted value is `start_sequence + 1`.
 
 | Argument | Default | Purpose |
 |---|---|---|
-| `exchange_id` | required | exact CCXT exchange ID and PineForge venue |
+| `exchange_id` | required | exact CCXT exchange ID and Tunaxis venue |
 | `config` | `{}` | CCXT exchange constructor options and credentials |
 | `exchange` | `None` | injected async CCXT-compatible exchange |
 | `page_limit` | `1000` | maximum bars or trades requested per REST page |
@@ -156,7 +156,7 @@ The registry factory forwards the JSON object to CCXT's exchange constructor:
 ```
 
 ```bash
-pineforge-backtest \
+tunaxis-backtest \
   --pine strategy.pine \
   --provider ccxt \
   --provider-config ccxt.json \

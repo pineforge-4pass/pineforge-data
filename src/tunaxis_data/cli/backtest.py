@@ -1,4 +1,4 @@
-"""Fetch provider OHLCV and run a PineForge strategy without intermediate files."""
+"""Fetch provider OHLCV and run a Tunaxis strategy without intermediate files."""
 
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ def source_timeframe_to_pine(timeframe: str) -> str:
 
     match = re.fullmatch(r"([1-9][0-9]*)([smhdwM])", timeframe)
     if match is None:
-        raise ValueError(f"cannot translate source timeframe to PineForge: {timeframe}")
+        raise ValueError(f"cannot translate source timeframe to Tunaxis: {timeframe}")
     count = int(match.group(1))
     unit = match.group(2)
     if unit == "s":
@@ -126,7 +126,7 @@ def _market_payload(listing: MarketListing) -> dict[str, JsonValue]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="pineforge-backtest",
+        prog="tunaxis-backtest",
         description="Transpile raw PineScript and backtest provider OHLCV in Docker",
     )
     parser.add_argument("--pine", type=Path, required=True, help="raw PineScript v6 strategy")
@@ -156,10 +156,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="source bars before --start used for indicator warmup; trading stays disabled",
     )
     parser.add_argument("--timezone", default="UTC", help="IANA chart and exchange timezone")
-    parser.add_argument("--session", default="24x7", help="PineForge syminfo session")
+    parser.add_argument("--session", default="24x7", help="Tunaxis syminfo session")
     parser.add_argument(
         "--engine-timeframe",
-        help="PineForge input timeframe; defaults to a translation of --timeframe",
+        help="Tunaxis input timeframe; defaults to a translation of --timeframe",
     )
     parser.add_argument("--script-timeframe", default="")
     parser.add_argument("--provider-config", type=Path, help="provider options JSON file")

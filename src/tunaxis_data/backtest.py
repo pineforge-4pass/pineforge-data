@@ -1,4 +1,4 @@
-"""Run normalized PineForge data directly through a compiled strategy library."""
+"""Run normalized Tunaxis data directly through a compiled strategy library."""
 
 from __future__ import annotations
 
@@ -23,18 +23,18 @@ EXPECTED_PF_ABI = 4
 _REFUSED_ABI_HINTS = {
     2: (
         "engine v0.10.2 to v0.12.3 built it: rebuild the strategy with engine 1.x, "
-        "or read it with pineforge-data 0.2.0"
+        "or read it with tunaxis-data 0.2.0"
     ),
     3: "engine v0.13.0 to v0.13.1 built it: rebuild the strategy with engine 1.x",
 }
 
 
 class EngineBacktestError(RuntimeError):
-    """A PineForge historical backtest could not be completed."""
+    """A Tunaxis historical backtest could not be completed."""
 
 
 class MagnifierDistribution(IntEnum):
-    """PineForge bar-magnifier path sampling distributions."""
+    """Tunaxis bar-magnifier path sampling distributions."""
 
     UNIFORM = 0
     COSINE = 1
@@ -321,10 +321,10 @@ def _decode(value: bytes | None) -> str:
     return value.decode("utf-8", "replace") if value else ""
 
 
-class PineForgeBacktestRunner:
-    """Thin owner-safe wrapper around one compiled PineForge strategy library.
+class TunaxisBacktestRunner:
+    """Thin owner-safe wrapper around one compiled Tunaxis strategy library.
 
-    The library must report PineForge C ABI 4, which engine 1.x builds; like the
+    The library must report Tunaxis C ABI 4, which engine 1.x builds; like the
     release image's own harness, the runner requires the exact ABI that
     ``pineforge.h`` asks every caller to check. Libraries that report ABI 2
     (engine v0.10.2 to v0.12.3) or ABI 3 (engine v0.13.x) are refused with
@@ -339,7 +339,7 @@ class PineForgeBacktestRunner:
         self._configure_signatures()
 
     @classmethod
-    def load(cls, strategy_library: str | Path) -> PineForgeBacktestRunner:
+    def load(cls, strategy_library: str | Path) -> TunaxisBacktestRunner:
         """Load a compiled strategy shared library from disk."""
 
         path = Path(strategy_library).expanduser().resolve()
@@ -359,11 +359,11 @@ class PineForgeBacktestRunner:
             ) from exc
         if actual != EXPECTED_PF_ABI:
             message = (
-                f"PineForge ABI mismatch: strategy reports {actual}, expected {EXPECTED_PF_ABI}"
+                f"Tunaxis ABI mismatch: strategy reports {actual}, expected {EXPECTED_PF_ABI}"
             )
             hint = _REFUSED_ABI_HINTS.get(actual)
             if hint is None and actual > EXPECTED_PF_ABI:
-                hint = "a newer engine built it: upgrade pineforge-data"
+                hint = "a newer engine built it: upgrade tunaxis-data"
             raise EngineBacktestError(f"{message}; {hint}" if hint else message)
 
     def _configure_signatures(self) -> None:
@@ -450,7 +450,7 @@ class PineForgeBacktestRunner:
         if not bars:
             raise ValueError("bars must not be empty")
         if len(bars) > 2**31 - 1:
-            raise ValueError("bar count exceeds the PineForge C ABI limit")
+            raise ValueError("bar count exceeds the Tunaxis C ABI limit")
         if any(left.timestamp_ms >= right.timestamp_ms for left, right in pairwise(bars)):
             raise ValueError("bar timestamps must be strictly increasing")
 
@@ -591,4 +591,8 @@ if (
     or _PfReport.metrics.offset != 160
     or ctypes.sizeof(_PfTrade) != 104
 ):
-    raise RuntimeError("unsupported platform ABI layout for PineForge reports")
+    raise RuntimeError("unsupported platform ABI layout for Tunaxis reports")
+
+
+# Compatibility for callers that imported the pre-rename public class.
+PineForgeBacktestRunner = TunaxisBacktestRunner

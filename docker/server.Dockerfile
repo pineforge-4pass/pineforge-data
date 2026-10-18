@@ -13,7 +13,7 @@ ARG PINEFORGE_HUB_COMMIT=unknown
 
 USER root
 COPY --from=server-builder /opt/pineforge-server-deps /opt/pineforge-server-deps
-COPY src/pineforge_data /opt/pineforge-server/pineforge_data
+COPY src/tunaxis_data /opt/pineforge-server/tunaxis_data
 RUN mkdir -p /cache \
     && chown 10001:10001 /cache
 
@@ -42,4 +42,4 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
 
 USER 10001
 ENTRYPOINT ["python3", "-m", "uvicorn"]
-CMD ["pineforge_data.server:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+CMD ["tunaxis_data.server:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

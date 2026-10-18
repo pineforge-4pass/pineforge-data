@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pineforge-data"
+version = "0.3.0"
+description = "Compatibility shim forwarding PineForge Data to Tunaxis Data"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Tunaxis contributors" }]
+dependencies = ["tunaxis-data==0.3.0"]
+
+[project.optional-dependencies]
+ccxt = ["tunaxis-data[ccxt]==0.3.0"]
+database = ["tunaxis-data[database]==0.3.0"]
+database-e2e = ["tunaxis-data[database-e2e]==0.3.0"]
+server = ["tunaxis-data[server]==0.3.0"]
+docs = ["tunaxis-data[docs]==0.3.0"]
+release = ["tunaxis-data[release]==0.3.0"]
+dev = ["tunaxis-data[dev]==0.3.0"]
+
+[project.scripts]
+pineforge-backtest = "tunaxis_data.cli.backtest:main"
+pineforge-backtest-server = "tunaxis_data.server:main"
+
+[project.urls]
+Homepage = "https://github.com/pineforge-4pass/pineforge-data"
+Documentation = "https://pineforge-4pass.github.io/pineforge-data/"
+Issues = "https://github.com/pineforge-4pass/pineforge-data/issues"
+Source = "https://github.com/pineforge-4pass/pineforge-data"
+
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"
+
+[tool.hatch.build.targets.wheel]
+bypass-selection = true
+
+[tool.hatch.build.targets.sdist]
+include = ["/pyproject.toml", "/README.md", "/hatch_build.py", "/src/pineforge_data"]

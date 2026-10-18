@@ -9,15 +9,15 @@ from typing import cast
 
 import pytest
 
-from pineforge_data import (
+from tunaxis_data import (
     BacktestOptions,
     Bar,
     EngineBacktestError,
     Instrument,
-    PineForgeBacktestRunner,
+    TunaxisBacktestRunner,
 )
-from pineforge_data.backtest import _PfEquityPoint, _PfEquityStats, _PfReport, _PfTrade
-from pineforge_data.cli.backtest import (
+from tunaxis_data.backtest import _PfEquityPoint, _PfEquityStats, _PfReport, _PfTrade
+from tunaxis_data.cli.backtest import (
     build_parser,
     ccxt_timeframe_to_pine,
     parse_timestamp,
@@ -25,7 +25,7 @@ from pineforge_data.cli.backtest import (
     source_timeframe_to_pine,
     warmup_request_start_ms,
 )
-from pineforge_data.models import MarketListing
+from tunaxis_data.models import MarketListing
 
 
 class FakeFunction:
@@ -95,7 +95,7 @@ def bars() -> list[Bar]:
 
 def test_runner_returns_detached_json_safe_report() -> None:
     fake = FakeBacktestLibrary()
-    runner = PineForgeBacktestRunner(cast(ctypes.CDLL, fake))
+    runner = TunaxisBacktestRunner(cast(ctypes.CDLL, fake))
     instrument = bars()[0].instrument
 
     report = runner.run(
@@ -130,7 +130,7 @@ def test_runner_returns_detached_json_safe_report() -> None:
 
 def test_runner_surfaces_engine_error_and_releases_owners() -> None:
     fake = FakeBacktestLibrary(error=b"strategy failed")
-    runner = PineForgeBacktestRunner(cast(ctypes.CDLL, fake))
+    runner = TunaxisBacktestRunner(cast(ctypes.CDLL, fake))
 
     with pytest.raises(EngineBacktestError, match="strategy failed"):
         runner.run(bars(), instrument=bars()[0].instrument)
@@ -140,14 +140,14 @@ def test_runner_surfaces_engine_error_and_releases_owners() -> None:
 
 
 def test_runner_rejects_abi_mismatch_and_unsorted_bars() -> None:
-    with pytest.raises(EngineBacktestError, match=r"ABI mismatch.*upgrade pineforge-data"):
-        PineForgeBacktestRunner(cast(ctypes.CDLL, FakeBacktestLibrary(abi=99)))
+    with pytest.raises(EngineBacktestError, match=r"ABI mismatch.*upgrade tunaxis-data"):
+        TunaxisBacktestRunner(cast(ctypes.CDLL, FakeBacktestLibrary(abi=99)))
     unversioned = FakeBacktestLibrary()
     del unversioned.pf_abi_version
     with pytest.raises(EngineBacktestError, match=r"predates pf_abi_version.*engine 1\.x"):
-        PineForgeBacktestRunner(cast(ctypes.CDLL, unversioned))
+        TunaxisBacktestRunner(cast(ctypes.CDLL, unversioned))
 
-    runner = PineForgeBacktestRunner(cast(ctypes.CDLL, FakeBacktestLibrary()))
+    runner = TunaxisBacktestRunner(cast(ctypes.CDLL, FakeBacktestLibrary()))
     with pytest.raises(ValueError, match="strictly increasing"):
         runner.run(list(reversed(bars())), instrument=bars()[0].instrument)
 
@@ -157,7 +157,7 @@ def test_runner_refuses_pre_1_0_libraries_with_a_rebuild_hint(abi: int, engine: 
     fake = FakeBacktestLibrary(abi=abi)
 
     with pytest.raises(EngineBacktestError, match=f"strategy reports {abi}, expected 4") as error:
-        PineForgeBacktestRunner(cast(ctypes.CDLL, fake))
+        TunaxisBacktestRunner(cast(ctypes.CDLL, fake))
 
     assert engine in str(error.value)
     assert "rebuild" in str(error.value)
@@ -323,10 +323,10 @@ def test_harness_loads_warmup_bars_and_gates_trading(
     provider = FakeProvider()
     runtime = FakeRuntime()
     monkeypatch.setattr(
-        "pineforge_data.cli.backtest.create_provider", lambda *_args, **_kwargs: provider
+        "tunaxis_data.cli.backtest.create_provider", lambda *_args, **_kwargs: provider
     )
     monkeypatch.setattr(
-        "pineforge_data.cli.backtest.DockerBacktestRuntime", lambda **_kwargs: runtime
+        "tunaxis_data.cli.backtest.DockerBacktestRuntime", lambda **_kwargs: runtime
     )
     pine = tmp_path / "strategy.pine"
     pine.write_text("//@version=6\nstrategy('warmup')\n", encoding="utf-8")

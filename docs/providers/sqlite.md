@@ -10,7 +10,7 @@ optional package.
 ## Construct the provider
 
 ```python
-from pineforge_data import SqliteBarProvider
+from tunaxis_data import SqliteBarProvider
 
 provider = SqliteBarProvider(
     "./warehouse.sqlite3",
@@ -48,7 +48,7 @@ never creates tables, runs migrations, or changes source data.
 ## Resolve and fetch bars
 
 ```python
-from pineforge_data import BarRequest
+from tunaxis_data import BarRequest
 
 
 async def load_sqlite():
@@ -106,7 +106,7 @@ tables, expose a view with a consistently sortable numeric epoch column.
 ```
 
 ```bash
-pineforge-backtest \
+tunaxis-backtest \
   --pine strategy.pine \
   --provider sqlite \
   --provider-config sqlite.json \

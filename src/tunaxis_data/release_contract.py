@@ -1,4 +1,4 @@
-"""Shared input and output contract for the published PineForge release image."""
+"""Shared input and output contract for the published Tunaxis release image."""
 
 from __future__ import annotations
 
@@ -102,7 +102,7 @@ def release_environment(
     strategy_params: Mapping[str, JsonValue] | None = None,
     strategy_overrides: Mapping[str, JsonValue] | None = None,
 ) -> dict[str, str]:
-    """Translate PineForge options into the release entrypoint environment."""
+    """Translate Tunaxis options into the release entrypoint environment."""
 
     if options.trace_enabled:
         raise ReleaseContractError("the release adapter does not expose trace collection")
@@ -155,7 +155,7 @@ def release_response(
     request_id: str | None,
     runtime_metadata: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Wrap the release report in the stable pineforge-data transport envelope."""
+    """Wrap the release report in the stable tunaxis-data transport envelope."""
 
     runtime: dict[str, object] = {
         "mode": mode,

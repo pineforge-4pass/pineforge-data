@@ -200,7 +200,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/project/pineforge-data/
+      url: https://pypi.org/project/tunaxis-data/
     permissions:
       contents: read
       actions: read
@@ -227,10 +227,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python -m release_chain.publishing preflight --directory bundle --receipt report/release-receipt.json
-      - name: Publish to PyPI with Trusted Publishing
+      - name: Split tested distributions by PyPI project
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pypi/tunaxis-data" "$RUNNER_TEMP/pypi/pineforge-data"
+          cp bundle/dist/tunaxis_data-* "$RUNNER_TEMP/pypi/tunaxis-data/"
+          cp bundle/dist/pineforge_data-* "$RUNNER_TEMP/pypi/pineforge-data/"
+      - name: Publish tunaxis-data to PyPI with Trusted Publishing
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: bundle/dist/
+          packages-dir: ${{ runner.temp }}/pypi/tunaxis-data/
+      - name: Publish pineforge-data shim to PyPI with Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: ${{ runner.temp }}/pypi/pineforge-data/
       - uses: actions/upload-artifact@v5
         if: always()
         with:

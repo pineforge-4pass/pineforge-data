@@ -1,10 +1,10 @@
-site_name: PineForge Data
-site_description: Provider-neutral market data adapters and raw-PineScript backtest harness for PineForge
+site_name: Tunaxis Data
+site_description: Provider-neutral market data adapters and raw-PineScript backtest harness for Tunaxis
 site_url: https://pineforge-4pass.github.io/pineforge-data/
 repo_url: https://github.com/pineforge-4pass/pineforge-data
 repo_name: pineforge-4pass/pineforge-data
 edit_uri: edit/main/docs/
-copyright: Copyright &copy; PineForge contributors
+copyright: Copyright &copy; Tunaxis contributors
 
 theme:
   name: material

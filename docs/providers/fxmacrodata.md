@@ -7,7 +7,7 @@ announcements (CPI, policy rates, payrolls, GDP and so on) from the
 [FXMacroData API](https://fxmacrodata.com/documentation/reference)
 and returns `MacroObservation` records with release and vintage timestamps. It
 has no market catalog and no bars, so it is not a `MarketDataProvider` and is
-not registered for `pineforge-backtest --provider`.
+not registered for `tunaxis-backtest --provider`.
 
 FXMacroData is a commercial API. Without a key only USD is available, limited
 to the most recent 90 days and delayed by 15 minutes. Other currencies and full
@@ -16,7 +16,7 @@ history need an API key.
 ## Install
 
 ```bash
-pip install pineforge-data
+pip install tunaxis-data
 ```
 
 No extra is needed: the default transport uses the standard library.
@@ -26,7 +26,7 @@ No extra is needed: the default transport uses the standard library.
 ```python
 import os
 
-from pineforge_data import FxMacroDataProvider, MacroRequest
+from tunaxis_data import FxMacroDataProvider, MacroRequest
 
 
 async def us_payrolls():

@@ -11,8 +11,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-import pineforge_data
-from pineforge_data import (
+import tunaxis_data
+from tunaxis_data import (
     DEFAULT_RELEASE_IMAGE,
     BacktestOptions,
     Bar,
@@ -29,8 +29,8 @@ def main() -> None:
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    assert not Path(pineforge_data.__file__).resolve().is_relative_to(args.source.resolve())
-    assert importlib.metadata.version("pineforge-data") == args.version
+    assert not Path(tunaxis_data.__file__).resolve().is_relative_to(args.source.resolve())
+    assert importlib.metadata.version("tunaxis-data") == args.version
     assert args.image == DEFAULT_RELEASE_IMAGE
     instrument = Instrument("TEST/USD", venue="fixture")
     closes = (10, 11, 12, 13, 12, 11, 10, 9) * 3
@@ -61,7 +61,7 @@ def main() -> None:
     assert runtime["engine_version"] == runtime["codegen_version"] == version
     assert result["backtest"]["summary"]["bars_processed"] == len(bars) > 0
     assert len(result["backtest"]["trades"]) > 0
-    lock_path = Path(pineforge_data.__file__).with_name("release_lock.json")
+    lock_path = Path(tunaxis_data.__file__).with_name("release_lock.json")
     lock = json.loads(lock_path.read_text()) if lock_path.exists() else None
     if lock:
         event = lock["event"]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import hashlib
 import json
@@ -585,7 +586,7 @@ def create_app(
         api_key if api_key is not None else os.environ.get("PINEFORGE_SERVER_API_KEY", "")
     )
     application = FastAPI(
-        title="PineForge Backtest Server",
+        title="Tunaxis Backtest Server",
         version="1",
         docs_url="/docs",
         redoc_url=None,
@@ -640,11 +641,17 @@ def create_app(
 app = create_app()
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        prog="tunaxis-backtest-server",
+        description="Run the Tunaxis FastAPI backtest server",
+    )
+    parser.parse_args(argv)
+
     import uvicorn
 
     uvicorn.run(
-        "pineforge_data.server:app",
+        "tunaxis_data.server:app",
         host=os.environ.get("PINEFORGE_SERVER_HOST", "0.0.0.0"),
         port=int(os.environ.get("PINEFORGE_SERVER_PORT", "8000")),
         workers=1,

@@ -12,7 +12,7 @@ from importlib.metadata import EntryPoint
 from pathlib import Path
 
 import pytest
-from bump_version import synchronized_version
+from bump_version import bumped_version, project_version, synchronized_version
 from release_chain.contract import object_json
 from release_chain.distributions import verify_archives
 
@@ -202,7 +202,13 @@ def test_shim_pin_and_all_extras_cannot_drift(tmp_path: Path) -> None:
     shim = tmp_path / "shim/pyproject.toml"
     shim.parent.mkdir()
     main.write_text((ROOT / "pyproject.toml").read_text())
-    shim.write_text((ROOT / "shim/pyproject.toml").read_text().replace("==0.3.0", "==0.3.1"))
+    current = project_version(main)
+    mismatched = bumped_version(current, "patch")
+    shim.write_text(
+        (ROOT / "shim/pyproject.toml").read_text().replace(
+            f'=={current}"', f'=={mismatched}"'
+        )
+    )
     with pytest.raises(ValueError, match=r"must match|exactly"):
         synchronized_version(main)
 

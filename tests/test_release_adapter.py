@@ -11,6 +11,7 @@ from xml.etree import ElementTree
 
 import pytest
 import yaml
+from bump_version import bumped_version, project_version
 from release_chain import automation, contract, evidence, publishing, receipts, reporting
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -152,6 +153,8 @@ def test_valid_manifest_hash_cannot_hide_different_payload_identity(ready) -> No
 
 def test_update_changes_both_pins_and_independent_package_version(baseline, ready) -> None:
     event, manifest = ready
+    current = project_version(baseline / "pyproject.toml")
+    expected = bumped_version(current, "patch")
     patch = contract.update_files(baseline, event, manifest)
     assert set(patch) == contract.UPDATE_FILES
     apply(baseline, patch)
@@ -160,11 +163,12 @@ def test_update_changes_both_pins_and_independent_package_version(baseline, read
         f"PINEFORGE_RELEASE_IMAGE={contract.image_ref(event)}\n"
         in (baseline / contract.DOCKERFILE).read_text()
     )
-    assert contract.package_version(baseline) == "0.3.1"
+    assert contract.package_version(baseline) == expected
+    assert project_version(baseline / contract.SHIM_PROJECT) == expected
     assert 'version = "keep-this"' in (baseline / "pyproject.toml").read_text()
     lock = contract.verify_local(baseline)
     assert lock["event"]["event_id"] == event["event_id"]
-    assert lock["previous"]["package_version"] == "0.3.0"
+    assert lock["previous"]["package_version"] == current
     assert (baseline / contract.MANIFEST).read_bytes() == manifest
 
 
@@ -180,10 +184,11 @@ def test_a_single_stale_default_blocks_the_release(baseline, ready, which) -> No
 
 def test_replay_cannot_bump_or_republish_an_installed_identity(baseline, ready) -> None:
     event, manifest = ready
+    expected = bumped_version(project_version(baseline / "pyproject.toml"), "patch")
     apply(baseline, contract.update_files(baseline, event, manifest))
     with pytest.raises(ValueError, match="duplicate, older or conflicting"):
         contract.update_files(baseline, event, manifest)
-    assert contract.package_version(baseline) == "0.3.1"
+    assert contract.package_version(baseline) == expected
 
 
 def registry_fixture(
@@ -350,7 +355,7 @@ def bot_pr(event, *, human=False):
     meta = {
         "kind": "release",
         "event_id": event["event_id"],
-        "version": "0.3.1",
+        "version": bumped_version(project_version(ROOT / "pyproject.toml"), "patch"),
         "release_version": "1.6.0",
         "generated_head": "a" * 40,
         "base": "b" * 40,
@@ -446,12 +451,13 @@ def test_replayed_applied_event_creates_no_pr_or_merge(ready, baseline, monkeypa
 
 
 def test_distribution_publication_refuses_different_pypi_bytes(tmp_path, monkeypatch) -> None:
+    version = bumped_version(project_version(ROOT / "pyproject.toml"), "patch")
     bundle = tmp_path / "bundle"
     (bundle / "source").mkdir(parents=True)
-    (bundle / "source/pyproject.toml").write_text('[project]\nversion = "0.3.1"\n')
+    (bundle / "source/pyproject.toml").write_text(f'[project]\nversion = "{version}"\n')
     dist = bundle / "dist"
     dist.mkdir()
-    paired_test_archives(dist, "0.3.1")
+    paired_test_archives(dist, version)
     hashes = evidence.distribution_hashes(dist)
     report = automation.receipt(None, "verify")
     (bundle / "evidence.json").write_bytes(contract.json_bytes({"distributions": hashes}))
@@ -642,7 +648,9 @@ def test_completed_receipt_replay_does_not_dispatch_or_publish(
         "head": "c" * 40,
         "merge": "a" * 40,
     }
-    saved["deployed"] = receipts.served(event, "a" * 40, "0.3.1", {"wheel": "a", "sdist": "b"})
+    saved["deployed"] = receipts.served(
+        event, "a" * 40, project_version(baseline / "pyproject.toml"), {"wheel": "a", "sdist": "b"}
+    )
     monkeypatch.setattr(publishing, "stored_receipt", lambda *args: saved)
     monkeypatch.setattr(publishing, "verified_package", lambda *args: saved["deployed"])
     monkeypatch.setattr(publishing, "api", lambda *args: pytest.fail("replayed publication"))
@@ -691,16 +699,19 @@ def test_workflows_keep_every_gate_ahead_of_oidc_publication() -> None:
 def test_rollback_is_a_new_patch_and_rejected_events_cannot_return(ready, baseline) -> None:
     good, good_raw = ready
     apply(baseline, contract.update_files(baseline, good, good_raw))
+    good_version = project_version(baseline / "pyproject.toml")
     rejected, rejected_raw = next_ready(good)
     apply(baseline, contract.update_files(baseline, rejected, rejected_raw))
+    expected = bumped_version(project_version(baseline / "pyproject.toml"), "patch")
     rollback = {
-        "package_version": "0.3.1",
+        "package_version": good_version,
         "source": "a" * 40,
         "rejected_event_id": rejected["event_id"],
     }
     apply(baseline, contract.update_files(baseline, good, good_raw, rollback=rollback))
     lock = contract.verify_local(baseline)
-    assert lock["package_version"] == "0.3.3"
+    assert lock["package_version"] == expected
+    assert project_version(baseline / contract.SHIM_PROJECT) == expected
     assert lock["event"]["event_id"] == good["event_id"]
     assert lock["rejected_event_ids"] == [rejected["event_id"]]
     assert contract.runtime_pin(baseline) == contract.image_ref(good)
@@ -713,7 +724,7 @@ def test_rollback_requires_a_previously_verified_package(ready, monkeypatch) -> 
     lock = {
         "event": event,
         "rollback": {
-            "package_version": "0.3.1",
+            "package_version": project_version(ROOT / "pyproject.toml"),
             "source": "a" * 40,
             "rejected_event_id": "sha256:" + "b" * 64,
         },
@@ -729,6 +740,7 @@ def test_reconciliation_repairs_a_dropped_rollback_publication(
 ) -> None:
     good, good_raw = ready
     apply(baseline, contract.update_files(baseline, good, good_raw))
+    good_version = project_version(baseline / "pyproject.toml")
     rejected, rejected_raw = next_ready(good)
     apply(baseline, contract.update_files(baseline, rejected, rejected_raw))
     apply(
@@ -738,7 +750,7 @@ def test_reconciliation_repairs_a_dropped_rollback_publication(
             good,
             good_raw,
             rollback={
-                "package_version": "0.3.1",
+                "package_version": good_version,
                 "source": "a" * 40,
                 "rejected_event_id": rejected["event_id"],
             },

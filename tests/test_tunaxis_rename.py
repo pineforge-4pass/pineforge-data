@@ -190,9 +190,6 @@ def test_real_paired_wheels_have_exact_metadata_and_no_overlap(paired_artifacts)
     } == extras
     with zipfile.ZipFile(main) as main_archive, zipfile.ZipFile(shim) as shim_archive:
         assert not set(main_archive.namelist()) & set(shim_archive.namelist())
-        assert shim_archive.read("pineforge_data/py.typed") == (
-            SRC / "pineforge_data/py.typed"
-        ).read_bytes()
         main_licenses = [
             name for name in main_archive.namelist()
             if name.endswith(".dist-info/licenses/LICENSE")
@@ -222,7 +219,7 @@ def test_shim_direct_wheel_matches_wheel_from_sdist(paired_artifacts, tmp_path: 
         assert direct_names.count("pineforge_data/__init__.py") == 1
         assert sdist_names.count("pineforge_data/__init__.py") == 1
         assert {name for name in direct_names if name.startswith("pineforge_data/")} == {
-            "pineforge_data/__init__.py", "pineforge_data/py.typed"
+            "pineforge_data/__init__.py"
         }
         assert not any(name.startswith(("src/", "tunaxis_data/")) for name in direct_names)
         for name in direct_names:

@@ -10,7 +10,7 @@ class CustomBuildHook(BuildHookInterface):
     def initialize(self, version: str, build_data: dict[str, Any]) -> None:
         root = Path(self.root)
         destination = "src/pineforge_data" if self.target_name == "sdist" else "pineforge_data"
-        for name in ("__init__.py", "py.typed"):
+        for name in ("__init__.py",):
             relative = Path("src/pineforge_data") / name
             if (root / relative).is_file():
                 # An extracted sdist selects this file normally; do not add it twice.

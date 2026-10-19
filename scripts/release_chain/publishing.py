@@ -35,7 +35,21 @@ from .evidence import distribution_hashes, gate_for_run
 from .receipts import candidate as record_candidate
 from .receipts import canonical, served, timestamp
 
-# TEMPORARY first-adopter exemption (TX-DATA-BASELINE2, L6 10-19): delete after 0.3.1 ships and is verified.  # noqa: E501
+# TEMPORARY first-adopter exemption (TX-DATA-BASELINE2, L6 10-19):
+# remove the data exemption and the hub form together, only after 0.3.1 is verified AND
+# every retained release-receipt-data artifact carrying the bootstrap previous has
+# expired (90-day retention). The hub's scheduled collector re-validates retained receipts,
+# and recover_applied replays the stored receipt.
+# Removal checklist:
+# - publishing.py: canonical import, BOOTSTRAP_PACKAGE constant block, adopter_lock
+#   parameter, bootstrap branch in verified_package, and adopter_lock argument in prepare.
+# - reporting.py: adopter_lock argument in publication.
+# - tests/hub_receipt_validator.py: bootstrap docstring note, TEMPORARY constant block,
+#   identity branch/slot parameter, and provenance pre-loop/identity call arguments.
+# - tests/test_consumer_receipt.py: bootstrap fixtures/tests and adopter-lock wiring stubs.
+# - tests/fixtures/release_chain/bootstrap/ and bootstrap lines in its parent README.md.
+# - TEMPORARY paragraphs in docs/releasing.md and docs/release-receipt-report.md.
+# - pyproject.toml: bootstrap sdist exclusion; the pytest network marker may stay.
 BOOTSTRAP_PACKAGE: dict[str, Any] = {
     "repo": "pineforge-4pass/pineforge-data",
     "package": "pineforge-data",
@@ -136,7 +150,7 @@ def verified_package(
     version: str,
     saved: dict[str, Any] | None = None,
     *,
-    lock: dict[str, Any] | None = None,
+    adopter_lock: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Observe immutable PyPI bytes, matching GitHub assets and tagged source/facts."""
     files = pypi_files(version)
@@ -181,10 +195,10 @@ def verified_package(
         repo == BOOTSTRAP_PACKAGE["repo"]
         and version == BOOTSTRAP_PACKAGE["version"]
         and saved is None
-        and lock is not None
-        and "rollback" not in lock
-        and lock.get("package_version") == BOOTSTRAP_PACKAGE["adopter_version"]
-        and lock.get("previous")
+        and adopter_lock is not None
+        and "rollback" not in adopter_lock
+        and adopter_lock.get("package_version") == BOOTSTRAP_PACKAGE["adopter_version"]
+        and adopter_lock.get("previous")
         == {
             "package_version": version,
             "event_id": None,
@@ -422,7 +436,7 @@ def prepare(
     if event:
         record_candidate(report, event, candidate_gate(repo, pr), meta["version"])
         previous_version = lock["previous"]["package_version"]
-        report["previous"] = verified_package(repo, previous_version, lock=lock)
+        report["previous"] = verified_package(repo, previous_version, adopter_lock=lock)
     require(
         git("rev-parse", f"{source}^1") == meta["base"],
         "landed first parent differs from the tested base",

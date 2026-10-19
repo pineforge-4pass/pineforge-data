@@ -234,7 +234,7 @@ def publication(repo: str, run_id: int, report: dict[str, Any]) -> None:
         require(report["deployed"] == verified_package(repo, version), "served identity moved")
         require(
             report["previous"]
-            == verified_package(repo, lock["previous"]["package_version"], lock=lock),
+            == verified_package(repo, lock["previous"]["package_version"], adopter_lock=lock),
             "previous/rollback distribution identity moved",
         )
     # workflow_run takes the then-current main SHA. Pin repair runs to the trusted,

@@ -160,23 +160,29 @@ def completed_data_receipt(monkeypatch):
         return main_gate
 
     monkeypatch.setattr(reporting, "gate_for_run", landed_gate)
-    monkeypatch.setattr(
-        reporting,
-        "verify_local",
-        lambda root: {
-            "event": event,
-            "package_version": "0.3.1",
-            "previous": {"package_version": "0.3.0"},
-        },
-    )
+    lock = {
+        "event": event,
+        "package_version": "0.3.1",
+        "previous": {"package_version": "0.3.0"},
+    }
+    monkeypatch.setattr(reporting, "verify_local", lambda root: lock)
     monkeypatch.setattr(contract, "verify_artifacts", lambda target: None)
-    monkeypatch.setattr(
-        reporting,
-        "verified_package",
-        lambda repo, version, *, lock=None: copy.deepcopy(
-            staged["deployed" if version == "0.3.1" else "previous"]
-        ),
-    )
+    verified_versions = []
+
+    def verified_package(repo, version, *, adopter_lock=None):
+        assert repo == REPO
+        if version == "0.3.1":
+            assert adopter_lock is None
+            identity = staged["deployed"]
+        else:
+            assert version == "0.3.0"
+            assert adopter_lock is lock
+            assert adopter_lock["package_version"] == "0.3.1"
+            identity = staged["previous"]
+        verified_versions.append(version)
+        return copy.deepcopy(identity)
+
+    monkeypatch.setattr(reporting, "verified_package", verified_package)
 
     def download(command, *, check):
         assert command[:3] == ["gh", "run", "download"] and check
@@ -185,6 +191,7 @@ def completed_data_receipt(monkeypatch):
     monkeypatch.setattr(reporting.subprocess, "run", download)
     report = receipts.receipt(None)
     reporting.publication(REPO, 200, report)
+    assert verified_versions == ["0.3.1", "0.3.0"]
     assert report == expected
     return report, event, client, hub.profile("data")
 
@@ -342,6 +349,122 @@ def bootstrap_lock():
     }
 
 
+def test_prepare_passes_adopter_lock_for_previous(
+    monkeypatch, tmp_path, bootstrap_lock, bootstrap_identity
+):
+    event = contract.object_json((FIXTURES / "ready-event.json").read_bytes())
+    lock = {**bootstrap_lock, "event": event}
+    client = ObservedGitHub()
+    client.pr["user"] = {"login": "release[bot]"}
+    client.pr["body"] = automation.body(
+        {
+            "kind": "release",
+            "event_id": event["event_id"],
+            "version": "0.3.1",
+            "generated_head": HEAD,
+            "base": BASE,
+        }
+    )
+    client.runs[80] = {
+        "event": "push",
+        "head_branch": "main",
+        "head_sha": MERGE,
+        "run_attempt": 1,
+    }
+    files = {
+        "pineforge_data-0.3.1-py3-none-any.whl": b"tested wheel",
+        "pineforge_data-0.3.1.tar.gz": b"tested sdist",
+    }
+    gate = {
+        "run_id": 80,
+        "attempt": 1,
+        "head": MERGE,
+        "tested_sha": MERGE,
+        "tree": "d" * 40,
+        "distributions": {name: contract.sha256(data) for name, data in files.items()},
+    }
+    output = tmp_path / "bundle"
+    verified_versions = []
+
+    def api(repo, endpoint):
+        assert repo == REPO
+        if endpoint == f"commits/{MERGE}/pulls?per_page=100":
+            return [copy.deepcopy(client.pr)]
+        return client.consumer_api(repo, endpoint)
+
+    def git(*args):
+        return {
+            ("fetch", "origin", MERGE): "",
+            ("rev-parse", f"{MERGE}^{{tree}}"): gate["tree"],
+            ("rev-parse", f"{MERGE}^1"): BASE,
+        }[args]
+
+    def snapshot(source, candidate):
+        assert source == MERGE and candidate == output / "source"
+        (candidate / "pyproject.toml").write_text('[project]\nversion = "0.3.1"\n')
+
+    def landed_gate(repo, run_id, *, head):
+        assert repo == REPO and run_id == 80 and head == MERGE
+        return gate
+
+    def verified_package(repo, version, *, adopter_lock=None):
+        assert repo == REPO and version == "0.3.0"
+        assert adopter_lock is lock
+        assert adopter_lock["package_version"] == "0.3.1"
+        verified_versions.append(version)
+        return copy.deepcopy(bootstrap_identity)
+
+    def download(command, *, check):
+        assert check
+        assert command == [
+            "gh",
+            "run",
+            "download",
+            "80",
+            "--repo",
+            REPO,
+            "--name",
+            "python-package-distributions-1",
+            "--dir",
+            str(output / "dist"),
+        ]
+        dist = output / "dist"
+        dist.mkdir()
+        for name, data in files.items():
+            (dist / name).write_bytes(data)
+
+    monkeypatch.setenv("RELEASE_BOT_LOGIN", "release[bot]")
+    monkeypatch.setattr(publishing, "api", api)
+    monkeypatch.setattr(publishing, "git", git)
+    monkeypatch.setattr(publishing, "snapshot", snapshot)
+    monkeypatch.setattr(publishing, "verify_local", lambda candidate: lock)
+    monkeypatch.setattr(publishing, "gate_for_run", landed_gate)
+    monkeypatch.setattr(
+        publishing,
+        "candidate_gate",
+        lambda *args: {**gate, "run_id": 70, "attempt": 2, "head": HEAD},
+    )
+    monkeypatch.setattr(publishing, "verified_package", verified_package)
+    monkeypatch.setattr(publishing, "current_intent", lambda *args: None)
+    monkeypatch.setattr(publishing.subprocess, "run", download)
+    monkeypatch.setattr(publishing, "pypi_files", lambda version: None)
+    report = receipts.receipt(None)
+    result = publishing.prepare(tmp_path, REPO, 80, output, report)
+    assert verified_versions == ["0.3.0"]
+    assert report["previous"] == bootstrap_identity
+    assert report["state"] == "deploying"
+    assert contract.object_json((output / "evidence.json").read_bytes()) == gate
+    assert result == {
+        "eligible": "true",
+        "published": "false",
+        "sha": MERGE,
+        "tag": "v0.3.1",
+        "version": "0.3.1",
+        "ci_run": "80",
+        "has_target": "true",
+    }
+
+
 @pytest.fixture
 def bootstrap_observed(monkeypatch, bootstrap_identity):
     # Literal archived bytes and a separately transcribed identity; no verifier,
@@ -435,7 +558,7 @@ def test_first_adopter_returns_exact_bootstrap_identity(
     bootstrap_observed, bootstrap_lock, bootstrap_identity
 ):
     actual = publishing.verified_package(
-        "pineforge-4pass/pineforge-data", "0.3.0", lock=bootstrap_lock
+        "pineforge-4pass/pineforge-data", "0.3.0", adopter_lock=bootstrap_lock
     )
     assert actual == bootstrap_identity
     assert not any(name.startswith("facts_") for name in actual)
@@ -472,7 +595,9 @@ def test_bootstrap_recorded_hashes_bind_independent_archived_bytes(
 def test_bootstrap_rejects_wrong_pypi_bytes(bootstrap_observed, bootstrap_lock, name):
     bootstrap_observed["downloads"][name] += b"\n"
     with pytest.raises(ValueError, match="PyPI bytes differ"):
-        publishing.verified_package("pineforge-4pass/pineforge-data", "0.3.0", lock=bootstrap_lock)
+        publishing.verified_package(
+            "pineforge-4pass/pineforge-data", "0.3.0", adopter_lock=bootstrap_lock
+        )
 
 
 @pytest.mark.parametrize(
@@ -488,7 +613,9 @@ def test_bootstrap_rejects_unrecorded_bytes_even_when_both_services_agree(
     entry = next(row for row in bootstrap_observed["urls"] if row["filename"] == name)
     entry["digests"]["sha256"] = contract.sha256(wrong)
     with pytest.raises(ValueError, match="bootstrap PyPI inventory differs"):
-        publishing.verified_package("pineforge-4pass/pineforge-data", "0.3.0", lock=bootstrap_lock)
+        publishing.verified_package(
+            "pineforge-4pass/pineforge-data", "0.3.0", adopter_lock=bootstrap_lock
+        )
 
 
 @pytest.mark.parametrize(
@@ -498,7 +625,9 @@ def test_bootstrap_rejects_unrecorded_bytes_even_when_both_services_agree(
 def test_bootstrap_rejects_different_release_asset_bytes(bootstrap_observed, bootstrap_lock, name):
     bootstrap_observed["release_bytes"][name] += b"\n"
     with pytest.raises(ValueError, match="release asset differs from PyPI"):
-        publishing.verified_package("pineforge-4pass/pineforge-data", "0.3.0", lock=bootstrap_lock)
+        publishing.verified_package(
+            "pineforge-4pass/pineforge-data", "0.3.0", adopter_lock=bootstrap_lock
+        )
 
 
 @pytest.mark.parametrize("mutation", ["missing", "duplicate"])
@@ -515,7 +644,9 @@ def test_bootstrap_requires_unique_release_assets(
     else:
         assets.append(copy.deepcopy(next(asset for asset in assets if asset["name"] == name)))
     with pytest.raises(ValueError, match="no unique immutable release asset"):
-        publishing.verified_package("pineforge-4pass/pineforge-data", "0.3.0", lock=bootstrap_lock)
+        publishing.verified_package(
+            "pineforge-4pass/pineforge-data", "0.3.0", adopter_lock=bootstrap_lock
+        )
 
 
 @pytest.mark.parametrize("mutation", ["missing", "duplicate", "extra"])
@@ -530,20 +661,24 @@ def test_bootstrap_requires_exact_pypi_inventory(bootstrap_observed, bootstrap_l
         extra["filename"] = "another.whl"
         entries.append(extra)
     with pytest.raises(ValueError, match=r"wheel and sdist|bootstrap PyPI inventory differs"):
-        publishing.verified_package("pineforge-4pass/pineforge-data", "0.3.0", lock=bootstrap_lock)
+        publishing.verified_package(
+            "pineforge-4pass/pineforge-data", "0.3.0", adopter_lock=bootstrap_lock
+        )
 
 
 def test_bootstrap_rejects_a_moved_tag(bootstrap_observed, bootstrap_lock):
     bootstrap_observed["source"] = "fb5cec39b6c6d70af103df0df182d47bb5812190"
     with pytest.raises(ValueError, match="bootstrap tag differs from the recorded commit"):
-        publishing.verified_package("pineforge-4pass/pineforge-data", "0.3.0", lock=bootstrap_lock)
+        publishing.verified_package(
+            "pineforge-4pass/pineforge-data", "0.3.0", adopter_lock=bootstrap_lock
+        )
 
 
 @pytest.mark.parametrize("saved", [{}, {"state": "verified"}])
 def test_bootstrap_never_applies_to_saved_receipts(bootstrap_observed, bootstrap_lock, saved):
     with pytest.raises(ValueError, match="lacks manifest/facts provenance"):
         publishing.verified_package(
-            "pineforge-4pass/pineforge-data", "0.3.0", saved, lock=bootstrap_lock
+            "pineforge-4pass/pineforge-data", "0.3.0", saved, adopter_lock=bootstrap_lock
         )
 
 
@@ -553,7 +688,9 @@ def test_other_previous_versions_still_require_provenance(
 ):
     bootstrap_lock["previous"]["package_version"] = version
     with pytest.raises(ValueError, match="lacks manifest/facts provenance"):
-        publishing.verified_package("pineforge-4pass/pineforge-data", version, lock=bootstrap_lock)
+        publishing.verified_package(
+            "pineforge-4pass/pineforge-data", version, adopter_lock=bootstrap_lock
+        )
 
 
 @pytest.mark.parametrize(
@@ -561,7 +698,7 @@ def test_other_previous_versions_still_require_provenance(
 )
 def test_bootstrap_is_exclusive_to_the_data_repo(bootstrap_observed, bootstrap_lock, repo):
     with pytest.raises(ValueError, match="lacks manifest/facts provenance"):
-        publishing.verified_package(repo, "0.3.0", lock=bootstrap_lock)
+        publishing.verified_package(repo, "0.3.0", adopter_lock=bootstrap_lock)
 
 
 @pytest.mark.parametrize(
@@ -583,14 +720,18 @@ def test_bootstrap_requires_exact_previous_context(
 ):
     bootstrap_lock["previous"][field] = value
     with pytest.raises(ValueError, match="lacks manifest/facts provenance"):
-        publishing.verified_package("pineforge-4pass/pineforge-data", "0.3.0", lock=bootstrap_lock)
+        publishing.verified_package(
+            "pineforge-4pass/pineforge-data", "0.3.0", adopter_lock=bootstrap_lock
+        )
 
 
 @pytest.mark.parametrize("field", ["event_id", "image", "package_version"])
 def test_bootstrap_rejects_incomplete_previous_context(bootstrap_observed, bootstrap_lock, field):
     del bootstrap_lock["previous"][field]
     with pytest.raises(ValueError, match="lacks manifest/facts provenance"):
-        publishing.verified_package("pineforge-4pass/pineforge-data", "0.3.0", lock=bootstrap_lock)
+        publishing.verified_package(
+            "pineforge-4pass/pineforge-data", "0.3.0", adopter_lock=bootstrap_lock
+        )
 
 
 def test_bootstrap_requires_caller_lock(bootstrap_observed):
@@ -601,13 +742,17 @@ def test_bootstrap_requires_caller_lock(bootstrap_observed):
 def test_bootstrap_cannot_be_reused_by_a_later_adopter(bootstrap_observed, bootstrap_lock):
     bootstrap_lock["package_version"] = "0.3.2"
     with pytest.raises(ValueError, match="lacks manifest/facts provenance"):
-        publishing.verified_package("pineforge-4pass/pineforge-data", "0.3.0", lock=bootstrap_lock)
+        publishing.verified_package(
+            "pineforge-4pass/pineforge-data", "0.3.0", adopter_lock=bootstrap_lock
+        )
 
 
 def test_bootstrap_cannot_be_used_by_a_rollback_lock(bootstrap_observed, bootstrap_lock):
     bootstrap_lock["rollback"] = {"package_version": "0.3.0"}
     with pytest.raises(ValueError, match="lacks manifest/facts provenance"):
-        publishing.verified_package("pineforge-4pass/pineforge-data", "0.3.0", lock=bootstrap_lock)
+        publishing.verified_package(
+            "pineforge-4pass/pineforge-data", "0.3.0", adopter_lock=bootstrap_lock
+        )
 
 
 @pytest.fixture
@@ -616,7 +761,7 @@ def bootstrap_receipt(bootstrap_observed, bootstrap_lock):
     # verifier for synthetic coordinator evidence. This fixture calls it for real.
     report = contract.object_json((FIXTURES / "sample-release-receipt.json").read_bytes())
     report["previous"] = publishing.verified_package(
-        "pineforge-4pass/pineforge-data", "0.3.0", lock=bootstrap_lock
+        "pineforge-4pass/pineforge-data", "0.3.0", adopter_lock=bootstrap_lock
     )
     event = contract.object_json((FIXTURES / "ready-event.json").read_bytes())
     policy = contract.object_json((FIXTURES / "receipt-policy.json").read_bytes())["data"]
@@ -717,7 +862,7 @@ def test_hub_rejects_unrecorded_bootstrap_distributions(bootstrap_receipt, mutat
 def test_hub_rejects_bootstrap_for_other_consumers(bootstrap_receipt, consumer, state):
     report, event, client, policy = bootstrap_receipt
     report.update(consumer=consumer, state=state)
-    with pytest.raises(hub.Invalid, match="only valid for data previous"):
+    with pytest.raises(hub.Invalid, match=r"only valid for product data\.previous"):
         hub.validate_receipt(client, REPO, report, event, policy, client.runs[300])
 
 
@@ -727,13 +872,13 @@ def test_hub_rejects_bootstrap_outside_previous(bootstrap_receipt, slot, state):
     report, event, client, policy = bootstrap_receipt
     report[slot] = copy.deepcopy(report["previous"])
     report["state"] = state
-    with pytest.raises(hub.Invalid, match="only valid for data previous"):
+    with pytest.raises(hub.Invalid, match=r"only valid for product data\.previous"):
         hub.validate_receipt(client, REPO, report, event, policy, client.runs[300])
 
 
 def test_hub_rejects_bootstrap_for_facts_only_identity(bootstrap_identity):
-    with pytest.raises(hub.Invalid, match="only valid for data previous"):
-        hub.identity(bootstrap_identity, facts_only=True, consumer="data", previous=True)
+    with pytest.raises(hub.Invalid, match=r"only valid for product data\.previous"):
+        hub.identity(bootstrap_identity, facts_only=True, consumer="data", slot="previous")
 
 
 @pytest.mark.network

@@ -70,7 +70,7 @@ Source = "https://github.com/pineforge-4pass/pineforge-data"
 packages = ["src/pineforge_data"]
 
 [tool.hatch.build.targets.sdist]
-exclude = ["/native"]
+exclude = ["/native", "/tests/fixtures/release_chain/bootstrap"]
 
 [tool.pytest.ini_options]
 addopts = "-q"

@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
@@ -45,20 +46,55 @@ def pypi_files(version: str) -> dict[str, str] | None:
     return {entry["filename"]: entry["digests"]["sha256"] for entry in value["urls"]}
 
 
+def run_belongs_to_pr(run: dict[str, Any], pr: dict[str, Any]) -> bool:
+    """Match exact PR CI, allowing GitHub's empty association list after merge."""
+    head = pr.get("head") or {}
+    number = pr.get("number")
+    if (
+        not head.get("sha")
+        or run.get("head_sha") != head.get("sha")
+        or run.get("event") != "pull_request"
+        or number is None
+    ):
+        return False
+    pull_requests = run.get("pull_requests")
+    if not isinstance(pull_requests, list):
+        return False
+    if pull_requests:
+        return any(
+            isinstance(item, dict) and item.get("number") == number for item in pull_requests
+        )
+    if not head.get("ref") or run.get("head_branch") != head.get("ref"):
+        return False
+    head_repo_name = (run.get("head_repository") or {}).get("full_name")
+    if (
+        not isinstance(head_repo_name, str)
+        or not head_repo_name
+        or head_repo_name != (head.get("repo") or {}).get("full_name")
+    ):
+        return False
+    created_at, merged_at = run.get("created_at"), pr.get("merged_at")
+    if not isinstance(created_at, str) or not isinstance(merged_at, str):
+        return False
+    try:
+        created = datetime.fromisoformat(created_at)
+        merged = datetime.fromisoformat(merged_at)
+    except ValueError:
+        return False
+    return created.tzinfo is not None and merged.tzinfo is not None and created < merged
+
+
 def candidate_gate(repo: str, pr: dict[str, Any]) -> dict[str, Any]:
     """Re-read the successful PR attempt, never substitute post-merge smoke tests."""
     meta = marker(pr)
+    head = (pr.get("head") or {}).get("sha")
+    require(head, "pre-merge CI evidence missing")
     runs = inventory(
         repo,
-        "actions/workflows/ci.yml/runs?event=pull_request&head_sha=" + pr["head"]["sha"],
+        "actions/workflows/ci.yml/runs?event=pull_request&head_sha=" + head,
         "workflow_runs",
     )
-    runs = [
-        run
-        for run in runs
-        if run["head_sha"] == pr["head"]["sha"]
-        and any(item["number"] == pr["number"] for item in run["pull_requests"])
-    ]
+    runs = [run for run in runs if run_belongs_to_pr(run, pr)]
     require(runs, "pre-merge CI evidence missing")
     run = max(runs, key=lambda row: row["id"])
     evidence = gate_for_run(

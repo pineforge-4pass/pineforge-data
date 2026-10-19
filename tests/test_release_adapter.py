@@ -963,7 +963,7 @@ def test_workflows_keep_every_gate_ahead_of_oidc_publication() -> None:
     workflows = ROOT / ".github/workflows"
     ci = yaml.load((workflows / "ci.yml").read_text(), Loader=yaml.BaseLoader)
     assert ci["jobs"]["test"]["strategy"]["matrix"]["python-version"] == ["3.11", "3.12", "3.13"]
-    assert set(ci["jobs"]["ready"]["needs"]) == evidence.NEEDS
+    assert set(ci["jobs"]["ready"]["needs"]) == evidence.NEEDS | {"changes"}
     assert ci["jobs"]["ready"]["if"] == "always()"
     assert ci["jobs"]["ready"]["name"] == "release/ready"
     for job, suite, enabled in (

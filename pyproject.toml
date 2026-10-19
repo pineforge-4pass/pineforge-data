@@ -70,12 +70,13 @@ Source = "https://github.com/pineforge-4pass/pineforge-data"
 packages = ["src/pineforge_data"]
 
 [tool.hatch.build.targets.sdist]
-exclude = ["/native"]
+exclude = ["/native", "/tests/fixtures/release_chain/bootstrap"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
 pythonpath = ["src", "scripts"]
+markers = ["network: live public network checks (set PINEFORGE_NETWORK_TEST=1)"]
 
 [tool.ruff]
 extend-exclude = ["vendor"]

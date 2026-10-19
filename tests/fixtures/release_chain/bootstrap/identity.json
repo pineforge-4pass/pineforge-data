@@ -1,0 +1,12 @@
+{
+  "provenance": "pre-manifest-bootstrap",
+  "package": "pineforge-data",
+  "version": "0.3.0",
+  "source": "fb5cec39b6c6d70af103df0df182d47bb5812191",
+  "image_digest": "sha256:b271873d0e91a9eeeb4595daaded9bdfbdbcd3925d3ec1300a833395e2004c86",
+  "deployment_id_sha256": "12ffb9b3d3cd270604b06f558ae73a9eb0ca1e2f82a84d45728232091d3e3307",
+  "distributions": {
+    "pineforge_data-0.3.0-py3-none-any.whl": "609b3e9976ae55fc290c725731cf1dd0266c9b3eb6f3353122c8bcdc05e497bc",
+    "pineforge_data-0.3.0.tar.gz": "f29a2bd50f70ff46ebdf31f987260dec3123600ab5bf493741bbbd4e21aaacdc"
+  }
+}

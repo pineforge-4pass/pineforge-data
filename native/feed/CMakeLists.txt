@@ -101,7 +101,26 @@ if(BUILD_TESTING)
   add_test(NAME feed-mock COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/mock_venue.py $<TARGET_FILE:pineforge-feed>)
   set_tests_properties(feed-mock PROPERTIES TIMEOUT 420)
   if(PINEFORGE_FEED_SANITIZER STREQUAL "thread")
-    set_tests_properties(feed-unit feed-export-unit feed-mock feed-mock-export PROPERTIES ENVIRONMENT
-      "TSAN_OPTIONS=halt_on_error=1 suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/tsan.supp")
+    # CTest replaces TSAN_OPTIONS, so use this cache variable for the symbolizer path and for an explicit
+    # diagnostic run, never for turning reports off. Options are appended after the defaults (the last
+    # occurrence of an option wins in TSan's parser).
+    set(PINEFORGE_FEED_TSAN_OPTIONS_EXTRA "" CACHE STRING "Extra TSAN_OPTIONS appended after the defaults")
+    # Refuse, at configure time, options that would switch reports off or replace the suppressions (a ';'
+    # would also split the ENVIRONMENT list). halt_on_error and log_path stay allowed for diagnostics:
+    # TSan still exits non-zero at the end when it reported anything.
+    if(PINEFORGE_FEED_TSAN_OPTIONS_EXTRA MATCHES ";"
+       OR PINEFORGE_FEED_TSAN_OPTIONS_EXTRA MATCHES "(^|[ :,])(exitcode|report_bugs|report_atomic_races|suppressions|ignore_[a-z_]+)=")
+      message(FATAL_ERROR "PINEFORGE_FEED_TSAN_OPTIONS_EXTRA must not switch TSan reports off, change the exit code, "
+                          "replace the suppressions or contain ';' (got: ${PINEFORGE_FEED_TSAN_OPTIONS_EXTRA})")
+    endif()
+    add_executable(feed-tsan-seeded-race tests/tsan_seeded_race.cpp)
+    target_link_libraries(feed-tsan-seeded-race PRIVATE Threads::Threads)
+    # Keep the deliberate plain-int accesses in optimized CI builds.
+    target_compile_options(feed-tsan-seeded-race PRIVATE -Wall -Wextra -Wpedantic -Werror -O0)
+    add_test(NAME feed-tsan-seeded-race COMMAND feed-tsan-seeded-race)
+    # The program returns zero unless TSan detects its intentional race and exits nonzero.
+    set_tests_properties(feed-tsan-seeded-race PROPERTIES WILL_FAIL TRUE)
+    set_tests_properties(feed-unit feed-export-unit feed-mock feed-mock-export feed-tsan-seeded-race PROPERTIES ENVIRONMENT
+      "TSAN_OPTIONS=halt_on_error=1 suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/tsan.supp ${PINEFORGE_FEED_TSAN_OPTIONS_EXTRA}")
   endif()
 endif()

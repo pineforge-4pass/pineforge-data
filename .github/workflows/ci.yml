@@ -12,7 +12,15 @@ permissions:
 jobs:
   test:
     name: Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name != 'pull_request_target' &&
+          github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
+          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+          (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
+    env:
+      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     strategy:
       fail-fast: false
       matrix:
@@ -42,7 +50,15 @@ jobs:
 
   docker:
     name: Docker runtime
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name != 'pull_request_target' &&
+          github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
+          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+          (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
+    env:
+      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
@@ -58,7 +74,13 @@ jobs:
 
   database-e2e:
     name: Database E2E
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name != 'pull_request_target' &&
+          github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
+          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+          (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
     services:
       mysql:
         image: mysql:8.4
@@ -90,6 +112,7 @@ jobs:
           --health-retries=30
           --health-start-period=10s
     env:
+      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
       PINEFORGE_DATABASE_E2E: "1"
       PINEFORGE_CORPUS_OHLCV: tests/fixtures/corpus_ohlcv_ETH-USDT-USDT_1m_sample.csv
       PINEFORGE_MYSQL_URL: mysql+pymysql://pineforge:pineforge@127.0.0.1:3306/pineforge
@@ -110,7 +133,15 @@ jobs:
 
   contract:
     name: Release contract
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name != 'pull_request_target' &&
+          github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
+          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+          (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
+    env:
+      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     steps:
       - uses: actions/checkout@v7
         with:
@@ -125,7 +156,15 @@ jobs:
 
   distribution:
     name: Distribution
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name != 'pull_request_target' &&
+          github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
+          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+          (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
+    env:
+      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     steps:
       - uses: actions/checkout@v7
         with:
@@ -181,7 +220,15 @@ jobs:
     name: release/ready
     if: always()
     needs: [test, contract, docker, database-e2e, distribution]
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name != 'pull_request_target' &&
+          github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
+          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+          (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
+    env:
+      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     steps:
       - uses: actions/checkout@v7
         with:

@@ -2331,6 +2331,17 @@ class FeedMockTests(unittest.TestCase):
             if process.poll() is None:
                 process.kill()
                 process.wait()
+            # The server's stderr is captured here, so a sanitizer report (exit 66 under TSan)
+            # would otherwise vanish: print every non-JSON line and a sanitizer exit code with
+            # the test id.
+            raw = [record["line"] for record in list(records) if record.get("event") == "raw"]
+            if raw or process.returncode == 66:
+                print(
+                    f"--- {self.id()}: serve child exit {process.returncode}, "
+                    f"{len(raw)} raw stderr line(s) ---\n" + "".join(raw),
+                    file=sys.stderr,
+                    flush=True,
+                )
 
         self.addCleanup(cleanup)
         self.assertTrue(ready.wait(15))

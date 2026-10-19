@@ -244,7 +244,15 @@ jobs:
   build:
     if: needs.prepare.outputs.eligible == 'true' && !inputs.claim_placeholder
     needs: prepare
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name != 'pull_request_target' &&
+          github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
+          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+          (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
+    env:
+      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     steps:
       - uses: actions/checkout@v7
         with:
@@ -271,7 +279,15 @@ jobs:
   github-release:
     needs: [prepare, build]
     if: needs.prepare.outputs.eligible == 'true' && !inputs.claim_placeholder
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name != 'pull_request_target' &&
+          github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
+          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+          (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
+    env:
+      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     permissions:
       contents: write
       actions: read
@@ -353,7 +369,15 @@ jobs:
       needs.github-release.result == 'success' &&
       (needs.publish.result == 'success' || needs.prepare.outputs.published == 'true') && !inputs.claim_placeholder
     needs: [prepare, github-release, publish]
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name != 'pull_request_target' &&
+          github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
+          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+          (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
+    env:
+      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     permissions:
       contents: write
       actions: read

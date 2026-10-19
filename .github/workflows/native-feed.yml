@@ -17,7 +17,18 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14]
-    runs-on: ${{ matrix.os }}
+        include:
+          - os: ubuntu-24.04
+            runner: >-
+              ${{ github.event_name != 'pull_request_target' &&
+                  github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
+                  contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+                  (github.event_name != 'pull_request' ||
+                   (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+                  fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ matrix.runner || matrix.os }}
+    env:
+      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -42,7 +53,15 @@ jobs:
 
   asan-ubsan:
     name: ASan + UBSan
-    runs-on: ubuntu-24.04
+    runs-on: >-
+      ${{ github.event_name != 'pull_request_target' &&
+          github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
+          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+          (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
+    env:
+      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -62,12 +81,28 @@ jobs:
 
   tsan:
     name: TSan
-    runs-on: ubuntu-24.04
+    runs-on: >-
+      ${{ github.event_name != 'pull_request_target' &&
+          github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
+          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+          (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
+    env:
+      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - run: sudo apt-get update && sudo apt-get install -y ninja-build libssl-dev clang-18
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build libssl-dev clang-18 llvm-18
       - run: bash native/feed/tests/build_ci_curl.sh "$RUNNER_TEMP/curl"
+      - name: Check TSan symbolizer
+        run: |
+          # With no symbolizer configured, TSan can fall back and still symbolize.
+          # A wrong explicit path breaks symbolization and makes race:STOP_FLAG_ASSIGN inert.
+          if ! test -x /usr/lib/llvm-18/bin/llvm-symbolizer; then
+            echo "::error::TSan requires an executable /usr/lib/llvm-18/bin/llvm-symbolizer for function-name suppressions; install llvm-18." >&2
+            exit 1
+          fi
       - name: Threaded receive, healing, termination and serve fan-out
         env:
           TSAN_OPTIONS: halt_on_error=1
@@ -75,6 +110,7 @@ jobs:
           export LD_LIBRARY_PATH="$RUNNER_TEMP/curl/lib:${LD_LIBRARY_PATH:-}"
           cmake -S native/feed -B build-feed -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_CXX_COMPILER=clang++-18 -DCMAKE_C_COMPILER=clang-18 -DCURL_DIR="$RUNNER_TEMP/curl/lib/cmake/CURL" \
-            -DPINEFORGE_FEED_SANITIZER=thread
+            -DPINEFORGE_FEED_SANITIZER=thread \
+            -DPINEFORGE_FEED_TSAN_OPTIONS_EXTRA=external_symbolizer_path=/usr/lib/llvm-18/bin/llvm-symbolizer
           cmake --build build-feed -j4
           ctest --test-dir build-feed --output-on-failure

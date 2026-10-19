@@ -15,7 +15,10 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 HUB = "pineforge-4pass/pineforge-release"
-IMAGE = f"ghcr.io/{HUB}"
+IMAGE_OLD = "ghcr.io/pineforge-4pass/pineforge-release"
+IMAGE_NEW = "ghcr.io/tunaxis/pineforge-release"
+IMAGES = (IMAGE_OLD, IMAGE_NEW)
+IMAGE = IMAGE_OLD
 SCHEMA = "pineforge/release-ready/v1"
 LOCK = "src/pineforge_data/release_lock.json"
 MANIFEST = "src/pineforge_data/release_manifest.json"
@@ -172,7 +175,10 @@ def validate_event(event: dict[str, Any]) -> None:
         and set(image) == {"repository", "digest", "amd64_digest", "arm64_digest"},
         "invalid image fields",
     )
-    require(image["repository"] == IMAGE, "unexpected image repository")
+    require(
+        isinstance(image["repository"], str) and image["repository"] in IMAGES,
+        "unexpected image repository",
+    )
     for key in ("digest", "amd64_digest", "arm64_digest"):
         _string(image[key], re.compile(r"sha256:[0-9a-f]{64}"), f"image.{key}")
     facts = event["facts"]
@@ -401,7 +407,7 @@ def verify_local(root: Path) -> dict[str, Any] | None:
 
 
 def image_ref(event: dict[str, Any]) -> str:
-    return f"{IMAGE}:{event['release_version']}@{event['image']['digest']}"
+    return f"{event['image']['repository']}:{event['release_version']}@{event['image']['digest']}"
 
 
 def update_files(
@@ -451,7 +457,8 @@ def update_files(
     runtime = re.sub(
         rb"DEFAULT_RELEASE_IMAGE = \([\s\S]*?\n\)",
         (
-            f'DEFAULT_RELEASE_IMAGE = (\n    "{IMAGE}:{event["release_version"]}@"\n'
+            "DEFAULT_RELEASE_IMAGE = (\n"
+            f'    "{event["image"]["repository"]}:{event["release_version"]}@"\n'
             f'    "{event["image"]["digest"]}"\n)'
         ).encode(),
         (root / RUNTIME).read_bytes(),

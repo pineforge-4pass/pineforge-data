@@ -2,6 +2,7 @@
 name: Native feed
 on:
   push:
+    branches: [main]
     paths: ['native/feed/**', '.github/workflows/native-feed.yml']
   pull_request:
     paths: ['native/feed/**', '.github/workflows/native-feed.yml']
@@ -9,6 +10,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: native-feed-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   release:

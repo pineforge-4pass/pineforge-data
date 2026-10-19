@@ -9,6 +9,12 @@ permissions:
   contents: read
   actions: read
 
+# Cancel older PR runs; no docs-only filter: release/ready's evidence aggregate
+# requires success from every needed job (skips fail); all jobs take 7-60 s.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     name: Python ${{ matrix.python-version }}

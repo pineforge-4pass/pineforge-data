@@ -33,7 +33,29 @@ from .contract import (
 )
 from .evidence import distribution_hashes, gate_for_run
 from .receipts import candidate as record_candidate
-from .receipts import served, timestamp
+from .receipts import canonical, served, timestamp
+
+# TEMPORARY first-adopter exemption (TX-DATA-BASELINE2, L6 10-19): delete after 0.3.1 ships and is verified.  # noqa: E501
+BOOTSTRAP_PACKAGE: dict[str, Any] = {
+    "repo": "pineforge-4pass/pineforge-data",
+    "package": "pineforge-data",
+    "version": "0.3.0",
+    "adopter_version": "0.3.1",
+    "provenance": "pre-manifest-bootstrap",
+    "source": "fb5cec39b6c6d70af103df0df182d47bb5812191",
+    "image": (
+        "ghcr.io/pineforge-4pass/pineforge-release:1.0.0@sha256:"
+        "b271873d0e91a9eeeb4595daaded9bdfbdbcd3925d3ec1300a833395e2004c86"
+    ),
+    "distributions": {
+        "pineforge_data-0.3.0-py3-none-any.whl": (
+            "609b3e9976ae55fc290c725731cf1dd0266c9b3eb6f3353122c8bcdc05e497bc"
+        ),
+        "pineforge_data-0.3.0.tar.gz": (
+            "f29a2bd50f70ff46ebdf31f987260dec3123600ab5bf493741bbbd4e21aaacdc"
+        ),
+    },
+}
 
 
 def pypi_files(version: str) -> dict[str, str] | None:
@@ -110,8 +132,12 @@ def candidate_gate(repo: str, pr: dict[str, Any]) -> dict[str, Any]:
 
 
 def verified_package(
-    repo: str, version: str, saved: dict[str, Any] | None = None
-) -> dict[str, str]:
+    repo: str,
+    version: str,
+    saved: dict[str, Any] | None = None,
+    *,
+    lock: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Observe immutable PyPI bytes, matching GitHub assets and tagged source/facts."""
     files = pypi_files(version)
     require(
@@ -151,6 +177,41 @@ def verified_package(
         )
     git("fetch", "origin", f"refs/tags/v{version}")
     source = git("rev-parse", f"v{version}^{{commit}}")
+    if (
+        repo == BOOTSTRAP_PACKAGE["repo"]
+        and version == BOOTSTRAP_PACKAGE["version"]
+        and saved is None
+        and lock is not None
+        and "rollback" not in lock
+        and lock.get("package_version") == BOOTSTRAP_PACKAGE["adopter_version"]
+        and lock.get("previous")
+        == {
+            "package_version": version,
+            "event_id": None,
+            "image": BOOTSTRAP_PACKAGE["image"],
+        }
+    ):
+        require(
+            len(metadata["urls"]) == 2 and files == BOOTSTRAP_PACKAGE["distributions"],
+            "bootstrap PyPI inventory differs from the recorded distributions",
+        )
+        require(
+            source == BOOTSTRAP_PACKAGE["source"],
+            "bootstrap tag differs from the recorded commit",
+        )
+        distribution_identity = {
+            "package": BOOTSTRAP_PACKAGE["package"],
+            "version": version,
+            "distributions": files,
+        }
+        # Facts never existed for this release; their sentinel is absent keys.
+        return {
+            "provenance": BOOTSTRAP_PACKAGE["provenance"],
+            **distribution_identity,
+            "source": source,
+            "image_digest": BOOTSTRAP_PACKAGE["image"].split("@", 1)[1],
+            "deployment_id_sha256": sha256(canonical(distribution_identity)),
+        }
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         snapshot(source, root)
@@ -361,7 +422,7 @@ def prepare(
     if event:
         record_candidate(report, event, candidate_gate(repo, pr), meta["version"])
         previous_version = lock["previous"]["package_version"]
-        report["previous"] = verified_package(repo, previous_version)
+        report["previous"] = verified_package(repo, previous_version, lock=lock)
     require(
         git("rev-parse", f"{source}^1") == meta["base"],
         "landed first parent differs from the tested base",

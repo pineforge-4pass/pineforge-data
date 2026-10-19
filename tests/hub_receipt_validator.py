@@ -5,6 +5,9 @@ from scripts/release_contract.py in the sibling rc-hub checkout. CI cannot impor
 that checkout. Update this snapshot when the hub contract changes. The version
 helper below inlines the same bare semver subset instead of importing release_pair.
 Source release_receipts.py SHA-256: 6fe7b0afcb7a34de9e28bce9d8372e5a4eaa6695398536697f59ed705b0cc23a
+
+TX-DATA-BASELINE2 adds the shared bootstrap-form.md previous identity below;
+the supervisor reconciles this addition with the parallel hub implementation.
 """
 # Upstream field checks are kept verbatim.
 # ruff: noqa
@@ -128,7 +131,30 @@ def check_run(client, repo, evidence, policy, expected_sha):
     run["checked_finished_at"] = max(finished)
     return run
 
-def identity(obj, *, facts_only=False):
+DATA_BOOTSTRAP = {
+    "provenance": "pre-manifest-bootstrap",
+    "package": "pineforge-data",
+    "version": "0.3.0",
+    "source": "fb5cec39b6c6d70af103df0df182d47bb5812191",
+    "image_digest": "sha256:b271873d0e91a9eeeb4595daaded9bdfbdbcd3925d3ec1300a833395e2004c86",
+    "distributions": {
+        "pineforge_data-0.3.0-py3-none-any.whl": "609b3e9976ae55fc290c725731cf1dd0266c9b3eb6f3353122c8bcdc05e497bc",
+        "pineforge_data-0.3.0.tar.gz": "f29a2bd50f70ff46ebdf31f987260dec3123600ab5bf493741bbbd4e21aaacdc",
+    },
+}
+
+def identity(obj, *, facts_only=False, consumer=None, previous=False):
+    if type(obj) is dict and "provenance" in obj:
+        require(previous and consumer == "data" and not facts_only,
+                "pre-manifest bootstrap is only valid for data previous")
+        keys(obj, (*DATA_BOOTSTRAP, "deployment_id_sha256"))
+        require(all(obj[name] == value for name, value in DATA_BOOTSTRAP.items()),
+                "pre-manifest bootstrap differs from the recorded identity")
+        require(obj["deployment_id_sha256"] == sha256(canonical({
+            name: obj[name] for name in ("package", "version", "distributions")
+        })), "pre-manifest bootstrap deployment identity differs")
+        # facts_commit/facts_sha256 never existed; exact keys require their absence.
+        return
     keys(obj, ("source", "image_digest", "facts_commit", "facts_sha256", "deployment_id_sha256"))
     match(COMMIT, obj["source"])
     match(COMMIT, obj["facts_commit"])
@@ -148,6 +174,10 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
         match(SHA, receipt["facts"]["sha256"])
     else:
         require(receipt["event_id"] == event["event_id"] and receipt["release_version"] == event["release_version"], "receipt event differs")
+    for name in ("preview", "deployed", "previous"):
+        if type(receipt[name]) is dict and "provenance" in receipt[name]:
+            identity(receipt[name], facts_only=facts_only, consumer=receipt["consumer"],
+                     previous=name == "previous")
     positive(receipt["attempt"])
     positive(receipt["sequence"])
     require(receipt["state"] in STATES, "invalid receipt state")
@@ -206,7 +236,8 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
         deployed_run = check_run(client, repo, receipt["deploy"], policy["deploy"], pr["merge"])
         require(receipt["timestamp"] >= deployed_run["checked_finished_at"], "served receipt predates verification")
         identity(receipt["deployed"], facts_only=facts_only)
-        identity(receipt["previous"], facts_only=facts_only)
+        identity(receipt["previous"], facts_only=facts_only,
+                 consumer=receipt["consumer"], previous=True)
         require(receipt["deployed"]["source"] == pr["merge"]
                 and (facts_only or receipt["deployed"]["image_digest"] == event["image"]["digest"]),
                 "actual served source/image differs")

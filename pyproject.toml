@@ -76,6 +76,7 @@ exclude = ["/native"]
 addopts = "-q"
 testpaths = ["tests"]
 pythonpath = ["src", "scripts"]
+markers = ["network: live public network checks (set PINEFORGE_NETWORK_TEST=1)"]
 
 [tool.ruff]
 extend-exclude = ["vendor"]

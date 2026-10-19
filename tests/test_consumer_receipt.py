@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import copy
 import io
 import json
+import os
 import zipfile
 from pathlib import Path
 
@@ -171,7 +173,7 @@ def completed_data_receipt(monkeypatch):
     monkeypatch.setattr(
         reporting,
         "verified_package",
-        lambda repo, version: copy.deepcopy(
+        lambda repo, version, *, lock=None: copy.deepcopy(
             staged["deployed" if version == "0.3.1" else "previous"]
         ),
     )
@@ -320,47 +322,435 @@ def test_workflow_transport_is_trusted_upload_then_signal():
     assert not any("RELEASE_RECEIPT_EVENT_TYPE" in step.get("env", {}) for step in steps)
 
 
-def test_previous_identity_requires_observed_manifest_provenance(monkeypatch):
-    # Byte-identical downloads/assets still cannot manufacture missing prior facts.
-    files = {"previous.whl": b"legacy wheel", "previous.tar.gz": b"legacy sdist"}
-    hashes = {name: contract.sha256(raw) for name, raw in files.items()}
-    metadata = {
+@pytest.fixture
+def bootstrap_identity():
+    return contract.object_json((FIXTURES / "bootstrap/identity.json").read_bytes())
+
+
+@pytest.fixture
+def bootstrap_lock():
+    return {
+        "package_version": "0.3.1",
+        "previous": {
+            "package_version": "0.3.0",
+            "event_id": None,
+            "image": (
+                "ghcr.io/pineforge-4pass/pineforge-release:1.0.0@sha256:"
+                "b271873d0e91a9eeeb4595daaded9bdfbdbcd3925d3ec1300a833395e2004c86"
+            ),
+        },
+    }
+
+
+@pytest.fixture
+def bootstrap_observed(monkeypatch, bootstrap_identity):
+    # Literal archived bytes and a separately transcribed identity; no verifier,
+    # inventory, provenance or hash function is replaced.
+    files = {
+        name: base64.b64decode((FIXTURES / "bootstrap" / f"{name}.b64").read_bytes())
+        for name in (
+            "pineforge_data-0.3.0-py3-none-any.whl",
+            "pineforge_data-0.3.0.tar.gz",
+        )
+    }
+    observed = {
+        "downloads": dict(files),
+        "release_bytes": dict(files),
+        "assets": [{"name": name, "id": i} for i, name in enumerate(files)],
+        "source": "fb5cec39b6c6d70af103df0df182d47bb5812191",
+        "calls": [],
         "urls": [
             {
                 "filename": name,
                 "digests": {"sha256": digest},
                 "url": "https://files.pythonhosted.org/" + name,
             }
-            for name, digest in hashes.items()
-        ]
+            for name, digest in bootstrap_identity["distributions"].items()
+        ],
     }
-    monkeypatch.setattr(publishing, "pypi_files", lambda version: hashes)
-    monkeypatch.setattr(
-        publishing,
-        "fetch",
-        lambda url: (
-            contract.json_bytes(metadata)
-            if url.startswith("https://pypi.org/")
-            else files[url.rsplit("/", 1)[1]]
-        ),
-    )
-    monkeypatch.setattr(
-        publishing,
-        "api",
-        lambda *args: {
-            "assets": [{"name": name, "id": i} for i, name in enumerate(files)],
-        },
-    )
-    monkeypatch.setattr(
-        publishing,
-        "gh_bytes",
-        lambda route, **kwargs: list(files.values())[int(route.rsplit("/", 1)[1])],
-    )
-    monkeypatch.setattr(publishing, "git", lambda *args: "d" * 40)
-    monkeypatch.setattr(publishing, "snapshot", lambda *args: None)
-    monkeypatch.setattr(publishing, "verify_local", lambda root: None)
+
+    def fetch(url):
+        observed["calls"].append(("fetch", url))
+        if url.startswith("https://pypi.org/pypi/pineforge-data/"):
+            return contract.json_bytes({"urls": observed["urls"]})
+        assert url.startswith("https://files.pythonhosted.org/")
+        return observed["downloads"][url.rsplit("/", 1)[1]]
+
+    def api(repo, endpoint):
+        observed["calls"].append(("api", repo, endpoint))
+        assert endpoint in ("releases/tags/v0.3.0", "releases/tags/v0.3.1", "releases/tags/v0.2.0")
+        return {"assets": copy.deepcopy(observed["assets"])}
+
+    def gh_bytes(route, *, accept):
+        observed["calls"].append(("gh_bytes", route))
+        assert accept == "application/octet-stream"
+        name = list(files)[int(route.rsplit("/", 1)[1])]
+        return observed["release_bytes"][name]
+
+    def git(*args):
+        observed["calls"].append(("git", *args))
+        if args[0] == "fetch":
+            assert args[1] == "origin" and args[2].startswith("refs/tags/v")
+            return ""
+        assert args[0] == "rev-parse" and args[1].endswith("^{commit}")
+        return observed["source"]
+
+    def snapshot(source, root):
+        observed["calls"].append(("snapshot", source))
+        # Exercise the real verify_local refusal when the exemption is ineligible.
+        runtime = root / contract.RUNTIME
+        runtime.parent.mkdir(parents=True, exist_ok=True)
+        runtime.write_text(
+            'DEFAULT_RELEASE_IMAGE = "ghcr.io/pineforge-4pass/pineforge-release:1.0.0@sha256:'
+            'b271873d0e91a9eeeb4595daaded9bdfbdbcd3925d3ec1300a833395e2004c86"\n'
+        )
+        docker = root / contract.DOCKERFILE
+        docker.parent.mkdir(parents=True, exist_ok=True)
+        docker.write_text(
+            "ARG PINEFORGE_RELEASE_IMAGE=ghcr.io/pineforge-4pass/pineforge-release:1.0.0@sha256:"
+            "b271873d0e91a9eeeb4595daaded9bdfbdbcd3925d3ec1300a833395e2004c86\n"
+        )
+        (root / "pyproject.toml").write_text(
+            '[project]\nname = "pineforge-data"\nversion = "0.3.0"\n'
+        )
+
+    for name, function in (
+        ("fetch", fetch),
+        ("api", api),
+        ("gh_bytes", gh_bytes),
+        ("git", git),
+        ("snapshot", snapshot),
+    ):
+        monkeypatch.setattr(publishing, name, function)
+    return observed
+
+
+def test_previous_identity_requires_observed_manifest_provenance(bootstrap_observed):
+    # Byte-identical downloads/assets still cannot manufacture missing prior facts.
     with pytest.raises(ValueError, match="lacks manifest/facts provenance"):
         publishing.verified_package(REPO, "0.3.0")
+
+
+def test_first_adopter_returns_exact_bootstrap_identity(
+    bootstrap_observed, bootstrap_lock, bootstrap_identity
+):
+    actual = publishing.verified_package(
+        "pineforge-4pass/pineforge-data", "0.3.0", lock=bootstrap_lock
+    )
+    assert actual == bootstrap_identity
+    assert not any(name.startswith("facts_") for name in actual)
+    assert (
+        receipts.canonical(
+            {name: actual[name] for name in ("package", "version", "distributions")}
+        )
+        == (FIXTURES / "bootstrap/distribution-identity.json").read_bytes()
+    )
+    assert ("git", "fetch", "origin", "refs/tags/v0.3.0") in bootstrap_observed["calls"]
+    assert ("git", "rev-parse", "v0.3.0^{commit}") in bootstrap_observed["calls"]
+    assert not any(call[0] == "snapshot" for call in bootstrap_observed["calls"])
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["pineforge_data-0.3.0-py3-none-any.whl", "pineforge_data-0.3.0.tar.gz"],
+)
+def test_bootstrap_recorded_hashes_bind_independent_archived_bytes(
+    bootstrap_observed, bootstrap_identity, name
+):
+    # A one-character edit of either recorded hash fails against actual bytes.
+    assert (
+        contract.sha256(bootstrap_observed["downloads"][name])
+        == bootstrap_identity["distributions"][name]
+        == publishing.BOOTSTRAP_PACKAGE["distributions"][name]
+    )
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["pineforge_data-0.3.0-py3-none-any.whl", "pineforge_data-0.3.0.tar.gz"],
+)
+def test_bootstrap_rejects_wrong_pypi_bytes(bootstrap_observed, bootstrap_lock, name):
+    bootstrap_observed["downloads"][name] += b"\n"
+    with pytest.raises(ValueError, match="PyPI bytes differ"):
+        publishing.verified_package("pineforge-4pass/pineforge-data", "0.3.0", lock=bootstrap_lock)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["pineforge_data-0.3.0-py3-none-any.whl", "pineforge_data-0.3.0.tar.gz"],
+)
+def test_bootstrap_rejects_unrecorded_bytes_even_when_both_services_agree(
+    bootstrap_observed, bootstrap_lock, name
+):
+    wrong = bootstrap_observed["downloads"][name] + b"\n"
+    bootstrap_observed["downloads"][name] = wrong
+    bootstrap_observed["release_bytes"][name] = wrong
+    entry = next(row for row in bootstrap_observed["urls"] if row["filename"] == name)
+    entry["digests"]["sha256"] = contract.sha256(wrong)
+    with pytest.raises(ValueError, match="bootstrap PyPI inventory differs"):
+        publishing.verified_package("pineforge-4pass/pineforge-data", "0.3.0", lock=bootstrap_lock)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["pineforge_data-0.3.0-py3-none-any.whl", "pineforge_data-0.3.0.tar.gz"],
+)
+def test_bootstrap_rejects_different_release_asset_bytes(bootstrap_observed, bootstrap_lock, name):
+    bootstrap_observed["release_bytes"][name] += b"\n"
+    with pytest.raises(ValueError, match="release asset differs from PyPI"):
+        publishing.verified_package("pineforge-4pass/pineforge-data", "0.3.0", lock=bootstrap_lock)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "duplicate"])
+@pytest.mark.parametrize(
+    "name",
+    ["pineforge_data-0.3.0-py3-none-any.whl", "pineforge_data-0.3.0.tar.gz"],
+)
+def test_bootstrap_requires_unique_release_assets(
+    bootstrap_observed, bootstrap_lock, mutation, name
+):
+    assets = bootstrap_observed["assets"]
+    if mutation == "missing":
+        assets[:] = [asset for asset in assets if asset["name"] != name]
+    else:
+        assets.append(copy.deepcopy(next(asset for asset in assets if asset["name"] == name)))
+    with pytest.raises(ValueError, match="no unique immutable release asset"):
+        publishing.verified_package("pineforge-4pass/pineforge-data", "0.3.0", lock=bootstrap_lock)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "duplicate", "extra"])
+def test_bootstrap_requires_exact_pypi_inventory(bootstrap_observed, bootstrap_lock, mutation):
+    entries = bootstrap_observed["urls"]
+    if mutation == "missing":
+        entries.pop()
+    elif mutation == "duplicate":
+        entries.append(copy.deepcopy(entries[0]))
+    else:
+        extra = copy.deepcopy(entries[0])
+        extra["filename"] = "another.whl"
+        entries.append(extra)
+    with pytest.raises(ValueError, match=r"wheel and sdist|bootstrap PyPI inventory differs"):
+        publishing.verified_package("pineforge-4pass/pineforge-data", "0.3.0", lock=bootstrap_lock)
+
+
+def test_bootstrap_rejects_a_moved_tag(bootstrap_observed, bootstrap_lock):
+    bootstrap_observed["source"] = "fb5cec39b6c6d70af103df0df182d47bb5812190"
+    with pytest.raises(ValueError, match="bootstrap tag differs from the recorded commit"):
+        publishing.verified_package("pineforge-4pass/pineforge-data", "0.3.0", lock=bootstrap_lock)
+
+
+@pytest.mark.parametrize("saved", [{}, {"state": "verified"}])
+def test_bootstrap_never_applies_to_saved_receipts(bootstrap_observed, bootstrap_lock, saved):
+    with pytest.raises(ValueError, match="lacks manifest/facts provenance"):
+        publishing.verified_package(
+            "pineforge-4pass/pineforge-data", "0.3.0", saved, lock=bootstrap_lock
+        )
+
+
+@pytest.mark.parametrize("version", ["0.3.1", "0.2.0"])
+def test_other_previous_versions_still_require_provenance(
+    bootstrap_observed, bootstrap_lock, version
+):
+    bootstrap_lock["previous"]["package_version"] = version
+    with pytest.raises(ValueError, match="lacks manifest/facts provenance"):
+        publishing.verified_package("pineforge-4pass/pineforge-data", version, lock=bootstrap_lock)
+
+
+@pytest.mark.parametrize(
+    "repo", ["owner/data", "other/pineforge-data", "pineforge-4pass/pineforge-codegen"]
+)
+def test_bootstrap_is_exclusive_to_the_data_repo(bootstrap_observed, bootstrap_lock, repo):
+    with pytest.raises(ValueError, match="lacks manifest/facts provenance"):
+        publishing.verified_package(repo, "0.3.0", lock=bootstrap_lock)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("event_id", "sha256:" + "1" * 64),
+        ("image", "ghcr.io/pineforge-4pass/pineforge-release:1.0.0@sha256:" + "1" * 64),
+        (
+            "image",
+            "ghcr.io/pineforge-4pass/pineforge-release:1.0.1@sha256:"
+            "b271873d0e91a9eeeb4595daaded9bdfbdbcd3925d3ec1300a833395e2004c86",
+        ),
+        ("package_version", "0.2.0"),
+        ("provenance", "pre-manifest-bootstrap"),
+    ],
+)
+def test_bootstrap_requires_exact_previous_context(
+    bootstrap_observed, bootstrap_lock, field, value
+):
+    bootstrap_lock["previous"][field] = value
+    with pytest.raises(ValueError, match="lacks manifest/facts provenance"):
+        publishing.verified_package("pineforge-4pass/pineforge-data", "0.3.0", lock=bootstrap_lock)
+
+
+@pytest.mark.parametrize("field", ["event_id", "image", "package_version"])
+def test_bootstrap_rejects_incomplete_previous_context(bootstrap_observed, bootstrap_lock, field):
+    del bootstrap_lock["previous"][field]
+    with pytest.raises(ValueError, match="lacks manifest/facts provenance"):
+        publishing.verified_package("pineforge-4pass/pineforge-data", "0.3.0", lock=bootstrap_lock)
+
+
+def test_bootstrap_requires_caller_lock(bootstrap_observed):
+    with pytest.raises(ValueError, match="lacks manifest/facts provenance"):
+        publishing.verified_package("pineforge-4pass/pineforge-data", "0.3.0")
+
+
+def test_bootstrap_cannot_be_reused_by_a_later_adopter(bootstrap_observed, bootstrap_lock):
+    bootstrap_lock["package_version"] = "0.3.2"
+    with pytest.raises(ValueError, match="lacks manifest/facts provenance"):
+        publishing.verified_package("pineforge-4pass/pineforge-data", "0.3.0", lock=bootstrap_lock)
+
+
+def test_bootstrap_cannot_be_used_by_a_rollback_lock(bootstrap_observed, bootstrap_lock):
+    bootstrap_lock["rollback"] = {"package_version": "0.3.0"}
+    with pytest.raises(ValueError, match="lacks manifest/facts provenance"):
+        publishing.verified_package("pineforge-4pass/pineforge-data", "0.3.0", lock=bootstrap_lock)
+
+
+@pytest.fixture
+def bootstrap_receipt(bootstrap_observed, bootstrap_lock):
+    # Do not use completed_data_receipt: it predates this exemption and mocks the
+    # verifier for synthetic coordinator evidence. This fixture calls it for real.
+    report = contract.object_json((FIXTURES / "sample-release-receipt.json").read_bytes())
+    report["previous"] = publishing.verified_package(
+        "pineforge-4pass/pineforge-data", "0.3.0", lock=bootstrap_lock
+    )
+    event = contract.object_json((FIXTURES / "ready-event.json").read_bytes())
+    policy = contract.object_json((FIXTURES / "receipt-policy.json").read_bytes())["data"]
+    return report, event, ObservedGitHub(), policy
+
+
+def test_bootstrap_previous_survives_receipt_writer_and_hub_validation(
+    bootstrap_receipt, bootstrap_identity, tmp_path
+):
+    report, event, client, policy = bootstrap_receipt
+    public = hub.validate_receipt(client, REPO, report, event, policy, client.runs[300])
+    assert public["previous"] == bootstrap_identity
+    path = tmp_path / "release-receipt.json"
+    automation.finish(report, path)
+    assert contract.object_json(path.read_bytes())["previous"] == bootstrap_identity
+    assert path.read_bytes() == hub.canonical(report)
+    assert reporting.public_receipt(report)["previous"] == bootstrap_identity
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("provenance", "manifest"),
+        ("package", "pineforge-codegen"),
+        ("version", "0.3.1"),
+        ("version", "0.2.0"),
+        ("source", "fb5cec39b6c6d70af103df0df182d47bb5812190"),
+        ("image_digest", "sha256:" + "1" * 64),
+        ("deployment_id_sha256", "1" * 64),
+        ("distributions", None),
+    ],
+)
+def test_hub_rejects_bootstrap_identity_drift(bootstrap_receipt, field, value):
+    report, event, client, policy = bootstrap_receipt
+    report["previous"][field] = value
+    with pytest.raises(hub.Invalid):
+        hub.validate_receipt(client, REPO, report, event, policy, client.runs[300])
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "provenance",
+        "package",
+        "version",
+        "source",
+        "image_digest",
+        "deployment_id_sha256",
+        "distributions",
+    ],
+)
+def test_hub_rejects_missing_bootstrap_keys(bootstrap_receipt, field):
+    report, event, client, policy = bootstrap_receipt
+    del report["previous"][field]
+    with pytest.raises(hub.Invalid):
+        hub.validate_receipt(client, REPO, report, event, policy, client.runs[300])
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("facts_commit", None),
+        ("facts_commit", "e" * 40),
+        ("facts_sha256", None),
+        ("facts_sha256", "d" * 64),
+        ("extra", "not permitted"),
+    ],
+)
+def test_hub_rejects_facts_or_extra_bootstrap_keys(bootstrap_receipt, field, value):
+    report, event, client, policy = bootstrap_receipt
+    report["previous"][field] = value
+    with pytest.raises(hub.Invalid):
+        hub.validate_receipt(client, REPO, report, event, policy, client.runs[300])
+
+
+@pytest.mark.parametrize("mutation", ["wheel", "sdist", "missing", "extra"])
+def test_hub_rejects_unrecorded_bootstrap_distributions(bootstrap_receipt, mutation):
+    report, event, client, policy = bootstrap_receipt
+    previous = report["previous"]
+    distributions = previous["distributions"]
+    if mutation == "wheel":
+        distributions["pineforge_data-0.3.0-py3-none-any.whl"] = "1" * 64
+    elif mutation == "sdist":
+        distributions["pineforge_data-0.3.0.tar.gz"] = "1" * 64
+    elif mutation == "missing":
+        del distributions["pineforge_data-0.3.0.tar.gz"]
+    else:
+        distributions["extra.whl"] = "1" * 64
+    previous["deployment_id_sha256"] = hub.sha256(
+        hub.canonical({name: previous[name] for name in ("package", "version", "distributions")})
+    )
+    with pytest.raises(hub.Invalid):
+        hub.validate_receipt(client, REPO, report, event, policy, client.runs[300])
+
+
+@pytest.mark.parametrize("consumer", ["offline", "hosted", "application", "web", "license"])
+@pytest.mark.parametrize("state", ["pending", "verified"])
+def test_hub_rejects_bootstrap_for_other_consumers(bootstrap_receipt, consumer, state):
+    report, event, client, policy = bootstrap_receipt
+    report.update(consumer=consumer, state=state)
+    with pytest.raises(hub.Invalid, match="only valid for data previous"):
+        hub.validate_receipt(client, REPO, report, event, policy, client.runs[300])
+
+
+@pytest.mark.parametrize("slot", ["preview", "deployed"])
+@pytest.mark.parametrize("state", ["pending", "verified"])
+def test_hub_rejects_bootstrap_outside_previous(bootstrap_receipt, slot, state):
+    report, event, client, policy = bootstrap_receipt
+    report[slot] = copy.deepcopy(report["previous"])
+    report["state"] = state
+    with pytest.raises(hub.Invalid, match="only valid for data previous"):
+        hub.validate_receipt(client, REPO, report, event, policy, client.runs[300])
+
+
+def test_hub_rejects_bootstrap_for_facts_only_identity(bootstrap_identity):
+    with pytest.raises(hub.Invalid, match="only valid for data previous"):
+        hub.identity(bootstrap_identity, facts_only=True, consumer="data", previous=True)
+
+
+@pytest.mark.network
+@pytest.mark.skipif(
+    os.environ.get("PINEFORGE_NETWORK_TEST") != "1",
+    reason="set PINEFORGE_NETWORK_TEST=1 to check the recorded PyPI bootstrap hashes",
+)
+def test_bootstrap_recorded_hashes_match_live_pypi(bootstrap_identity):
+    metadata = contract.object_json(
+        publishing.fetch("https://pypi.org/pypi/pineforge-data/0.3.0/json")
+    )
+    assert len(metadata["urls"]) == 2
+    assert (
+        {entry["filename"]: entry["digests"]["sha256"] for entry in metadata["urls"]}
+        == bootstrap_identity["distributions"]
+        == publishing.BOOTSTRAP_PACKAGE["distributions"]
+    )
 
 
 def test_verified_target_cannot_regress_even_on_a_new_attempt(completed_data_receipt, monkeypatch):

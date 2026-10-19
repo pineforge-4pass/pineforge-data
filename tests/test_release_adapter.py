@@ -391,7 +391,7 @@ def test_candidate_gate_rejects_unrelated_or_post_merge_ci(
     runs[0].update(run_changes)
     pr.update(pr_changes)
     assert not publishing.run_belongs_to_pr(runs[0], pr)
-    with pytest.raises(ValueError, match="^pre-merge CI evidence missing$"):
+    with pytest.raises(ValueError, match=r"^pre-merge CI evidence missing$"):
         publishing.candidate_gate("owner/data", pr)
     assert checked == []
 
@@ -422,7 +422,7 @@ def test_candidate_gate_rejects_missing_ci_identity(candidate_ci, target, path) 
         value = value[key]
     del value[path[-1]]
     assert not publishing.run_belongs_to_pr(runs[0], pr)
-    with pytest.raises(ValueError, match="^pre-merge CI evidence missing$"):
+    with pytest.raises(ValueError, match=r"^pre-merge CI evidence missing$"):
         publishing.candidate_gate("owner/data", pr)
     assert checked == []
 
@@ -433,7 +433,7 @@ def test_candidate_gate_rejects_null_head_identity(candidate_ci, run_key, pr_key
     runs[0][run_key] = None
     pr["head"][pr_key] = None
     assert not publishing.run_belongs_to_pr(runs[0], pr)
-    with pytest.raises(ValueError, match="^pre-merge CI evidence missing$"):
+    with pytest.raises(ValueError, match=r"^pre-merge CI evidence missing$"):
         publishing.candidate_gate("owner/data", pr)
     assert checked == []
 
@@ -444,7 +444,7 @@ def test_candidate_gate_rejects_invalid_head_repository_name(candidate_ci, full_
     runs[0]["head_repository"]["full_name"] = full_name
     pr["head"]["repo"]["full_name"] = full_name
     assert not publishing.run_belongs_to_pr(runs[0], pr)
-    with pytest.raises(ValueError, match="^pre-merge CI evidence missing$"):
+    with pytest.raises(ValueError, match=r"^pre-merge CI evidence missing$"):
         publishing.candidate_gate("owner/data", pr)
     assert checked == []
 

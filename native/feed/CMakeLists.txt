@@ -105,6 +105,14 @@ if(BUILD_TESTING)
     # diagnostic run, never for turning reports off. Options are appended after the defaults (the last
     # occurrence of an option wins in TSan's parser).
     set(PINEFORGE_FEED_TSAN_OPTIONS_EXTRA "" CACHE STRING "Extra TSAN_OPTIONS appended after the defaults")
+    # Refuse, at configure time, options that would switch reports off or replace the suppressions (a ';'
+    # would also split the ENVIRONMENT list). halt_on_error and log_path stay allowed for diagnostics:
+    # TSan still exits non-zero at the end when it reported anything.
+    if(PINEFORGE_FEED_TSAN_OPTIONS_EXTRA MATCHES ";"
+       OR PINEFORGE_FEED_TSAN_OPTIONS_EXTRA MATCHES "(^|[ :,])(exitcode|report_bugs|report_atomic_races|suppressions|ignore_[a-z_]+)=")
+      message(FATAL_ERROR "PINEFORGE_FEED_TSAN_OPTIONS_EXTRA must not switch TSan reports off, change the exit code, "
+                          "replace the suppressions or contain ';' (got: ${PINEFORGE_FEED_TSAN_OPTIONS_EXTRA})")
+    endif()
     add_executable(feed-tsan-seeded-race tests/tsan_seeded_race.cpp)
     target_link_libraries(feed-tsan-seeded-race PRIVATE Threads::Threads)
     # Keep the deliberate plain-int accesses in optimized CI builds.

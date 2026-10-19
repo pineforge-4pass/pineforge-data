@@ -59,6 +59,49 @@ def test_ready_event_binds_the_original_manifest_bytes(ready) -> None:
 
 
 @pytest.mark.parametrize(
+    "repository",
+    [
+        pytest.param("ghcr.io/pineforge-4pass/pineforge-release", id="old-org"),
+        pytest.param("ghcr.io/tunaxis/pineforge-release", id="new-org"),
+    ],
+)
+def test_ready_contract_accepts_each_exact_image_repository(ready, repository) -> None:
+    event, raw = ready
+    manifest = contract.object_json(raw)
+    manifest["image"]["repository"] = repository
+    raw = contract.json_bytes(manifest)
+    digest = contract.sha256(raw)
+    event["image"]["repository"] = repository
+    event["manifest"]["sha256"] = digest
+    event["event_id"] = f"sha256:{digest}"
+
+    contract.validate_event(event)
+    contract.verify_manifest(event, raw)
+    assert contract.event_from_manifest(raw) == event
+
+
+@pytest.mark.parametrize(
+    "repository",
+    [
+        pytest.param("ghcr.io/other/pineforge-release", id="third-org"),
+        pytest.param("ghcr.io/pineforge-4pass/other", id="old-org-other-repo"),
+        pytest.param("ghcr.io/tunaxis/other", id="new-org-other-repo"),
+        pytest.param("", id="empty"),
+        pytest.param("GHCR.IO/tunaxis/pineforge-release", id="different-case"),
+        pytest.param("ghcr.io/tunaxis/pineforge-release/", id="trailing-slash"),
+        pytest.param(None, id="null"),
+        pytest.param(["ghcr.io/pineforge-4pass/pineforge-release"], id="old-org-list"),
+        pytest.param(["ghcr.io/tunaxis/pineforge-release"], id="new-org-list"),
+    ],
+)
+def test_ready_contract_rejects_unexpected_image_repository(ready, repository) -> None:
+    event, _manifest = ready
+    event["image"]["repository"] = repository
+    with pytest.raises(ValueError, match=r"^unexpected image repository$"):
+        contract.validate_event(event)
+
+
+@pytest.mark.parametrize(
     "path,value",
     [
         (("schema",), "pineforge/release-ready/v2"),
@@ -102,6 +145,37 @@ def test_valid_manifest_hash_cannot_hide_different_payload_identity(ready) -> No
         contract.verify_manifest(event, raw)
 
 
+@pytest.mark.parametrize(
+    "event_repository,manifest_repository",
+    [
+        pytest.param(
+            "ghcr.io/tunaxis/pineforge-release",
+            "ghcr.io/pineforge-4pass/pineforge-release",
+            id="new-event-old-manifest",
+        ),
+        pytest.param(
+            "ghcr.io/pineforge-4pass/pineforge-release",
+            "ghcr.io/tunaxis/pineforge-release",
+            id="old-event-new-manifest",
+        ),
+    ],
+)
+def test_allowed_repository_cannot_hide_different_manifest_repository(
+    ready, event_repository, manifest_repository
+) -> None:
+    event, raw = ready
+    manifest = contract.object_json(raw)
+    manifest["image"]["repository"] = manifest_repository
+    raw = contract.json_bytes(manifest)
+    digest = contract.sha256(raw)
+    event["image"]["repository"] = event_repository
+    event["manifest"]["sha256"] = digest
+    event["event_id"] = f"sha256:{digest}"
+
+    with pytest.raises(ValueError, match=r"^manifest disagrees: image$"):
+        contract.verify_manifest(event, raw)
+
+
 def test_update_changes_both_pins_and_independent_package_version(baseline, ready) -> None:
     event, manifest = ready
     patch = contract.update_files(baseline, event, manifest)
@@ -118,6 +192,59 @@ def test_update_changes_both_pins_and_independent_package_version(baseline, read
     assert lock["event"]["event_id"] == event["event_id"]
     assert lock["previous"]["package_version"] == "0.3.0"
     assert (baseline / contract.MANIFEST).read_bytes() == manifest
+
+
+@pytest.mark.parametrize(
+    "repository",
+    [
+        pytest.param("ghcr.io/pineforge-4pass/pineforge-release", id="old-org"),
+        pytest.param("ghcr.io/tunaxis/pineforge-release", id="new-org"),
+    ],
+)
+def test_update_pins_preserve_the_validated_image_repository(baseline, ready, repository) -> None:
+    _event, raw = ready
+    manifest = contract.object_json(raw)
+    manifest["image"]["repository"] = repository
+    raw = contract.json_bytes(manifest)
+    event = contract.event_from_manifest(raw)
+    expected_pin = (
+        f"{event['image']['repository']}:{event['release_version']}@{event['image']['digest']}"
+    )
+    expected_runtime = (
+        "DEFAULT_RELEASE_IMAGE = (\n"
+        f'    "{event["image"]["repository"]}:{event["release_version"]}@"\n'
+        f'    "{event["image"]["digest"]}"\n)\n'
+    )
+
+    assert contract.image_ref(event) == expected_pin
+    patch = contract.update_files(baseline, event, raw)
+    assert patch[contract.RUNTIME].decode() == expected_runtime
+    assert f"ARG PINEFORGE_RELEASE_IMAGE={expected_pin}\n" in patch[contract.DOCKERFILE].decode()
+    apply(baseline, patch)
+    assert contract.runtime_pin(baseline) == expected_pin
+    lock = contract.verify_local(baseline)
+    assert lock["event"] == event
+
+
+def test_new_repository_pins_never_use_the_old_organization(baseline, ready) -> None:
+    _event, raw = ready
+    manifest = contract.object_json(raw)
+    manifest["image"]["repository"] = "ghcr.io/tunaxis/pineforge-release"
+    raw = contract.json_bytes(manifest)
+    event = contract.event_from_manifest(raw)
+    expected_pin = (
+        f"{event['image']['repository']}:{event['release_version']}@{event['image']['digest']}"
+    )
+
+    pin = contract.image_ref(event)
+    patch = contract.update_files(baseline, event, raw)
+    assert "pineforge-4pass" not in pin
+    assert "pineforge-4pass" not in patch[contract.RUNTIME].decode()
+    assert "pineforge-4pass" not in patch[contract.DOCKERFILE].decode()
+    assert pin == expected_pin
+    apply(baseline, patch)
+    assert contract.runtime_pin(baseline) == expected_pin
+    assert f"ARG PINEFORGE_RELEASE_IMAGE={expected_pin}\n" in patch[contract.DOCKERFILE].decode()
 
 
 @pytest.mark.parametrize("which", [contract.RUNTIME, contract.DOCKERFILE])
@@ -278,6 +405,255 @@ def test_old_green_evidence_does_not_authorize_new_merge_inputs(field, value) ->
     gate[field] = value
     with pytest.raises(ValueError, match="stale"):
         evidence.validate_gate(gate, run, jobs, head="a" * 40, base="b" * 40, pr=7)
+
+
+@pytest.fixture
+def candidate_ci(monkeypatch):
+    pr = {
+        "number": 7,
+        "body": (
+            '<!-- pineforge-data-release '
+            '{"base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"} -->'
+        ),
+        "head": {
+            "sha": "a" * 40,
+            "ref": "bot/pineforge-release/test",
+            "repo": {"full_name": "owner/data"},
+        },
+        "merged_at": "2020-01-01T00:05:00Z",
+    }
+    runs = [
+        {
+            "id": 70,
+            "run_attempt": 2,
+            "head_sha": "a" * 40,
+            "event": "pull_request",
+            "pull_requests": [],
+            "head_branch": "bot/pineforge-release/test",
+            "head_repository": {"full_name": "owner/data"},
+            "created_at": "2020-01-01T00:03:00Z",
+        }
+    ]
+    jobs = [
+        {"completed_at": "2020-01-01T00:04:00Z"},
+        {"completed_at": "2020-01-01T00:04:30Z"},
+    ]
+    checked = []
+
+    def inventory(repo, endpoint, key):
+        assert repo == "owner/data"
+        if key == "workflow_runs":
+            assert endpoint == (
+                "actions/workflows/ci.yml/runs?event=pull_request&head_sha=" + "a" * 40
+            )
+            return runs
+        assert key == "jobs"
+        run = next(row for row in runs if row["id"] == checked[-1])
+        assert endpoint == f"actions/runs/{run['id']}/attempts/{run['run_attempt']}/jobs"
+        return jobs
+
+    def gate_for_run(repo, run_id, *, head, base, pr):
+        assert repo == "owner/data"
+        assert head == "a" * 40 and base == "b" * 40 and pr == 7
+        checked.append(run_id)
+        return {"run_id": run_id}
+
+    monkeypatch.setattr(publishing, "inventory", inventory)
+    monkeypatch.setattr(publishing, "gate_for_run", gate_for_run)
+    return pr, runs, jobs, checked
+
+
+@pytest.mark.parametrize(
+    "run_changes,pr_changes",
+    [
+        pytest.param({"head_sha": "c" * 40}, {}, id="other-head"),
+        pytest.param({"created_at": "2020-01-01T00:06:00Z"}, {}, id="created-after-merge"),
+        pytest.param({"event": "push"}, {}, id="push-event"),
+        pytest.param({"head_branch": "other-branch"}, {}, id="other-branch"),
+        pytest.param(
+            {"head_repository": {"full_name": "other-owner/data"}},
+            {},
+            id="fork-repository",
+        ),
+        pytest.param(
+            {"pull_requests": [{"number": 8}], "head_branch": "other-branch"},
+            {},
+            id="other-pr-and-branch",
+        ),
+        pytest.param({}, {"merged_at": None}, id="unmerged-pr"),
+        pytest.param({"pull_requests": [{"number": 8}]}, {}, id="other-pr-same-branch"),
+        pytest.param(
+            {"head_sha": "c" * 40, "pull_requests": [{"number": 7}]},
+            {},
+            id="associated-other-head",
+        ),
+        pytest.param(
+            {"event": "push", "pull_requests": [{"number": 7}]},
+            {},
+            id="associated-push-event",
+        ),
+        pytest.param({"pull_requests": None}, {}, id="null-associations"),
+        pytest.param({"pull_requests": [{}]}, {}, id="missing-association-number"),
+        pytest.param({"created_at": "2020-01-01T00:05:00Z"}, {}, id="created-at-merge"),
+        pytest.param(
+            {"created_at": "2020-01-01T01:05:00+01:00"},
+            {},
+            id="created-at-merge-with-offset",
+        ),
+        pytest.param(
+            {"created_at": "2020-01-01T00:04:00-01:00"},
+            {},
+            id="created-after-merge-with-offset",
+        ),
+        pytest.param({"created_at": "invalid"}, {}, id="invalid-created-time"),
+        pytest.param({}, {"merged_at": "invalid"}, id="invalid-merge-time"),
+        pytest.param({"created_at": "2020-01-01T00:03:00"}, {}, id="naive-created-time"),
+        pytest.param({}, {"merged_at": "2020-01-01T00:05:00"}, id="naive-merge-time"),
+    ],
+)
+def test_candidate_gate_rejects_unrelated_or_post_merge_ci(
+    candidate_ci, run_changes, pr_changes
+) -> None:
+    pr, runs, _jobs, checked = candidate_ci
+    runs[0].update(run_changes)
+    pr.update(pr_changes)
+    assert not publishing.run_belongs_to_pr(runs[0], pr)
+    with pytest.raises(ValueError, match=r"^pre-merge CI evidence missing$"):
+        publishing.candidate_gate("owner/data", pr)
+    assert checked == []
+
+
+@pytest.mark.parametrize(
+    "target,path",
+    [
+        ("run", ("head_sha",)),
+        ("run", ("event",)),
+        ("run", ("pull_requests",)),
+        ("run", ("head_branch",)),
+        ("run", ("head_repository",)),
+        ("run", ("head_repository", "full_name")),
+        ("run", ("created_at",)),
+        ("pr", ("number",)),
+        ("pr", ("head",)),
+        ("pr", ("head", "sha")),
+        ("pr", ("head", "ref")),
+        ("pr", ("head", "repo")),
+        ("pr", ("head", "repo", "full_name")),
+        ("pr", ("merged_at",)),
+    ],
+)
+def test_candidate_gate_rejects_missing_ci_identity(candidate_ci, target, path) -> None:
+    pr, runs, _jobs, checked = candidate_ci
+    value = runs[0] if target == "run" else pr
+    for key in path[:-1]:
+        value = value[key]
+    del value[path[-1]]
+    assert not publishing.run_belongs_to_pr(runs[0], pr)
+    with pytest.raises(ValueError, match=r"^pre-merge CI evidence missing$"):
+        publishing.candidate_gate("owner/data", pr)
+    assert checked == []
+
+
+@pytest.mark.parametrize("run_key,pr_key", [("head_sha", "sha"), ("head_branch", "ref")])
+def test_candidate_gate_rejects_null_head_identity(candidate_ci, run_key, pr_key) -> None:
+    pr, runs, _jobs, checked = candidate_ci
+    runs[0][run_key] = None
+    pr["head"][pr_key] = None
+    assert not publishing.run_belongs_to_pr(runs[0], pr)
+    with pytest.raises(ValueError, match=r"^pre-merge CI evidence missing$"):
+        publishing.candidate_gate("owner/data", pr)
+    assert checked == []
+
+
+@pytest.mark.parametrize("full_name", [None, "", 123])
+def test_candidate_gate_rejects_invalid_head_repository_name(candidate_ci, full_name) -> None:
+    pr, runs, _jobs, checked = candidate_ci
+    runs[0]["head_repository"]["full_name"] = full_name
+    pr["head"]["repo"]["full_name"] = full_name
+    assert not publishing.run_belongs_to_pr(runs[0], pr)
+    with pytest.raises(ValueError, match=r"^pre-merge CI evidence missing$"):
+        publishing.candidate_gate("owner/data", pr)
+    assert checked == []
+
+
+@pytest.mark.parametrize(
+    "created_at,merged_at",
+    [
+        ("2020-01-01T00:03:00Z", "2020-01-01T00:05:00Z"),
+        ("2020-01-01T01:03:00.500000+01:00", "2020-01-01T00:05:00Z"),
+        ("2020-01-01T00:03:00Z", "2020-01-01T01:05:00+01:00"),
+    ],
+)
+def test_candidate_gate_recovers_merged_pr_with_empty_associations(
+    candidate_ci, created_at, merged_at
+) -> None:
+    pr, runs, _jobs, checked = candidate_ci
+    runs[0]["created_at"] = created_at
+    pr["merged_at"] = merged_at
+    assert publishing.run_belongs_to_pr(runs[0], pr)
+    assert publishing.candidate_gate("owner/data", pr) == {"run_id": 70}
+    assert checked == [70]
+
+
+def test_candidate_gate_accepts_explicit_association_for_open_pr(candidate_ci) -> None:
+    pr, runs, _jobs, checked = candidate_ci
+    pr["merged_at"] = None
+    runs[0]["pull_requests"] = [{"number": 8}, {"number": 7}]
+    del runs[0]["head_branch"]
+    del runs[0]["created_at"]
+    del pr["head"]["ref"]
+    assert publishing.run_belongs_to_pr(runs[0], pr)
+    assert publishing.candidate_gate("owner/data", pr) == {"run_id": 70}
+    assert checked == [70]
+
+
+@pytest.mark.parametrize("latest_first", [False, True])
+def test_candidate_gate_chooses_highest_matching_run_id(candidate_ci, latest_first) -> None:
+    pr, runs, _jobs, checked = candidate_ci
+    runs.append({**runs[0], "id": 71, "run_attempt": 1})
+    if latest_first:
+        runs.reverse()
+    assert all(publishing.run_belongs_to_pr(run, pr) for run in runs)
+    assert publishing.candidate_gate("owner/data", pr) == {"run_id": 71}
+    assert checked == [71]
+
+
+@pytest.mark.parametrize(
+    "run_changes",
+    [
+        pytest.param({"created_at": "2020-01-01T00:06:00Z"}, id="created-after-merge"),
+        pytest.param({"head_sha": "c" * 40}, id="other-head"),
+        pytest.param(
+            {"head_repository": {"full_name": "other-owner/data"}},
+            id="fork-repository",
+        ),
+    ],
+)
+@pytest.mark.parametrize("latest_first", [False, True])
+def test_candidate_gate_ignores_higher_id_unrelated_run(
+    candidate_ci, run_changes, latest_first
+) -> None:
+    pr, runs, _jobs, checked = candidate_ci
+    assert publishing.run_belongs_to_pr(runs[0], pr)
+    unrelated = {**runs[0], "id": 71, "run_attempt": 1, **run_changes}
+    assert not publishing.run_belongs_to_pr(unrelated, pr)
+    runs.append(unrelated)
+    if latest_first:
+        runs.reverse()
+    assert publishing.candidate_gate("owner/data", pr) == {"run_id": 70}
+    assert checked == [70]
+
+
+@pytest.mark.parametrize("completed_at", [None, "2020-01-01T00:06:00Z"])
+def test_candidate_gate_still_requires_every_job_to_finish_before_merge(
+    candidate_ci, completed_at
+) -> None:
+    pr, runs, jobs, checked = candidate_ci
+    jobs[-1]["completed_at"] = completed_at
+    assert publishing.run_belongs_to_pr(runs[0], pr)
+    with pytest.raises(ValueError, match="candidate CI/E2E did not finish before merge"):
+        publishing.candidate_gate("owner/data", pr)
+    assert checked == [70]
 
 
 @pytest.mark.parametrize("suite", list(evidence.TESTS))

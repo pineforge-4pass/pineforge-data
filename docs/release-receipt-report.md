@@ -361,3 +361,17 @@ not invent an identity or claim verified. Establish a manifest-based published
 baseline in CI before setting the hub's data readiness flag. Automatic rollback
 also continues to require a stored verified contract. This rollout prerequisite
 is explicit in `docs/releasing.md`; it was not bypassed to fabricate a receipt.
+
+**TEMPORARY first-adopter exception (TX-DATA-BASELINE2, L6 10-19):** for
+pineforge-data 0.3.0 → 0.3.1 only, the previous identity uses
+`provenance: "pre-manifest-bootstrap"` with `facts_commit` and `facts_sha256`
+keys **ABSENT**, including no null placeholders. The producer verifies actual
+PyPI wheel/sdist bytes against recorded hashes, matching immutable release
+assets and the recorded tag commit. This form is for one use; a receipt carries
+no data package version, so the hub cannot refuse the form in a later data
+receipt. The data producer's 0.3.1 adopter-version gate and removal enforce the
+one-time limit. Remove the data exemption and the hub form together, only after
+0.3.1 is verified AND every retained `release-receipt-data` artifact carrying the
+bootstrap `previous` has expired (90-day retention), because the hub's scheduled
+collector re-validates retained receipts and `recover_applied` replays the stored
+receipt.

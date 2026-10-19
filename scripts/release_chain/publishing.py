@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
@@ -32,7 +33,43 @@ from .contract import (
 )
 from .evidence import distribution_hashes, gate_for_run
 from .receipts import candidate as record_candidate
-from .receipts import served, timestamp
+from .receipts import canonical, served, timestamp
+
+# TEMPORARY first-adopter exemption (TX-DATA-BASELINE2, L6 10-19):
+# remove the data exemption and the hub form together, only after 0.3.1 is verified AND
+# every retained release-receipt-data artifact carrying the bootstrap previous has
+# expired (90-day retention). The hub's scheduled collector re-validates retained receipts,
+# and recover_applied replays the stored receipt.
+# Removal checklist:
+# - publishing.py: canonical import, BOOTSTRAP_PACKAGE constant block, adopter_lock
+#   parameter, bootstrap branch in verified_package, and adopter_lock argument in prepare.
+# - reporting.py: adopter_lock argument in publication.
+# - tests/hub_receipt_validator.py: bootstrap docstring note, TEMPORARY constant block,
+#   identity branch/slot parameter, and provenance pre-loop/identity call arguments.
+# - tests/test_consumer_receipt.py: bootstrap fixtures/tests and adopter-lock wiring stubs.
+# - tests/fixtures/release_chain/bootstrap/ and bootstrap lines in its parent README.md.
+# - TEMPORARY paragraphs in docs/releasing.md and docs/release-receipt-report.md.
+# - pyproject.toml: bootstrap sdist exclusion; the pytest network marker may stay.
+BOOTSTRAP_PACKAGE: dict[str, Any] = {
+    "repo": "pineforge-4pass/pineforge-data",
+    "package": "pineforge-data",
+    "version": "0.3.0",
+    "adopter_version": "0.3.1",
+    "provenance": "pre-manifest-bootstrap",
+    "source": "fb5cec39b6c6d70af103df0df182d47bb5812191",
+    "image": (
+        "ghcr.io/pineforge-4pass/pineforge-release:1.0.0@sha256:"
+        "b271873d0e91a9eeeb4595daaded9bdfbdbcd3925d3ec1300a833395e2004c86"
+    ),
+    "distributions": {
+        "pineforge_data-0.3.0-py3-none-any.whl": (
+            "609b3e9976ae55fc290c725731cf1dd0266c9b3eb6f3353122c8bcdc05e497bc"
+        ),
+        "pineforge_data-0.3.0.tar.gz": (
+            "f29a2bd50f70ff46ebdf31f987260dec3123600ab5bf493741bbbd4e21aaacdc"
+        ),
+    },
+}
 
 
 def pypi_files(version: str) -> dict[str, str] | None:
@@ -45,20 +82,55 @@ def pypi_files(version: str) -> dict[str, str] | None:
     return {entry["filename"]: entry["digests"]["sha256"] for entry in value["urls"]}
 
 
+def run_belongs_to_pr(run: dict[str, Any], pr: dict[str, Any]) -> bool:
+    """Match exact PR CI, allowing GitHub's empty association list after merge."""
+    head = pr.get("head") or {}
+    number = pr.get("number")
+    if (
+        not head.get("sha")
+        or run.get("head_sha") != head.get("sha")
+        or run.get("event") != "pull_request"
+        or number is None
+    ):
+        return False
+    pull_requests = run.get("pull_requests")
+    if not isinstance(pull_requests, list):
+        return False
+    if pull_requests:
+        return any(
+            isinstance(item, dict) and item.get("number") == number for item in pull_requests
+        )
+    if not head.get("ref") or run.get("head_branch") != head.get("ref"):
+        return False
+    head_repo_name = (run.get("head_repository") or {}).get("full_name")
+    if (
+        not isinstance(head_repo_name, str)
+        or not head_repo_name
+        or head_repo_name != (head.get("repo") or {}).get("full_name")
+    ):
+        return False
+    created_at, merged_at = run.get("created_at"), pr.get("merged_at")
+    if not isinstance(created_at, str) or not isinstance(merged_at, str):
+        return False
+    try:
+        created = datetime.fromisoformat(created_at)
+        merged = datetime.fromisoformat(merged_at)
+    except ValueError:
+        return False
+    return created.tzinfo is not None and merged.tzinfo is not None and created < merged
+
+
 def candidate_gate(repo: str, pr: dict[str, Any]) -> dict[str, Any]:
     """Re-read the successful PR attempt, never substitute post-merge smoke tests."""
     meta = marker(pr)
+    head = (pr.get("head") or {}).get("sha")
+    require(head, "pre-merge CI evidence missing")
     runs = inventory(
         repo,
-        "actions/workflows/ci.yml/runs?event=pull_request&head_sha=" + pr["head"]["sha"],
+        "actions/workflows/ci.yml/runs?event=pull_request&head_sha=" + head,
         "workflow_runs",
     )
-    runs = [
-        run
-        for run in runs
-        if run["head_sha"] == pr["head"]["sha"]
-        and any(item["number"] == pr["number"] for item in run["pull_requests"])
-    ]
+    runs = [run for run in runs if run_belongs_to_pr(run, pr)]
     require(runs, "pre-merge CI evidence missing")
     run = max(runs, key=lambda row: row["id"])
     evidence = gate_for_run(
@@ -74,8 +146,12 @@ def candidate_gate(repo: str, pr: dict[str, Any]) -> dict[str, Any]:
 
 
 def verified_package(
-    repo: str, version: str, saved: dict[str, Any] | None = None
-) -> dict[str, str]:
+    repo: str,
+    version: str,
+    saved: dict[str, Any] | None = None,
+    *,
+    adopter_lock: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Observe immutable PyPI bytes, matching GitHub assets and tagged source/facts."""
     files = pypi_files(version)
     require(
@@ -115,6 +191,41 @@ def verified_package(
         )
     git("fetch", "origin", f"refs/tags/v{version}")
     source = git("rev-parse", f"v{version}^{{commit}}")
+    if (
+        repo == BOOTSTRAP_PACKAGE["repo"]
+        and version == BOOTSTRAP_PACKAGE["version"]
+        and saved is None
+        and adopter_lock is not None
+        and "rollback" not in adopter_lock
+        and adopter_lock.get("package_version") == BOOTSTRAP_PACKAGE["adopter_version"]
+        and adopter_lock.get("previous")
+        == {
+            "package_version": version,
+            "event_id": None,
+            "image": BOOTSTRAP_PACKAGE["image"],
+        }
+    ):
+        require(
+            len(metadata["urls"]) == 2 and files == BOOTSTRAP_PACKAGE["distributions"],
+            "bootstrap PyPI inventory differs from the recorded distributions",
+        )
+        require(
+            source == BOOTSTRAP_PACKAGE["source"],
+            "bootstrap tag differs from the recorded commit",
+        )
+        distribution_identity = {
+            "package": BOOTSTRAP_PACKAGE["package"],
+            "version": version,
+            "distributions": files,
+        }
+        # Facts never existed for this release; their sentinel is absent keys.
+        return {
+            "provenance": BOOTSTRAP_PACKAGE["provenance"],
+            **distribution_identity,
+            "source": source,
+            "image_digest": BOOTSTRAP_PACKAGE["image"].split("@", 1)[1],
+            "deployment_id_sha256": sha256(canonical(distribution_identity)),
+        }
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         snapshot(source, root)
@@ -325,7 +436,7 @@ def prepare(
     if event:
         record_candidate(report, event, candidate_gate(repo, pr), meta["version"])
         previous_version = lock["previous"]["package_version"]
-        report["previous"] = verified_package(repo, previous_version)
+        report["previous"] = verified_package(repo, previous_version, adopter_lock=lock)
     require(
         git("rev-parse", f"{source}^1") == meta["base"],
         "landed first parent differs from the tested base",

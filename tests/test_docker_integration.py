@@ -245,7 +245,9 @@ def test_server_handles_concurrent_requests_and_reuses_compile_cache() -> None:
     if lock_path.exists():
         event = json.loads(lock_path.read_text())["event"]
         assert labels["org.opencontainers.image.revision"] == event["hub_commit"]
-        assert labels["org.opencontainers.image.version"] == event["release_version"]
+        # The server image inherits the hub image's labels, and the hub labels its image
+        # with the release TAG (v-prefixed), exactly as release_chain/contract.py verifies.
+        assert labels["org.opencontainers.image.version"] == f"v{event['release_version']}"
     container = subprocess.run(
         [
             "docker",

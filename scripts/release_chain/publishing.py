@@ -66,6 +66,13 @@ def run_belongs_to_pr(run: dict[str, Any], pr: dict[str, Any]) -> bool:
         )
     if not head.get("ref") or run.get("head_branch") != head.get("ref"):
         return False
+    head_repo_name = (run.get("head_repository") or {}).get("full_name")
+    if (
+        not isinstance(head_repo_name, str)
+        or not head_repo_name
+        or head_repo_name != (head.get("repo") or {}).get("full_name")
+    ):
+        return False
     created_at, merged_at = run.get("created_at"), pr.get("merged_at")
     if not isinstance(created_at, str) or not isinstance(merged_at, str):
         return False

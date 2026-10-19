@@ -288,7 +288,11 @@ def candidate_ci(monkeypatch):
             '<!-- pineforge-data-release '
             '{"base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"} -->'
         ),
-        "head": {"sha": "a" * 40, "ref": "bot/pineforge-release/test"},
+        "head": {
+            "sha": "a" * 40,
+            "ref": "bot/pineforge-release/test",
+            "repo": {"full_name": "owner/data"},
+        },
         "merged_at": "2020-01-01T00:05:00Z",
     }
     runs = [
@@ -299,6 +303,7 @@ def candidate_ci(monkeypatch):
             "event": "pull_request",
             "pull_requests": [],
             "head_branch": "bot/pineforge-release/test",
+            "head_repository": {"full_name": "owner/data"},
             "created_at": "2020-01-01T00:03:00Z",
         }
     ]
@@ -338,6 +343,11 @@ def candidate_ci(monkeypatch):
         pytest.param({"created_at": "2020-01-01T00:06:00Z"}, {}, id="created-after-merge"),
         pytest.param({"event": "push"}, {}, id="push-event"),
         pytest.param({"head_branch": "other-branch"}, {}, id="other-branch"),
+        pytest.param(
+            {"head_repository": {"full_name": "other-owner/data"}},
+            {},
+            id="fork-repository",
+        ),
         pytest.param(
             {"pull_requests": [{"number": 8}], "head_branch": "other-branch"},
             {},
@@ -393,11 +403,15 @@ def test_candidate_gate_rejects_unrelated_or_post_merge_ci(
         ("run", ("event",)),
         ("run", ("pull_requests",)),
         ("run", ("head_branch",)),
+        ("run", ("head_repository",)),
+        ("run", ("head_repository", "full_name")),
         ("run", ("created_at",)),
         ("pr", ("number",)),
         ("pr", ("head",)),
         ("pr", ("head", "sha")),
         ("pr", ("head", "ref")),
+        ("pr", ("head", "repo")),
+        ("pr", ("head", "repo", "full_name")),
         ("pr", ("merged_at",)),
     ],
 )
@@ -407,6 +421,28 @@ def test_candidate_gate_rejects_missing_ci_identity(candidate_ci, target, path) 
     for key in path[:-1]:
         value = value[key]
     del value[path[-1]]
+    assert not publishing.run_belongs_to_pr(runs[0], pr)
+    with pytest.raises(ValueError, match="^pre-merge CI evidence missing$"):
+        publishing.candidate_gate("owner/data", pr)
+    assert checked == []
+
+
+@pytest.mark.parametrize("run_key,pr_key", [("head_sha", "sha"), ("head_branch", "ref")])
+def test_candidate_gate_rejects_null_head_identity(candidate_ci, run_key, pr_key) -> None:
+    pr, runs, _jobs, checked = candidate_ci
+    runs[0][run_key] = None
+    pr["head"][pr_key] = None
+    assert not publishing.run_belongs_to_pr(runs[0], pr)
+    with pytest.raises(ValueError, match="^pre-merge CI evidence missing$"):
+        publishing.candidate_gate("owner/data", pr)
+    assert checked == []
+
+
+@pytest.mark.parametrize("full_name", [None, "", 123])
+def test_candidate_gate_rejects_invalid_head_repository_name(candidate_ci, full_name) -> None:
+    pr, runs, _jobs, checked = candidate_ci
+    runs[0]["head_repository"]["full_name"] = full_name
+    pr["head"]["repo"]["full_name"] = full_name
     assert not publishing.run_belongs_to_pr(runs[0], pr)
     with pytest.raises(ValueError, match="^pre-merge CI evidence missing$"):
         publishing.candidate_gate("owner/data", pr)
@@ -453,6 +489,32 @@ def test_candidate_gate_chooses_highest_matching_run_id(candidate_ci, latest_fir
     assert all(publishing.run_belongs_to_pr(run, pr) for run in runs)
     assert publishing.candidate_gate("owner/data", pr) == {"run_id": 71}
     assert checked == [71]
+
+
+@pytest.mark.parametrize(
+    "run_changes",
+    [
+        pytest.param({"created_at": "2020-01-01T00:06:00Z"}, id="created-after-merge"),
+        pytest.param({"head_sha": "c" * 40}, id="other-head"),
+        pytest.param(
+            {"head_repository": {"full_name": "other-owner/data"}},
+            id="fork-repository",
+        ),
+    ],
+)
+@pytest.mark.parametrize("latest_first", [False, True])
+def test_candidate_gate_ignores_higher_id_unrelated_run(
+    candidate_ci, run_changes, latest_first
+) -> None:
+    pr, runs, _jobs, checked = candidate_ci
+    assert publishing.run_belongs_to_pr(runs[0], pr)
+    unrelated = {**runs[0], "id": 71, "run_attempt": 1, **run_changes}
+    assert not publishing.run_belongs_to_pr(unrelated, pr)
+    runs.append(unrelated)
+    if latest_first:
+        runs.reverse()
+    assert publishing.candidate_gate("owner/data", pr) == {"run_id": 70}
+    assert checked == [70]
 
 
 @pytest.mark.parametrize("completed_at", [None, "2020-01-01T00:06:00Z"])

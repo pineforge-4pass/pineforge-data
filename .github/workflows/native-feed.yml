@@ -11,6 +11,9 @@ on:
 permissions:
   contents: read
 
+# Only a superseded pull_request run is cancelled; push and dispatch are never cancelled.
+# Pull requests run on GitHub-hosted runners only (ubuntu-24.04, ubuntu-24.04-arm, macos-14);
+# push and dispatch keep the pool for the Linux x64 jobs.
 concurrency:
   group: native-feed-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -25,7 +28,7 @@ jobs:
         include:
           - os: ubuntu-24.04
             runner: >-
-              ${{ github.event_name != 'pull_request_target' &&
+              ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' &&
                   github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
                   contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
                   (github.event_name != 'pull_request' ||
@@ -59,7 +62,7 @@ jobs:
   asan-ubsan:
     name: ASan + UBSan
     runs-on: >-
-      ${{ github.event_name != 'pull_request_target' &&
+      ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' &&
           github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
           contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
           (github.event_name != 'pull_request' ||
@@ -87,7 +90,7 @@ jobs:
   tsan:
     name: TSan
     runs-on: >-
-      ${{ github.event_name != 'pull_request_target' &&
+      ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' &&
           github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
           contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
           (github.event_name != 'pull_request' ||

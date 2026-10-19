@@ -9,17 +9,49 @@ permissions:
   contents: read
   actions: read
 
-# Cancel older PR runs; no docs-only filter: release/ready's evidence aggregate
-# requires success from every needed job (skips fail); all jobs take 7-60 s.
+# Only a superseded pull_request run is cancelled: every other event (push to main,
+# whose run authorizes publication) gets its own run_id group and is never cancelled.
+# Pull requests (same-repo, fork, dependabot) run on GitHub-hosted ubuntu-24.04 only;
+# push keeps the pool. Docs-only PRs skip the four runtime jobs (docker, database-e2e,
+# contract, distribution); the Python matrix always runs because tests/test_documentation.py
+# checks the links in README.md, CONTRIBUTING.md and docs/. release/ready then accepts
+# those four as skipped and writes no release evidence; release PRs change code, so the
+# publication gates still read complete evidence from their pre-merge and main runs.
 concurrency:
   group: ci-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.paths.outputs.code }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify the tested merge against the PR base
+        id: paths
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git diff --no-renames --name-only -z "$BASE_SHA" HEAD > "$RUNNER_TEMP/pr-changed-paths"
+          code=false
+          while IFS= read -r -d '' path; do
+            case "$path" in
+              docs/*|mkdocs.yml|README.md|CONTRIBUTING.md|LICENSE) ;;
+              *) code=true ;;
+            esac
+          done < "$RUNNER_TEMP/pr-changed-paths"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
   test:
     name: Python ${{ matrix.python-version }}
     runs-on: >-
-      ${{ github.event_name != 'pull_request_target' &&
+      ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' &&
           github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
           contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
           (github.event_name != 'pull_request' ||
@@ -56,8 +88,13 @@ jobs:
 
   docker:
     name: Docker runtime
+    needs: changes
+    if: >-
+      !cancelled() &&
+      (github.event_name != 'pull_request' ||
+       (needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))
     runs-on: >-
-      ${{ github.event_name != 'pull_request_target' &&
+      ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' &&
           github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
           contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
           (github.event_name != 'pull_request' ||
@@ -80,8 +117,13 @@ jobs:
 
   database-e2e:
     name: Database E2E
+    needs: changes
+    if: >-
+      !cancelled() &&
+      (github.event_name != 'pull_request' ||
+       (needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))
     runs-on: >-
-      ${{ github.event_name != 'pull_request_target' &&
+      ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' &&
           github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
           contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
           (github.event_name != 'pull_request' ||
@@ -139,8 +181,13 @@ jobs:
 
   contract:
     name: Release contract
+    needs: changes
+    if: >-
+      !cancelled() &&
+      (github.event_name != 'pull_request' ||
+       (needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))
     runs-on: >-
-      ${{ github.event_name != 'pull_request_target' &&
+      ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' &&
           github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
           contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
           (github.event_name != 'pull_request' ||
@@ -162,8 +209,13 @@ jobs:
 
   distribution:
     name: Distribution
+    needs: changes
+    if: >-
+      !cancelled() &&
+      (github.event_name != 'pull_request' ||
+       (needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))
     runs-on: >-
-      ${{ github.event_name != 'pull_request_target' &&
+      ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' &&
           github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
           contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
           (github.event_name != 'pull_request' ||
@@ -225,9 +277,9 @@ jobs:
   ready:
     name: release/ready
     if: always()
-    needs: [test, contract, docker, database-e2e, distribution]
+    needs: [changes, test, contract, docker, database-e2e, distribution]
     runs-on: >-
-      ${{ github.event_name != 'pull_request_target' &&
+      ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' &&
           github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
           contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
           (github.event_name != 'pull_request' ||
@@ -236,23 +288,77 @@ jobs:
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     steps:
+      - name: Require the path decision and every expected job result
+        id: gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          CODE_CHANGED: ${{ needs.changes.outputs.code }}
+          UNIT_RESULT: ${{ needs.test.result }}
+          RUNTIME_RESULTS: >-
+            ${{ needs.contract.result }} ${{ needs.docker.result }}
+            ${{ needs.database-e2e.result }} ${{ needs.distribution.result }}
+        run: |
+          evidence=true
+          if [ "$EVENT_NAME" = pull_request ]; then
+            if [ "$CHANGES_RESULT" != success ]; then
+              echo "::error::The PR path decision did not succeed: $CHANGES_RESULT"
+              exit 1
+            fi
+            case "$CODE_CHANGED" in
+              true) ;;
+              false) evidence=false ;;
+              *) echo "::error::Missing or invalid PR path decision: '$CODE_CHANGED'"; exit 1 ;;
+            esac
+          fi
+          if [ "$UNIT_RESULT" != success ]; then
+            echo "::error::Expected the Python matrix to succeed, observed $UNIT_RESULT"
+            exit 1
+          fi
+          expected=success
+          if [ "$evidence" = false ]; then
+            expected=skipped
+          fi
+          set -- $RUNTIME_RESULTS
+          if [ "$#" -ne 4 ]; then
+            echo "::error::Expected four runtime job results, observed $#"
+            exit 1
+          fi
+          for result in "$@"; do
+            if [ "$result" != "$expected" ]; then
+              echo "::error::Expected $expected runtime jobs, observed $result"
+              exit 1
+            fi
+          done
+          if [ "$evidence" = false ]; then
+            echo "Docs-only PR: runtime jobs skipped; no release evidence is produced."
+          fi
+          echo "evidence=$evidence" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v7
+        if: steps.gate.outputs.evidence == 'true'
         with:
           persist-credentials: false
       - uses: actions/setup-python@v6
+        if: steps.gate.outputs.evidence == 'true'
         with:
           python-version: '3.13'
       - uses: actions/download-artifact@v6
+        if: steps.gate.outputs.evidence == 'true'
         with:
           name: python-package-distributions-${{ github.run_attempt }}
           path: dist/
       - name: Require the complete job inventory and bind evidence to this head/base/tree
+        if: steps.gate.outputs.evidence == 'true'
         env:
           PYTHONPATH: scripts
-          NEEDS_JSON: ${{ toJSON(needs) }}
+          NEEDS_JSON: >-
+            {"test":${{ toJSON(needs.test) }},"contract":${{ toJSON(needs.contract) }},
+            "docker":${{ toJSON(needs.docker) }},"database-e2e":${{ toJSON(needs.database-e2e) }},
+            "distribution":${{ toJSON(needs.distribution) }}}
           GH_TOKEN: ${{ github.token }}
         run: python -m release_chain.evidence aggregate --path dist
       - uses: actions/upload-artifact@v5
+        if: steps.gate.outputs.evidence == 'true'
         with:
           name: release-evidence-${{ github.run_attempt }}
           path: evidence.json

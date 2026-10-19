@@ -9,14 +9,16 @@ on:
 permissions:
   contents: read
 
+# Only a superseded pull_request run is cancelled; a push to main (Pages deploy) and a
+# dispatch are never cancelled. Pull requests run on a GitHub-hosted runner.
 concurrency:
-  group: pages-${{ github.ref }}
-  cancel-in-progress: true
+  group: pages-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
     runs-on: >-
-      ${{ github.event_name != 'pull_request_target' &&
+      ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' &&
           github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
           contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
           (github.event_name != 'pull_request' ||

@@ -59,6 +59,49 @@ def test_ready_event_binds_the_original_manifest_bytes(ready) -> None:
 
 
 @pytest.mark.parametrize(
+    "repository",
+    [
+        pytest.param("ghcr.io/pineforge-4pass/pineforge-release", id="old-org"),
+        pytest.param("ghcr.io/tunaxis/pineforge-release", id="new-org"),
+    ],
+)
+def test_ready_contract_accepts_each_exact_image_repository(ready, repository) -> None:
+    event, raw = ready
+    manifest = contract.object_json(raw)
+    manifest["image"]["repository"] = repository
+    raw = contract.json_bytes(manifest)
+    digest = contract.sha256(raw)
+    event["image"]["repository"] = repository
+    event["manifest"]["sha256"] = digest
+    event["event_id"] = f"sha256:{digest}"
+
+    contract.validate_event(event)
+    contract.verify_manifest(event, raw)
+    assert contract.event_from_manifest(raw) == event
+
+
+@pytest.mark.parametrize(
+    "repository",
+    [
+        pytest.param("ghcr.io/other/pineforge-release", id="third-org"),
+        pytest.param("ghcr.io/pineforge-4pass/other", id="old-org-other-repo"),
+        pytest.param("ghcr.io/tunaxis/other", id="new-org-other-repo"),
+        pytest.param("", id="empty"),
+        pytest.param("GHCR.IO/tunaxis/pineforge-release", id="different-case"),
+        pytest.param("ghcr.io/tunaxis/pineforge-release/", id="trailing-slash"),
+        pytest.param(None, id="null"),
+        pytest.param(["ghcr.io/pineforge-4pass/pineforge-release"], id="old-org-list"),
+        pytest.param(["ghcr.io/tunaxis/pineforge-release"], id="new-org-list"),
+    ],
+)
+def test_ready_contract_rejects_unexpected_image_repository(ready, repository) -> None:
+    event, _manifest = ready
+    event["image"]["repository"] = repository
+    with pytest.raises(ValueError, match=r"^unexpected image repository$"):
+        contract.validate_event(event)
+
+
+@pytest.mark.parametrize(
     "path,value",
     [
         (("schema",), "pineforge/release-ready/v2"),
@@ -102,6 +145,37 @@ def test_valid_manifest_hash_cannot_hide_different_payload_identity(ready) -> No
         contract.verify_manifest(event, raw)
 
 
+@pytest.mark.parametrize(
+    "event_repository,manifest_repository",
+    [
+        pytest.param(
+            "ghcr.io/tunaxis/pineforge-release",
+            "ghcr.io/pineforge-4pass/pineforge-release",
+            id="new-event-old-manifest",
+        ),
+        pytest.param(
+            "ghcr.io/pineforge-4pass/pineforge-release",
+            "ghcr.io/tunaxis/pineforge-release",
+            id="old-event-new-manifest",
+        ),
+    ],
+)
+def test_allowed_repository_cannot_hide_different_manifest_repository(
+    ready, event_repository, manifest_repository
+) -> None:
+    event, raw = ready
+    manifest = contract.object_json(raw)
+    manifest["image"]["repository"] = manifest_repository
+    raw = contract.json_bytes(manifest)
+    digest = contract.sha256(raw)
+    event["image"]["repository"] = event_repository
+    event["manifest"]["sha256"] = digest
+    event["event_id"] = f"sha256:{digest}"
+
+    with pytest.raises(ValueError, match=r"^manifest disagrees: image$"):
+        contract.verify_manifest(event, raw)
+
+
 def test_update_changes_both_pins_and_independent_package_version(baseline, ready) -> None:
     event, manifest = ready
     patch = contract.update_files(baseline, event, manifest)
@@ -118,6 +192,59 @@ def test_update_changes_both_pins_and_independent_package_version(baseline, read
     assert lock["event"]["event_id"] == event["event_id"]
     assert lock["previous"]["package_version"] == "0.3.0"
     assert (baseline / contract.MANIFEST).read_bytes() == manifest
+
+
+@pytest.mark.parametrize(
+    "repository",
+    [
+        pytest.param("ghcr.io/pineforge-4pass/pineforge-release", id="old-org"),
+        pytest.param("ghcr.io/tunaxis/pineforge-release", id="new-org"),
+    ],
+)
+def test_update_pins_preserve_the_validated_image_repository(baseline, ready, repository) -> None:
+    _event, raw = ready
+    manifest = contract.object_json(raw)
+    manifest["image"]["repository"] = repository
+    raw = contract.json_bytes(manifest)
+    event = contract.event_from_manifest(raw)
+    expected_pin = (
+        f"{event['image']['repository']}:{event['release_version']}@{event['image']['digest']}"
+    )
+    expected_runtime = (
+        "DEFAULT_RELEASE_IMAGE = (\n"
+        f'    "{event["image"]["repository"]}:{event["release_version"]}@"\n'
+        f'    "{event["image"]["digest"]}"\n)\n'
+    )
+
+    assert contract.image_ref(event) == expected_pin
+    patch = contract.update_files(baseline, event, raw)
+    assert patch[contract.RUNTIME].decode() == expected_runtime
+    assert f"ARG PINEFORGE_RELEASE_IMAGE={expected_pin}\n" in patch[contract.DOCKERFILE].decode()
+    apply(baseline, patch)
+    assert contract.runtime_pin(baseline) == expected_pin
+    lock = contract.verify_local(baseline)
+    assert lock["event"] == event
+
+
+def test_new_repository_pins_never_use_the_old_organization(baseline, ready) -> None:
+    _event, raw = ready
+    manifest = contract.object_json(raw)
+    manifest["image"]["repository"] = "ghcr.io/tunaxis/pineforge-release"
+    raw = contract.json_bytes(manifest)
+    event = contract.event_from_manifest(raw)
+    expected_pin = (
+        f"{event['image']['repository']}:{event['release_version']}@{event['image']['digest']}"
+    )
+
+    pin = contract.image_ref(event)
+    patch = contract.update_files(baseline, event, raw)
+    assert "pineforge-4pass" not in pin
+    assert "pineforge-4pass" not in patch[contract.RUNTIME].decode()
+    assert "pineforge-4pass" not in patch[contract.DOCKERFILE].decode()
+    assert pin == expected_pin
+    apply(baseline, patch)
+    assert contract.runtime_pin(baseline) == expected_pin
+    assert f"ARG PINEFORGE_RELEASE_IMAGE={expected_pin}\n" in patch[contract.DOCKERFILE].decode()
 
 
 @pytest.mark.parametrize("which", [contract.RUNTIME, contract.DOCKERFILE])

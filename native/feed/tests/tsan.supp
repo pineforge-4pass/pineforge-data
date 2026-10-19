@@ -2,4 +2,5 @@
 # CivetWeb 1.16 (built with STOP_FLAG_NEEDS_LOCK): STOP_FLAG_ASSIGN passes the flag's current value to its
 # compare-and-swap loop with a plain read, which races benignly with the atomic reads of mg_stop and the
 # master thread during shutdown.
+# Matching by function name needs a symbolizer, which the TSan job installs and checks for.
 race:STOP_FLAG_ASSIGN

@@ -19,7 +19,7 @@ ALLOWED_BOTS = "dependabot[bot] pineforge-app[bot]"
 AUTHZ_PASSED = "needs.authz.result == 'success'"
 AUTHZ_REFUSED = "needs.authz.result != 'success'"
 
-# Literal transcription of ci-labels.md, frozen sha d7ba0680, lines 53-114.
+# Literal transcription of ci-labels.md, frozen sha ac875205.
 # Full-line comments are omitted; adjacent literals only split long source lines.
 CANON_SCRIPT = (
     'set -eu\n'
@@ -30,16 +30,18 @@ CANON_SCRIPT = (
     'repository_dispatch)\n'
     '    ;;\n'
     '  workflow_run)\n'
+    '    [ -n "${WR_HEAD_REPO:-}" ] || fail "workflow_run head repository is missing"\n'
+    '    [ -n "${WR_ACTOR:-}" ] || fail "workflow_run triggering actor is missing"\n'
     '    [ "$WR_HEAD_REPO" = "$REPO" ] || fail '
-    '"workflow_run triggered from another repository (${WR_HEAD_REPO:-unknown})"\n'
-    '    case " $ALLOWED_BOTS " in\n'
-    '      *" $WR_ACTOR "*) ;;\n'
+    '"workflow_run head repository does not match this repository"\n'
+    '    case "$WR_ACTOR" in\n'
+    '      "pineforge-app[bot]"|"pineforge-ci-dispatcher[bot]") ;;\n'
+    '      *"[bot]") fail "workflow_run bot is not on the canon allowlist" ;;\n'
     '      *)\n'
     '        perm=$(gh api "repos/$REPO/collaborators/$WR_ACTOR/permission" '
-    '--jq .permission 2>/dev/null || echo none)\n'
+    '--jq .permission 2>/dev/null) || fail "workflow_run permission lookup failed"\n'
     '        case "$perm" in admin|maintain|write) ;; *) fail '
-    '"workflow_run triggering actor ${WR_ACTOR:-unknown} has permission '
-    "'$perm', not write\" ;; esac ;;\n"
+    '"workflow_run triggering actor does not have write permission" ;; esac ;;\n'
     '    esac ;;\n'
     '  pull_request)\n'
     '    [ "$HEAD_REPO" = "$REPO" ] || fail '
@@ -249,8 +251,8 @@ class Case:
     gh_empty: bool = False
 
 
-def actor_refusal(actor: str, permission: str = "none") -> str:
-    return f"workflow_run triggering actor {actor} has permission '{permission}', not write"
+def actor_refusal() -> str:
+    return "workflow_run triggering actor does not have write permission"
 
 
 def author_refusal(author: str, association: str, permission: str = "none") -> str:
@@ -260,11 +262,14 @@ def author_refusal(author: str, association: str, permission: str = "none") -> s
     )
 
 
-FORK_REFUSAL = f"workflow_run triggered from another repository ({FORK_REPOSITORY})"
+FORK_REFUSAL = "workflow_run head repository does not match this repository"
 EVENT_REFUSAL = "does not run CI (pull_request_target and other events are not allowed)"
 CASES = {
-    "same-repo-dependabot": Case(actor="dependabot[bot]"),
+    "same-repo-dependabot": Case(
+        actor="dependabot[bot]", refusal="workflow_run bot is not on the canon allowlist"
+    ),
     "same-repo-app": Case(actor="pineforge-app[bot]"),
+    "same-repo-dispatcher": Case(actor="pineforge-ci-dispatcher[bot]"),
     "same-repo-write": Case(actor="writer", permission="write", lookup=True),
     "same-repo-admin": Case(actor="admin", permission="admin", lookup=True),
     "same-repo-maintain": Case(actor="maintainer", permission="maintain", lookup=True),
@@ -280,36 +285,36 @@ CASES = {
     "fork-writer": Case(
         actor="writer", head_repo=FORK_REPOSITORY, permission="write", refusal=FORK_REFUSAL
     ),
-    "unknown-none": Case(lookup=True, refusal=actor_refusal("outsider")),
-    "unknown-read": Case(
-        permission="read", lookup=True, refusal=actor_refusal("outsider", "read")
-    ),
-    "unknown-triage": Case(
-        permission="triage", lookup=True, refusal=actor_refusal("outsider", "triage")
-    ),
+    "unknown-none": Case(lookup=True, refusal=actor_refusal()),
+    "unknown-read": Case(permission="read", lookup=True, refusal=actor_refusal()),
+    "unknown-triage": Case(permission="triage", lookup=True, refusal=actor_refusal()),
     "lookup-failed": Case(
-        permission="write", gh_fails=True, lookup=True, refusal=actor_refusal("outsider")
+        permission="write",
+        gh_fails=True,
+        lookup=True,
+        refusal="workflow_run permission lookup failed",
     ),
     "empty-head": Case(
         actor="pineforge-app[bot]",
         head_repo="",
-        refusal="workflow_run triggered from another repository (unknown)",
+        refusal="workflow_run head repository is missing",
     ),
+    "empty-actor": Case(actor="", refusal="workflow_run triggering actor is missing"),
     "pull-request-target": Case(
         event="pull_request_target", refusal=f"event pull_request_target {EVENT_REFUSAL}"
     ),
     "unknown-event": Case(event="unknown_event", refusal=f"event unknown_event {EVENT_REFUSAL}"),
     "other-bot": Case(
-        actor="github-actions[bot]", lookup=True, refusal=actor_refusal("github-actions[bot]")
+        actor="github-actions[bot]", refusal="workflow_run bot is not on the canon allowlist"
     ),
     "app-without-bot-suffix": Case(
-        actor="pineforge-app", lookup=True, refusal=actor_refusal("pineforge-app")
+        actor="pineforge-app", lookup=True, refusal=actor_refusal()
     ),
     "app-with-extra-suffix": Case(
-        actor="pineforge-app[bot]x", lookup=True, refusal=actor_refusal("pineforge-app[bot]x")
+        actor="pineforge-app[bot]x", lookup=True, refusal=actor_refusal()
     ),
     "dependabot-with-prefix": Case(
-        actor="xdependabot[bot]", lookup=True, refusal=actor_refusal("xdependabot[bot]")
+        actor="xdependabot[bot]", refusal="workflow_run bot is not on the canon allowlist"
     ),
     "pr-owner": Case(event="pull_request", pr_author="owner", association="OWNER"),
     "pr-member": Case(event="pull_request", pr_author="member", association="MEMBER"),
@@ -568,8 +573,8 @@ def test_read_permission_mutation_allows_refused_prs(
 
 
 @pytest.mark.parametrize("name", RELEASE_WORKFLOWS)
-@pytest.mark.parametrize("case_name", ("fork-dependabot", "fork-app"))
-def test_missing_head_check_mutation_allows_fork_bots(
+@pytest.mark.parametrize("case_name", ("fork-writer",))
+def test_missing_head_check_mutation_allows_fork_writer(
     tmp_path: Path, name: str, case_name: str
 ) -> None:
     script = load(name)["jobs"]["authz"]["steps"][0]["run"]
@@ -584,4 +589,9 @@ def test_missing_head_check_mutation_allows_fork_bots(
     code, summary, calls = run_authz(tmp_path, name, case, mutated)
     assert code == 0
     assert summary == "authz: allowed (workflow_run)\n"
-    assert calls == []
+    assert calls == [
+        "api",
+        f"repos/{REPOSITORY}/collaborators/{case.actor}/permission",
+        "--jq",
+        ".permission",
+    ]

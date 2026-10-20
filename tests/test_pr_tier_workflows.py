@@ -18,8 +18,10 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github/workflows"
 PR_TIER_WORKFLOWS = ("ci.yml", "docs.yml", "native-feed.yml")
 RUNTIME_JOBS = ("docker", "database-e2e", "contract", "distribution")
-# ci-labels.md #830: the aggregate job runs unless the run was cancelled (never `always()`).
-AGGREGATE_IF = "${{ !cancelled() }}"
+# ci-labels.md 99de80f9 (frozen 10-20): the required aggregate runs `if: always()`; never
+# `!cancelled()` (a cancelled run would SKIP it and GitHub counts a skipped required check as
+# success). old: AGGREGATE_IF = "${{ !cancelled() }}" (#830, reverted for security).
+AGGREGATE_IF = "always()"
 
 HOSTED_GUARD = (
     "${{ github.event_name != 'pull_request' && "
@@ -584,8 +586,8 @@ def assert_docs_only_policy(jobs: dict[str, Any]) -> None:
         assert " ".join(jobs[name]["if"].split()) == RUNTIME_IF
     # old: assert set(jobs["ready"]["needs"]) == {"changes", "test", *RUNTIME_JOBS}
     assert set(jobs["ready"]["needs"]) == {"authz", "changes", "test", *RUNTIME_JOBS}
-    # old: assert jobs["ready"]["if"] == "always()"
-    # ci-labels.md #830: the aggregate uses !cancelled() so a superseded run never blocks the head.
+    # old: assert jobs["ready"]["if"] == "always()"  (then #830: "${{ !cancelled() }}", reverted)
+    # ci-labels.md 99de80f9: the required aggregate is always(), never skippable by a cancel.
     assert jobs["ready"]["if"] == AGGREGATE_IF
     assert jobs["ready"]["name"] == "release/ready"
 
@@ -683,24 +685,28 @@ def test_always_jobs_refuse_a_failed_authz_before_any_repo_code() -> None:
                 assert "needs.authz.result == 'success'" in condition, (workflow, job_id)
 
 
-def assert_no_always(name: str, jobs: dict[str, Any]) -> None:
+def assert_aggregate_is_always(jobs: dict[str, Any]) -> None:
+    # old: assert "always()" not in job.get("if", "") for every job (the #830 pin, reverted).
+    assert jobs["ready"]["if"] == "always()"
     for job_id, job in jobs.items():
-        assert "always()" not in job.get("if", ""), (name, job_id)
+        condition = job.get("if", "")
+        if job_id == "ready":
+            continue
+        # No other job may be a bare `!cancelled()` aggregate that a cancelled run skips.
+        assert condition.replace(" ", "") not in ("!cancelled()", "${{!cancelled()}}"), job_id
 
 
-@pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
-def test_no_job_uses_always_so_a_superseded_run_never_blocks_the_head(name: str) -> None:
-    assert_no_always(name, load(name)["jobs"])
+def test_the_required_aggregate_runs_always_never_cancelled_only() -> None:
+    assert_aggregate_is_always(load("ci.yml")["jobs"])
 
 
-@pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
-def test_an_always_job_condition_is_rejected_in_every_pr_tier_workflow(name: str) -> None:
-    jobs = copy.deepcopy(load(name)["jobs"])
-    assert_no_always(name, jobs)
-    job_id = next(iter(jobs))
-    jobs[job_id]["if"] = "always() && needs.authz.result == 'success'"
+@pytest.mark.parametrize("fault", ["${{ !cancelled() }}", "!cancelled()", "success()", ""])
+def test_an_aggregate_that_a_cancelled_run_can_skip_is_rejected(fault: str) -> None:
+    jobs = copy.deepcopy(load("ci.yml")["jobs"])
+    assert_aggregate_is_always(jobs)
+    jobs["ready"]["if"] = fault
     with pytest.raises(AssertionError):
-        assert_no_always(name, jobs)
+        assert_aggregate_is_always(jobs)
 
 
 @pytest.mark.parametrize(

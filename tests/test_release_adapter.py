@@ -1043,8 +1043,8 @@ def test_workflows_keep_every_gate_ahead_of_oidc_publication() -> None:
     assert ci["jobs"]["test"]["strategy"]["matrix"]["python-version"] == ["3.11", "3.12", "3.13"]
     # old: assert set(ci["jobs"]["ready"]["needs"]) == evidence.NEEDS | {"changes"}
     assert_ready_dependencies(ci["jobs"]["ready"])
-    # old: assert ci["jobs"]["ready"]["if"] == "always()"
-    assert ci["jobs"]["ready"]["if"] == "${{ !cancelled() }}"
+    # old: assert ci["jobs"]["ready"]["if"] == "always()"  (#830 made it "${{ !cancelled() }}", reverted)
+    assert ci["jobs"]["ready"]["if"] == "always()"
     assert ci["jobs"]["ready"]["name"] == "release/ready"
     for job, suite, enabled in (
         ("docker", "docker", "PINEFORGE_DOCKER_TEST=1"),

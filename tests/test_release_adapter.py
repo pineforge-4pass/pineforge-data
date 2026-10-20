@@ -959,11 +959,17 @@ def test_completed_receipt_replay_does_not_dispatch_or_publish(
     assert report["deployed"] == saved["deployed"]
 
 
+def assert_ready_dependencies(job: dict[str, Any]) -> None:
+    # old: assert set(ci["jobs"]["ready"]["needs"]) == evidence.NEEDS | {"changes"}
+    assert set(job["needs"]) == evidence.NEEDS | {"changes", "authz"}
+
+
 def test_workflows_keep_every_gate_ahead_of_oidc_publication() -> None:
     workflows = ROOT / ".github/workflows"
     ci = yaml.load((workflows / "ci.yml").read_text(), Loader=yaml.BaseLoader)
     assert ci["jobs"]["test"]["strategy"]["matrix"]["python-version"] == ["3.11", "3.12", "3.13"]
-    assert set(ci["jobs"]["ready"]["needs"]) == evidence.NEEDS | {"changes"}
+    # old: assert set(ci["jobs"]["ready"]["needs"]) == evidence.NEEDS | {"changes"}
+    assert_ready_dependencies(ci["jobs"]["ready"])
     assert ci["jobs"]["ready"]["if"] == "always()"
     assert ci["jobs"]["ready"]["name"] == "release/ready"
     for job, suite, enabled in (
@@ -992,6 +998,19 @@ def test_workflows_keep_every_gate_ahead_of_oidc_publication() -> None:
     assert release["jobs"]["publish"]["environment"]["name"] == "pypi"
     receiver = yaml.load((workflows / "pineforge-release.yml").read_text(), Loader=yaml.BaseLoader)
     assert receiver["on"]["repository_dispatch"]["types"] == ["pineforge-release"]
+
+
+@pytest.mark.parametrize("dependency", ["authz", "changes", *sorted(evidence.NEEDS), "extra"])
+def test_ready_rejects_missing_or_extra_publication_dependencies(dependency: str) -> None:
+    ci = yaml.load((ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
+    job = copy.deepcopy(ci["jobs"]["ready"])
+    assert_ready_dependencies(job)
+    if dependency == "extra":
+        job["needs"].append(dependency)
+    else:
+        job["needs"].remove(dependency)
+    with pytest.raises(AssertionError):
+        assert_ready_dependencies(job)
 
 
 def test_rollback_is_a_new_patch_and_rejected_events_cannot_return(ready, baseline) -> None:

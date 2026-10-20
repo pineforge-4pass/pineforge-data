@@ -671,10 +671,24 @@ def test_always_jobs_refuse_a_failed_authz_before_any_repo_code() -> None:
                 assert "needs.authz.result == 'success'" in condition, (workflow, job_id)
 
 
+def assert_no_always(name: str, jobs: dict[str, Any]) -> None:
+    for job_id, job in jobs.items():
+        assert "always()" not in job.get("if", ""), (name, job_id)
+
+
 @pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
 def test_no_job_uses_always_so_a_superseded_run_never_blocks_the_head(name: str) -> None:
-    for job_id, job in load(name)["jobs"].items():
-        assert "always()" not in job.get("if", ""), (name, job_id)
+    assert_no_always(name, load(name)["jobs"])
+
+
+@pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
+def test_an_always_job_condition_is_rejected_in_every_pr_tier_workflow(name: str) -> None:
+    jobs = copy.deepcopy(load(name)["jobs"])
+    assert_no_always(name, jobs)
+    job_id = next(iter(jobs))
+    jobs[job_id]["if"] = "always() && needs.authz.result == 'success'"
+    with pytest.raises(AssertionError):
+        assert_no_always(name, jobs)
 
 
 @pytest.mark.parametrize(

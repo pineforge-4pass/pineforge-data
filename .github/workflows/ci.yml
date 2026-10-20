@@ -73,7 +73,12 @@ jobs:
                 *)
                   case " $ALLOWED_BOTS " in
                     *" $PR_AUTHOR "*) ;;
-                    *) fail "author ${PR_AUTHOR:-unknown} (${ASSOCIATION:-NONE}) is not an owner, member, collaborator or allowlisted bot" ;;
+                    *)
+                      # A member whose org membership is private shows as CONTRIBUTOR: ask GitHub for the
+                      # author's permission on this repository; anything but admin/maintain/write (or a
+                      # failed call) refuses.
+                      perm=$(gh api "repos/$REPO/collaborators/$PR_AUTHOR/permission" --jq .permission 2>/dev/null || echo none)
+                      case "$perm" in admin|maintain|write) ;; *) fail "author ${PR_AUTHOR:-unknown} (${ASSOCIATION:-NONE}) has permission '$perm', not write, and is not an allowlisted bot" ;; esac ;;
                   esac ;;
               esac ;;
             *) fail "event $EVENT does not run CI (pull_request_target and other events are not allowed)" ;;

@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github/workflows"
 PR_TIER_WORKFLOWS = ("ci.yml", "docs.yml", "native-feed.yml")
 RUNTIME_JOBS = ("docker", "database-e2e", "contract", "distribution")
-# ci-labels.md 99de80f9 (frozen 10-20): the required aggregate runs `if: always()`; never
+# ci-labels.md ac875205 (frozen 10-20): the required aggregate runs `if: always()`; never
 # `!cancelled()` (a cancelled run would SKIP it and GitHub counts a skipped required check as
 # success). old: AGGREGATE_IF = "${{ !cancelled() }}" (#830, reverted for security).
 AGGREGATE_IF = "always()"
@@ -78,8 +78,7 @@ CANONICAL_AUTHZ_ENV = {
     "GH_TOKEN": "${{ github.token }}",
     "ALLOWED_BOTS": "dependabot[bot] pineforge-app[bot]",
 }
-# old: Literal transcription of ci-labels.md 99de80f9, including its shell comments.
-# Literal transcription of ci-labels.md d7ba0680, including its shell comments.
+# Literal transcription of ci-labels.md ac875205, including its shell comments.
 # old: CANONICAL_AUTHZ_SCRIPT pinned only pull_request_target and HEAD_REPO.
 CANONICAL_AUTHZ_SCRIPT = (
     "set -eu\n"
@@ -91,24 +90,20 @@ CANONICAL_AUTHZ_SCRIPT = (
     "    # events; none of them runs pull-request code.\n"
     "    ;;\n"
     "  workflow_run)\n"
-    "    # The pwn-request path: it runs in THIS repository with secrets even when "
-    "the triggering run\n"
-    "    # came from a fork. Refuse ALWAYS unless the triggering run's head is "
-    "this repository, and\n"
-    "    # apply the same identity rule to its triggering actor as to a pull-request author.\n"
+    "    # LB-437: bind identity to the triggering run and its re-runner.\n"
+    "    # These two App bots are fixed canon policy; ALLOWED_BOTS is PR-only.\n"
+    '    [ -n "${WR_HEAD_REPO:-}" ] || fail "workflow_run head repository is missing"\n'
+    '    [ -n "${WR_ACTOR:-}" ] || fail "workflow_run triggering actor is missing"\n'
     '    [ "$WR_HEAD_REPO" = "$REPO" ] || fail '
-    '"workflow_run triggered from another repository (${WR_HEAD_REPO:-unknown})"\n'
-    '    case " $ALLOWED_BOTS " in\n'
-    '      *" $WR_ACTOR "*) ;;\n'
+    '"workflow_run head repository does not match this repository"\n'
+    '    case "$WR_ACTOR" in\n'
+    '      "pineforge-app[bot]"|"pineforge-ci-dispatcher[bot]") ;;\n'
+    '      *"[bot]") fail "workflow_run bot is not on the canon allowlist" ;;\n'
     "      *)\n"
-    "        # No author_association exists on workflow_run: ask GitHub for the actor's "
-    "permission on\n"
-    "        # this repository; anything but admin/maintain/write (or a failed call) refuses.\n"
     '        perm=$(gh api "repos/$REPO/collaborators/$WR_ACTOR/permission" '
-    "--jq .permission 2>/dev/null || echo none)\n"
+    '--jq .permission 2>/dev/null) || fail "workflow_run permission lookup failed"\n'
     '        case "$perm" in admin|maintain|write) ;; *) fail '
-    '"workflow_run triggering actor ${WR_ACTOR:-unknown} has permission '
-    "'$perm', not write\" ;; esac ;;\n"
+    '"workflow_run triggering actor does not have write permission" ;; esac ;;\n'
     "    esac ;;\n"
     "  pull_request)\n"
     '    [ "$HEAD_REPO" = "$REPO" ] || fail '
@@ -584,7 +579,10 @@ def test_authz_rejects_weakened_repository_comparisons(name: str, comparison: st
         ("OWNER|MEMBER|COLLABORATOR)", "OWNER|MEMBER|COLLABORATOR|CONTRIBUTOR)"),
         ("admin|maintain|write)", "admin|maintain|write|read)"),
         ('*" $PR_AUTHOR "*)', '*"$PR_AUTHOR"*)'),
-        ('*" $WR_ACTOR "*)', '*"$WR_ACTOR"*)'),
+        (
+            '"pineforge-app[bot]"|"pineforge-ci-dispatcher[bot]")',
+            '*"pineforge-app[bot]"*|"pineforge-ci-dispatcher[bot]")',
+        ),
         ("2>/dev/null || echo none)", "2>/dev/null || echo write)"),
     ],
     ids=[
@@ -809,7 +807,25 @@ AUTHZ_DECISIONS: dict[str, tuple[dict[str, str], int, str, bool]] = {
             "",
             False,
         )
-        for actor in ("dependabot[bot]", "pineforge-app[bot]")
+        for actor in ("pineforge-app[bot]", "pineforge-ci-dispatcher[bot]")
+    },
+    **{
+        f"workflow-run-{actor}": (
+            authz_inputs("workflow_run", WR_ACTOR=actor),
+            1,
+            "workflow_run bot is not on the canon allowlist",
+            False,
+        )
+        for actor in ("dependabot[bot]", "github-actions[bot]", "xdependabot[bot]")
+    },
+    **{
+        f"workflow-run-{actor}": (
+            authz_inputs("workflow_run", WR_ACTOR=actor),
+            1,
+            "workflow_run triggering actor does not have write permission",
+            True,
+        )
+        for actor in ("pineforge-app", "pineforge-app[bot]x")
     },
     **{
         f"workflow-run-{permission}": (
@@ -937,7 +953,7 @@ AUTHZ_DECISIONS: dict[str, tuple[dict[str, str], int, str, bool]] = {
             FAKE_GH_PERMISSION="write",
         ),
         1,
-        "workflow_run triggered from another repository (outsider/pineforge-data)",
+        "workflow_run head repository does not match this repository",
         False,
     ),
     "workflow-run-fork-bot": (
@@ -947,20 +963,26 @@ AUTHZ_DECISIONS: dict[str, tuple[dict[str, str], int, str, bool]] = {
             WR_ACTOR="dependabot[bot]",
         ),
         1,
-        "workflow_run triggered from another repository (outsider/pineforge-data)",
+        "workflow_run head repository does not match this repository",
         False,
     ),
     "workflow-run-empty-head": (
         authz_inputs("workflow_run", WR_HEAD_REPO="", FAKE_GH_PERMISSION="write"),
         1,
-        "workflow_run triggered from another repository (unknown)",
+        "workflow_run head repository is missing",
+        False,
+    ),
+    "workflow-run-empty-actor": (
+        authz_inputs("workflow_run", WR_ACTOR=""),
+        1,
+        "workflow_run triggering actor is missing",
         False,
     ),
     **{
         f"workflow-run-{permission}": (
             authz_inputs("workflow_run", FAKE_GH_PERMISSION=permission),
             1,
-            f"workflow_run triggering actor alice has permission '{permission}', not write",
+            "workflow_run triggering actor does not have write permission",
             True,
         )
         for permission in ("read", "triage", "none")
@@ -968,7 +990,7 @@ AUTHZ_DECISIONS: dict[str, tuple[dict[str, str], int, str, bool]] = {
     "workflow-run-lookup-fails": (
         authz_inputs("workflow_run", FAKE_GH_PERMISSION="write", FAKE_GH_FAIL="true"),
         1,
-        "workflow_run triggering actor alice has permission 'none', not write",
+        "workflow_run permission lookup failed",
         True,
     ),
 }
@@ -1159,7 +1181,7 @@ def assert_docs_only_policy(jobs: dict[str, Any]) -> None:
     # old: assert set(jobs["ready"]["needs"]) == {"changes", "test", *RUNTIME_JOBS}
     assert set(jobs["ready"]["needs"]) == {"authz", "changes", "test", *RUNTIME_JOBS}
     # old: assert jobs["ready"]["if"] == "always()"  (then #830: "${{ !cancelled() }}", reverted)
-    # ci-labels.md 99de80f9: the required aggregate is always(), never skippable by a cancel.
+    # ci-labels.md ac875205: the required aggregate is always(), never skippable by a cancel.
     assert jobs["ready"]["if"] == AGGREGATE_IF
     assert jobs["ready"]["name"] == "release/ready"
 

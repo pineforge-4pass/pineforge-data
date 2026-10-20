@@ -411,7 +411,7 @@ jobs:
         with:
           python-version: '3.13'
       - uses: actions/download-artifact@v6
-        if: steps.gate.outputs.evidence == 'true'
+        if: needs.authz.result == 'success' && steps.gate.outputs.evidence == 'true'
         with:
           name: python-package-distributions-${{ github.run_attempt }}
           path: dist/

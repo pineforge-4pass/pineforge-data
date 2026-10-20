@@ -125,6 +125,7 @@ jobs:
     needs: [authz, changes]
     if: >-
       !cancelled() &&
+      needs.authz.result == 'success' &&
       (github.event_name != 'pull_request' ||
        (needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))
     runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
@@ -148,6 +149,7 @@ jobs:
     needs: [authz, changes]
     if: >-
       !cancelled() &&
+      needs.authz.result == 'success' &&
       (github.event_name != 'pull_request' ||
        (needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))
     runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
@@ -206,6 +208,7 @@ jobs:
     needs: [authz, changes]
     if: >-
       !cancelled() &&
+      needs.authz.result == 'success' &&
       (github.event_name != 'pull_request' ||
        (needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))
     runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
@@ -228,6 +231,7 @@ jobs:
     needs: [authz, changes]
     if: >-
       !cancelled() &&
+      needs.authz.result == 'success' &&
       (github.event_name != 'pull_request' ||
        (needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))
     runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]

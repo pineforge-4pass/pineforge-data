@@ -78,7 +78,8 @@ CANONICAL_AUTHZ_ENV = {
     "GH_TOKEN": "${{ github.token }}",
     "ALLOWED_BOTS": "dependabot[bot] pineforge-app[bot]",
 }
-# Literal transcription of ci-labels.md 99de80f9, including its shell comments.
+# old: Literal transcription of ci-labels.md 99de80f9, including its shell comments.
+# Literal transcription of ci-labels.md d7ba0680, including its shell comments.
 # old: CANONICAL_AUTHZ_SCRIPT pinned only pull_request_target and HEAD_REPO.
 CANONICAL_AUTHZ_SCRIPT = (
     "set -eu\n"
@@ -118,8 +119,19 @@ CANONICAL_AUTHZ_SCRIPT = (
     "      *)\n"
     '        case " $ALLOWED_BOTS " in\n'
     '          *" $PR_AUTHOR "*) ;;\n'
-    '          *) fail "author ${PR_AUTHOR:-unknown} (${ASSOCIATION:-NONE}) '
-    'is not an owner, member, collaborator or allowlisted bot" ;;\n'
+    # old: '          *) fail "author ${PR_AUTHOR:-unknown} (${ASSOCIATION:-NONE}) '
+    # old: 'is not an owner, member, collaborator or allowlisted bot" ;;\n'
+    "          *)\n"
+    "            # A member whose org membership is private shows as CONTRIBUTOR: ask GitHub "
+    "for the\n"
+    "            # author's permission on this repository; anything but admin/maintain/write "
+    "(or a\n"
+    "            # failed call) refuses.\n"
+    '            perm=$(gh api "repos/$REPO/collaborators/$PR_AUTHOR/permission" '
+    "--jq .permission 2>/dev/null || echo none)\n"
+    '            case "$perm" in admin|maintain|write) ;; *) fail '
+    '"author ${PR_AUTHOR:-unknown} (${ASSOCIATION:-NONE}) has permission '
+    "'$perm', not write, and is not an allowlisted bot\" ;; esac ;;\n"
     "        esac ;;\n"
     "    esac ;;\n"
     '  *) fail "event $EVENT does not run CI '
@@ -766,6 +778,21 @@ AUTHZ_DECISIONS: dict[str, tuple[dict[str, str], int, str, bool]] = {
         for author in ("dependabot[bot]", "pineforge-app[bot]")
     },
     **{
+        f"pr-contributor-{permission}": (
+            authz_inputs(ASSOCIATION="CONTRIBUTOR", FAKE_GH_PERMISSION=permission),
+            0,
+            "",
+            True,
+        )
+        for permission in ("write", "admin", "maintain")
+    },
+    "pr-none-write": (
+        authz_inputs(ASSOCIATION="NONE", FAKE_GH_PERMISSION="write"),
+        0,
+        "",
+        True,
+    ),
+    **{
         event: (authz_inputs(event), 0, "", False)
         for event in (
             "push",
@@ -807,6 +834,27 @@ AUTHZ_DECISIONS: dict[str, tuple[dict[str, str], int, str, bool]] = {
         "pull request from a fork",
         False,
     ),
+    "pr-contributor-other-repository": (
+        authz_inputs(
+            HEAD_REPO="outsider/pineforge-data",
+            HEAD_IS_FORK="true",
+            ASSOCIATION="CONTRIBUTOR",
+            FAKE_GH_PERMISSION="write",
+        ),
+        1,
+        "pull request from another repository (outsider/pineforge-data)",
+        False,
+    ),
+    "pr-contributor-fork": (
+        authz_inputs(
+            HEAD_IS_FORK="true",
+            ASSOCIATION="CONTRIBUTOR",
+            FAKE_GH_PERMISSION="write",
+        ),
+        1,
+        "pull request from a fork",
+        False,
+    ),
     "pr-empty-head": (
         authz_inputs(HEAD_REPO=""),
         1,
@@ -817,18 +865,52 @@ AUTHZ_DECISIONS: dict[str, tuple[dict[str, str], int, str, bool]] = {
         f"pr-outsider-{association}": (
             authz_inputs(ASSOCIATION=association, PR_AUTHOR="outsider"),
             1,
-            f"author outsider ({association}) is not an owner, member, "
-            "collaborator or allowlisted bot",
-            False,
+            # old: f"author outsider ({association}) is not an owner, member, "
+            # old: "collaborator or allowlisted bot",
+            f"author outsider ({association}) has permission 'none', not write, "
+            "and is not an allowlisted bot",
+            # old: False,
+            True,
         )
         for association in ("NONE", "CONTRIBUTOR")
     },
     **{
+        f"pr-{association.lower()}-{permission}": (
+            authz_inputs(ASSOCIATION=association, FAKE_GH_PERMISSION=permission),
+            1,
+            f"author alice ({association}) has permission '{permission}', not write, "
+            "and is not an allowlisted bot",
+            True,
+        )
+        for association in ("NONE", "CONTRIBUTOR")
+        for permission in ("read", "triage")
+    },
+    "pr-lookup-fails": (
+        authz_inputs(
+            ASSOCIATION="CONTRIBUTOR", FAKE_GH_PERMISSION="write", FAKE_GH_FAIL="true"
+        ),
+        1,
+        "author alice (CONTRIBUTOR) has permission 'none', not write, "
+        "and is not an allowlisted bot",
+        True,
+    ),
+    "pr-lookup-empty": (
+        authz_inputs(ASSOCIATION="CONTRIBUTOR", FAKE_GH_PERMISSION=""),
+        1,
+        "author alice (CONTRIBUTOR) has permission '', not write, "
+        "and is not an allowlisted bot",
+        True,
+    ),
+    **{
         f"pr-unlisted-{author}": (
             authz_inputs(ASSOCIATION="NONE", PR_AUTHOR=author),
             1,
-            f"author {author} (NONE) is not an owner, member, collaborator or allowlisted bot",
-            False,
+            # old: f"author {author} (NONE) is not an owner, member, "
+            # old: "collaborator or allowlisted bot",
+            f"author {author} (NONE) has permission 'none', not write, "
+            "and is not an allowlisted bot",
+            # old: False,
+            True,
         )
         for author in (
             "github-actions[bot]",
@@ -898,12 +980,19 @@ set -eu
 printf '%s\n' "$@" >> "$FAKE_GH_CALLS"
 [ "$#" -eq 4 ] || exit 97
 [ "$1" = api ] || exit 97
-[ "$2" = "repos/$REPO/collaborators/$WR_ACTOR/permission" ] || exit 97
+# old: [ "$2" = "repos/$REPO/collaborators/$WR_ACTOR/permission" ] || exit 97
+case "$EVENT" in
+  pull_request) actor=$PR_AUTHOR ;;
+  workflow_run) actor=$WR_ACTOR ;;
+  *) exit 97 ;;
+esac
+[ "$2" = "repos/$REPO/collaborators/$actor/permission" ] || exit 97
 [ "$3" = --jq ] || exit 97
 [ "$4" = .permission ] || exit 97
 [ "$GH_TOKEN" = unit-test-token ] || exit 97
 printf '%s\n' validated >> "$FAKE_GH_CALLS"
 [ "$FAKE_GH_FAIL" = false ] || exit 1
+[ -n "$FAKE_GH_PERMISSION" ] || exit 0
 printf '%s\n' "$FAKE_GH_PERMISSION"
 """
 
@@ -943,10 +1032,12 @@ def run_authz(
         text=True,
         check=False,
     )
+    actor = inputs["PR_AUTHOR"] if inputs["EVENT"] == "pull_request" else inputs["WR_ACTOR"]
     expected_calls = (
         [
             "api",
-            f"repos/{inputs['REPO']}/collaborators/{inputs['WR_ACTOR']}/permission",
+            # old: f"repos/{inputs['REPO']}/collaborators/{inputs['WR_ACTOR']}/permission",
+            f"repos/{inputs['REPO']}/collaborators/{actor}/permission",
             "--jq",
             ".permission",
             "validated",
@@ -987,6 +1078,10 @@ def test_authz_executes_the_frozen_decision(tmp_path: Path, name: str, case: str
         "pr-fork-flag",
         "pr-empty-head",
         "pr-outsider-NONE",
+        "pr-outsider-CONTRIBUTOR",
+        "pr-contributor-read",
+        "pr-lookup-fails",
+        "pr-lookup-empty",
         "pr-unlisted-github-actions[bot]",
         "pull_request_target",
         "unknown_event",
@@ -1012,6 +1107,27 @@ def test_authz_decisions_depend_on_fail(tmp_path: Path, name: str, case: str) ->
 
 
 @pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
+@pytest.mark.parametrize("case", ["pr-none-read", "pr-contributor-read"])
+def test_authz_pr_decision_depends_on_write_permission(
+    tmp_path: Path, name: str, case: str
+) -> None:
+    inputs, expected_code, reason, lookup = AUTHZ_DECISIONS[case]
+    assert expected_code == 1
+    assert lookup
+    script = load(name)["jobs"]["authz"]["steps"][0]["run"]
+    prefix, separator, pr_arm = script.partition("  pull_request)\n")
+    assert separator
+    permissions = "admin|maintain|write)"
+    assert pr_arm.count(permissions) == 1
+    mutated = prefix + separator + pr_arm.replace(permissions, "admin|maintain|write|read)", 1)
+    assert mutated != script
+    original = run_authz(tmp_path / "original", name, inputs, lookup=lookup, script=script)
+    assert original == (1, f"authz: REFUSED: {reason}\n", f"::error title=authz::{reason}\n")
+    changed = run_authz(tmp_path / "mutated", name, inputs, lookup=lookup, script=mutated)
+    assert changed == (0, allowed_authz_summary(inputs), "")
+
+
+@pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
 def test_authz_decision_depends_on_the_exact_bot_allowlist(tmp_path: Path, name: str) -> None:
     inputs, expected_code, reason, lookup = AUTHZ_DECISIONS["pr-unlisted-github-actions[bot]"]
     assert expected_code == 1
@@ -1022,7 +1138,9 @@ def test_authz_decision_depends_on_the_exact_bot_allowlist(tmp_path: Path, name:
     assert mutated != script
     original = run_authz(tmp_path / "original", name, inputs, lookup=lookup, script=script)
     assert original == (1, f"authz: REFUSED: {reason}\n", f"::error title=authz::{reason}\n")
-    changed = run_authz(tmp_path / "mutated", name, inputs, lookup=lookup, script=mutated)
+    # old: changed = run_authz(tmp_path / "mutated", name, inputs,
+    # old:                     lookup=lookup, script=mutated)
+    changed = run_authz(tmp_path / "mutated", name, inputs, lookup=False, script=mutated)
     assert changed == (0, allowed_authz_summary(inputs), "")
 
 

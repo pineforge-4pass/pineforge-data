@@ -31,8 +31,11 @@ HOSTED_FALLBACK = "|| 'ubuntu-24.04' }}"
 POOL = "fromJSON('[\"self-hosted\",\"pf-ci\",\"pf-ci-x64\"]')"
 POOL_LABELS = ["self-hosted", "pf-ci", "pf-ci-x64"]
 MATRIX_RUNNERS = {
-    "ubuntu-24.04": "${{ fromJSON('[\"self-hosted\",\"pf-ci\",\"pf-ci-x64\"]') }}",
-    "ubuntu-24.04-arm": "${{ fromJSON('[\"self-hosted\",\"pf-ci\",\"pf-ci-arm64\"]') }}",
+    # old: "ubuntu-24.04": "${{ fromJSON('[\"self-hosted\",\"pf-ci\",\"pf-ci-x64\"]') }}",
+    "ubuntu-24.04": ["self-hosted", "pf-ci", "pf-ci-x64"],
+    # old: "ubuntu-24.04-arm": "${{ fromJSON('[\"self-hosted\",\"pf-ci\",\"pf-ci-arm64\"]') }}",
+    "ubuntu-24.04-arm": ["self-hosted", "pf-ci", "pf-ci-arm64"],
+    "macos-14": "macos-14",
 }
 # These expressions are rejection fixtures for the superseded hosted-fallback policy.
 OLD_ROUTE = (
@@ -63,14 +66,66 @@ RUNTIME_IF = (
     "(github.event_name != 'pull_request' || "
     "(needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))"
 )
+CANONICAL_AUTHZ_ENV = {
+    "EVENT": "${{ github.event_name }}",
+    "REPO": "${{ github.repository }}",
+    "HEAD_REPO": "${{ github.event.pull_request.head.repo.full_name }}",
+    "HEAD_IS_FORK": "${{ github.event.pull_request.head.repo.fork }}",
+    "ASSOCIATION": "${{ github.event.pull_request.author_association }}",
+    "PR_AUTHOR": "${{ github.event.pull_request.user.login }}",
+    "WR_HEAD_REPO": "${{ github.event.workflow_run.head_repository.full_name }}",
+    "WR_ACTOR": "${{ github.event.workflow_run.triggering_actor.login }}",
+    "GH_TOKEN": "${{ github.token }}",
+    "ALLOWED_BOTS": "dependabot[bot] pineforge-app[bot]",
+}
+# Literal transcription of ci-labels.md 99de80f9, including its shell comments.
+# old: CANONICAL_AUTHZ_SCRIPT pinned only pull_request_target and HEAD_REPO.
 CANONICAL_AUTHZ_SCRIPT = (
+    "set -eu\n"
+    'fail() { echo "::error title=authz::$1"; echo "authz: REFUSED: $1" '
+    '>> "$GITHUB_STEP_SUMMARY"; exit 1; }\n'
     'case "$EVENT" in\n'
-    '  pull_request_target) echo "::error::pull_request_target is not allowed for CI"; '
-    "exit 1 ;;\n"
-    '  pull_request) [ "$HEAD_REPO" = "$REPO" ] || { '
-    'echo "::error::fork pull requests do not run CI"; exit 1; } ;;\n'
+    "  push|workflow_dispatch|schedule|merge_group|release|workflow_call|repository_dispatch)\n"
+    "    # Only someone with write access to this repository (or our App's token) can cause these\n"
+    "    # events; none of them runs pull-request code.\n"
+    "    ;;\n"
+    "  workflow_run)\n"
+    "    # The pwn-request path: it runs in THIS repository with secrets even when "
+    "the triggering run\n"
+    "    # came from a fork. Refuse ALWAYS unless the triggering run's head is "
+    "this repository, and\n"
+    "    # apply the same identity rule to its triggering actor as to a pull-request author.\n"
+    '    [ "$WR_HEAD_REPO" = "$REPO" ] || fail '
+    '"workflow_run triggered from another repository (${WR_HEAD_REPO:-unknown})"\n'
+    '    case " $ALLOWED_BOTS " in\n'
+    '      *" $WR_ACTOR "*) ;;\n'
+    "      *)\n"
+    "        # No author_association exists on workflow_run: ask GitHub for the actor's "
+    "permission on\n"
+    "        # this repository; anything but admin/maintain/write (or a failed call) refuses.\n"
+    '        perm=$(gh api "repos/$REPO/collaborators/$WR_ACTOR/permission" '
+    "--jq .permission 2>/dev/null || echo none)\n"
+    '        case "$perm" in admin|maintain|write) ;; *) fail '
+    '"workflow_run triggering actor ${WR_ACTOR:-unknown} has permission '
+    "'$perm', not write\" ;; esac ;;\n"
+    "    esac ;;\n"
+    "  pull_request)\n"
+    '    [ "$HEAD_REPO" = "$REPO" ] || fail '
+    '"pull request from another repository (${HEAD_REPO:-unknown})"\n'
+    '    [ "$HEAD_IS_FORK" = "false" ] || fail "pull request from a fork"\n'
+    '    case "$ASSOCIATION" in\n'
+    "      OWNER|MEMBER|COLLABORATOR) ;;\n"
+    "      *)\n"
+    '        case " $ALLOWED_BOTS " in\n'
+    '          *" $PR_AUTHOR "*) ;;\n'
+    '          *) fail "author ${PR_AUTHOR:-unknown} (${ASSOCIATION:-NONE}) '
+    'is not an owner, member, collaborator or allowlisted bot" ;;\n'
+    "        esac ;;\n"
+    "    esac ;;\n"
+    '  *) fail "event $EVENT does not run CI '
+    '(pull_request_target and other events are not allowed)" ;;\n'
     "esac\n"
-    'echo "authz ok: $EVENT"\n'
+    'echo "authz: allowed ($EVENT${PR_AUTHOR:+ by $PR_AUTHOR})" >> "$GITHUB_STEP_SUMMARY"\n'
 )
 READY_AUTHZ_CHECK = (
     'if [ "$AUTHZ_RESULT" != "success" ]; then echo "authz: $AUTHZ_RESULT"; exit 1; fi'
@@ -93,13 +148,13 @@ def assert_native_release_matrix(matrix: dict[str, Any]) -> None:
     includes = matrix["include"]
     by_os = {entry["os"]: entry for entry in includes}
     assert len(by_os) == len(includes), "matrix includes must not override the same OS twice"
-    assert set(by_os) <= set(matrix["os"])
+    # old: assert set(by_os) <= set(matrix["os"])
+    assert set(by_os) == set(matrix["os"])
     for os_name in matrix["os"]:
-        entry = by_os.get(os_name, {})
-        if os_name == "macos-14":
-            assert "runner" not in entry
-        else:
-            assert entry.get("runner") == MATRIX_RUNNERS[os_name]
+        # old: entry = by_os.get(os_name, {})
+        # old: if os_name == "macos-14": assert "runner" not in entry
+        # old: else: assert entry.get("runner") == MATRIX_RUNNERS[os_name]
+        assert by_os[os_name].get("runner") == MATRIX_RUNNERS[os_name]
 
 
 def assert_runner_policy(workflow: dict[str, Any], name: str = "ci.yml") -> None:
@@ -107,7 +162,8 @@ def assert_runner_policy(workflow: dict[str, Any], name: str = "ci.yml") -> None
         if name == "docs.yml" and job_id == "deploy":
             assert job["runs-on"] == "ubuntu-latest"
         elif name == "native-feed.yml" and job_id == "release":
-            assert job["runs-on"] == "${{ matrix.runner || matrix.os }}"
+            # old: assert job["runs-on"] == "${{ matrix.runner || matrix.os }}"
+            assert job["runs-on"] == "${{ matrix.runner }}"
             assert_native_release_matrix(job["strategy"]["matrix"])
         else:
             assert job["runs-on"] == POOL_LABELS
@@ -139,6 +195,10 @@ def assert_permission_policy(workflow: dict[str, Any], name: str) -> None:
             assert job["permissions"] == {"pages": "write", "id-token": "write"}
             assert job["if"] == "github.event_name != 'pull_request'"
             assert job["environment"]["name"] == "github-pages"
+        elif job_id == "authz":
+            # BaseLoader preserves an empty YAML mapping as a Python dict.
+            # old: assert "permissions" not in job
+            assert job["permissions"] == {}
         else:
             # old (for authz): assert job.get("permissions") == {"contents": "read"}
             assert "permissions" not in job
@@ -159,24 +219,30 @@ def assert_authz_dependencies(workflow: dict[str, Any]) -> None:
             assert "authz" in needs(job)
 
 
+def normalized_authz_script(script: str) -> list[str]:
+    return [line.strip() for line in script.splitlines() if not line.lstrip().startswith("#")]
+
+
 def assert_canonical_authz(job: dict[str, Any]) -> None:
-    assert set(job) == {"runs-on", "steps"}
+    # old: assert set(job) == {"runs-on", "steps"}
+    assert set(job) == {"name", "runs-on", "permissions", "steps"}
+    assert job["name"] == "authz"
     assert job["runs-on"] == ["self-hosted", "pf-ci", "pf-ci-x64"]
+    assert job["permissions"] == {}
     assert_secret_references(job, set())
     steps = job["steps"]
     assert isinstance(steps, list)
-    assert len(steps) == 1, "authz is exactly the canonical same-repository check"
+    assert len(steps) == 1, "authz is exactly the frozen canonical decision"
     step = steps[0]
     assert set(step) == {"name", "env", "run"}
-    assert step["name"] == "Same-repository pull requests only"
-    assert step["env"] == {
-        "EVENT": "${{ github.event_name }}",
-        "HEAD_REPO": "${{ github.event.pull_request.head.repo.full_name }}",
-        "REPO": "${{ github.repository }}",
-    }
+    # old: assert step["name"] == "Same-repository pull requests only"
+    assert step["name"] == "Only our own pull requests and our own events run CI"
+    # old: env pinned EVENT, HEAD_REPO and REPO only.
+    assert step["env"] == CANONICAL_AUTHZ_ENV
     script = step["run"]
     assert isinstance(script, str)
-    assert " ".join(script.split()) == " ".join(CANONICAL_AUTHZ_SCRIPT.split())
+    # old: assert " ".join(script.split()) == " ".join(CANONICAL_AUTHZ_SCRIPT.split())
+    assert normalized_authz_script(script) == normalized_authz_script(CANONICAL_AUTHZ_SCRIPT)
 
 
 def assert_ready_authz(job: dict[str, Any]) -> None:
@@ -246,6 +312,8 @@ def test_each_pool_job_rejects_expression_or_hosted_routes(name: str, route: str
         ("docs.yml", "deploy", "ubuntu-24.04"),
         ("native-feed.yml", "release", POOL_LABELS),
         ("native-feed.yml", "release", "ubuntu-24.04"),
+        ("native-feed.yml", "release", "${{ matrix.runner || matrix.os }}"),
+        ("native-feed.yml", "release", "${{ matrix.runner || 'ubuntu-24.04' }}"),
     ],
 )
 def test_runner_exceptions_reject_other_routes(name: str, job_id: str, route: Any) -> None:
@@ -256,7 +324,8 @@ def test_runner_exceptions_reject_other_routes(name: str, job_id: str, route: An
         assert_runner_policy(workflow, name)
 
 
-def test_native_release_matrix_uses_only_the_two_linux_pools() -> None:
+# old: def test_native_release_matrix_uses_only_the_two_linux_pools() -> None:
+def test_native_release_matrix_pins_every_runner_and_the_macos_exception() -> None:
     assert_native_release_matrix(load("native-feed.yml")["jobs"]["release"]["strategy"]["matrix"])
 
 
@@ -265,21 +334,31 @@ def test_native_release_matrix_uses_only_the_two_linux_pools() -> None:
     [
         ("ubuntu-24.04", GUARDED_ROUTE),
         ("ubuntu-24.04", "ubuntu-24.04"),
+        ("ubuntu-24.04", "macos-14"),
+        ("ubuntu-24.04", MATRIX_RUNNERS["ubuntu-24.04-arm"]),
+        ("ubuntu-24.04", "${{ " + POOL + " }}"),
         ("ubuntu-24.04-arm", "ubuntu-24.04-arm"),
+        ("ubuntu-24.04-arm", "macos-14"),
         ("ubuntu-24.04-arm", MATRIX_RUNNERS["ubuntu-24.04"]),
+        (
+            "ubuntu-24.04-arm",
+            "${{ fromJSON('[\"self-hosted\",\"pf-ci\",\"pf-ci-arm64\"]') }}",
+        ),
         ("macos-14", MATRIX_RUNNERS["ubuntu-24.04"]),
+        ("macos-14", MATRIX_RUNNERS["ubuntu-24.04-arm"]),
+        ("macos-14", "ubuntu-24.04"),
     ],
 )
 def test_native_release_matrix_rejects_fallbacks_and_wrong_pools(
-    os_name: str, runner: str
+    os_name: str, runner: Any
 ) -> None:
-    matrix = copy.deepcopy(load("native-feed.yml")["jobs"]["release"]["strategy"]["matrix"])
-    assert_native_release_matrix(matrix)
-    if os_name == "macos-14":
-        matrix["include"].append({"os": os_name, "runner": runner})
-    else:
-        entry = next(entry for entry in matrix["include"] if entry["os"] == os_name)
-        entry["runner"] = runner
+    original = load("native-feed.yml")["jobs"]["release"]["strategy"]["matrix"]
+    assert_native_release_matrix(original)
+    matrix = copy.deepcopy(original)
+    # old: matrix["include"].append({"os": os_name, "runner": runner}) for macos-14.
+    entry = next(entry for entry in matrix["include"] if entry["os"] == os_name)
+    entry["runner"] = runner
+    assert matrix != original
     with pytest.raises(AssertionError):
         assert_native_release_matrix(matrix)
 
@@ -301,6 +380,26 @@ def test_native_release_matrix_rejects_missing_or_extra_legs(fault: str) -> None
         matrix["include"].append(dict(matrix["include"][0]))
     else:
         matrix["include"].append({"os": "windows-latest", "runner": "windows-latest"})
+    with pytest.raises(AssertionError):
+        assert_native_release_matrix(matrix)
+
+
+@pytest.mark.parametrize("os_name", list(MATRIX_RUNNERS))
+@pytest.mark.parametrize("fault", ["missing-include", "missing-runner", "duplicate-include"])
+def test_native_release_matrix_rejects_incomplete_or_duplicate_includes(
+    os_name: str, fault: str
+) -> None:
+    original = load("native-feed.yml")["jobs"]["release"]["strategy"]["matrix"]
+    assert_native_release_matrix(original)
+    matrix = copy.deepcopy(original)
+    entry = next(entry for entry in matrix["include"] if entry["os"] == os_name)
+    if fault == "missing-include":
+        matrix["include"].remove(entry)
+    elif fault == "missing-runner":
+        del entry["runner"]
+    else:
+        matrix["include"].append(dict(entry))
+    assert matrix != original
     with pytest.raises(AssertionError):
         assert_native_release_matrix(matrix)
 
@@ -450,30 +549,50 @@ def test_authz_rejects_weakened_repository_comparisons(name: str, comparison: st
 @pytest.mark.parametrize(
     "old,new",
     [
+        # old: 'pull_request_target) echo "..."; exit 1 ;;' was a separate branch.
         (
-            'pull_request_target) echo "::error::pull_request_target is not allowed for CI"; '
-            "exit 1 ;;",
-            "",
+            '*) fail "event $EVENT does not run CI '
+            '(pull_request_target and other events are not allowed)" ;;',
+            "*) ;;",
         ),
         (
-            'pull_request_target) echo "::error::pull_request_target is not allowed for CI"; '
-            "exit 1 ;;",
+            '*) fail "event $EVENT does not run CI '
+            '(pull_request_target and other events are not allowed)" ;;',
             "pull_request_target) exit 0 ;;",
         ),
-        ("; exit 1 ;;", " ;;"),
-        ("] || {", "] && {"),
-        ("exit 1; } ;;", "} ;;"),
-        ("exit 1; } ;;", "exit 0; } ;;"),
-        ("] || {", "] || true || {"),
+        # old: ('; exit 1 ;;', ' ;;') and ('exit 1; } ;;', '} ;;').
+        ("; exit 1; }", "; }"),
+        # old: ("] || {", "] && {").
+        ("] || fail", "] && fail"),
+        ("exit 1; }", "return 0; }"),
+        ("exit 1; }", "exit 0; }"),
+        # old: ("] || {", "] || true || {").
+        ("] || fail", "] || true || fail"),
+        ("set -eu", "set -u"),
+        ('[ "$HEAD_IS_FORK" = "false" ]', '[ "$HEAD_IS_FORK" != "true" ]'),
+        ('[ "$WR_HEAD_REPO" = "$REPO" ]', '[ "$WR_HEAD_REPO" != "$REPO" ]'),
+        ("OWNER|MEMBER|COLLABORATOR)", "OWNER|MEMBER|COLLABORATOR|CONTRIBUTOR)"),
+        ("admin|maintain|write)", "admin|maintain|write|read)"),
+        ('*" $PR_AUTHOR "*)', '*"$PR_AUTHOR"*)'),
+        ('*" $WR_ACTOR "*)', '*"$WR_ACTOR"*)'),
+        ("2>/dev/null || echo none)", "2>/dev/null || echo write)"),
     ],
     ids=[
         "missing-target-rejection",
         "target-success",
-        "target-exit-dropped",
+        "fail-exit-dropped",
         "and-instead-of-or",
-        "fork-exit-dropped",
-        "fork-exit-zero",
+        "fail-returns-success",
+        "fail-exits-zero",
         "or-true",
+        "no-errexit",
+        "fork-not-exactly-false",
+        "workflow-run-head-reversed",
+        "contributor-allowed",
+        "read-permission-allowed",
+        "pr-bot-substring",
+        "workflow-run-bot-substring",
+        "failed-lookup-allowed",
     ],
 )
 def test_authz_rejects_canonical_script_regressions(name: str, old: str, new: str) -> None:
@@ -491,12 +610,24 @@ def test_authz_rejects_canonical_script_regressions(name: str, old: str, new: st
 
 
 @pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
-@pytest.mark.parametrize("key", ["EVENT", "HEAD_REPO", "REPO"])
+@pytest.mark.parametrize("key", list(CANONICAL_AUTHZ_ENV))
 def test_authz_rejects_missing_canonical_env(name: str, key: str) -> None:
     original = load(name)["jobs"]["authz"]
     assert_canonical_authz(original)
     job = copy.deepcopy(original)
     del job["steps"][0]["env"][key]
+    assert job != original
+    with pytest.raises(AssertionError):
+        assert_canonical_authz(job)
+
+
+@pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
+@pytest.mark.parametrize("key", ["name", "runs-on", "permissions", "steps"])
+def test_authz_rejects_missing_canonical_job_keys(name: str, key: str) -> None:
+    original = load(name)["jobs"]["authz"]
+    assert_canonical_authz(original)
+    job = copy.deepcopy(original)
+    del job[key]
     assert job != original
     with pytest.raises(AssertionError):
         assert_canonical_authz(job)
@@ -511,6 +642,10 @@ def test_authz_rejects_missing_canonical_env(name: str, key: str) -> None:
         ("job", "needs", "build"),
         ("job", "permissions", {"contents": "read"}),
         ("job", "permissions", {"contents": "write"}),
+        ("job", "permissions", {"contents": "none"}),
+        ("job", "permissions", "{}"),
+        ("job", "permissions", []),
+        ("job", "permissions", None),
         ("job", "timeout-minutes", "5"),
         ("job", "continue-on-error", "true"),
         ("step", "name", "Authorize CI"),
@@ -523,8 +658,16 @@ def test_authz_rejects_missing_canonical_env(name: str, key: str) -> None:
         ("env", "HEAD_REPO", "${{ github.event.pull_request.head.repo.fork }}"),
         ("env", "HEAD_REPO", "${{ github.repository }}"),
         ("env", "REPO", "${{ github.event.pull_request.head.repo.full_name }}"),
+        ("env", "HEAD_IS_FORK", "${{ github.event.repository.fork }}"),
+        ("env", "ASSOCIATION", "${{ github.actor }}"),
+        ("env", "PR_AUTHOR", "${{ github.actor }}"),
+        ("env", "WR_HEAD_REPO", "${{ github.repository }}"),
+        ("env", "WR_ACTOR", "${{ github.actor }}"),
         ("env", "GH_TOKEN", "${{ secrets.GITHUB_TOKEN }}"),
         ("env", "GH_TOKEN", "unused"),
+        ("env", "ALLOWED_BOTS", "dependabot[bot] pineforge-app[bot] github-actions[bot]"),
+        ("env", "ALLOWED_BOTS", "dependabot* pineforge-app*"),
+        ("env", "ALLOWED_BOTS", "dependabot[bot]"),
         ("env", "EXTRA", "unused"),
     ],
 )
@@ -558,7 +701,8 @@ def test_authz_rejects_noncanonical_step_counts(name: str, fault: str) -> None:
 
 @pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
 @pytest.mark.parametrize(
-    "route", ["ubuntu-24.04", ["ubuntu-24.04"], MATRIX_RUNNERS["ubuntu-24.04"]]
+    # old: the expression fixture was MATRIX_RUNNERS["ubuntu-24.04"].
+    "route", ["ubuntu-24.04", ["ubuntu-24.04"], "${{ " + POOL + " }}"]
 )
 def test_authz_rejects_hosted_or_expression_runners(name: str, route: Any) -> None:
     original = load(name)["jobs"]["authz"]
@@ -568,6 +712,318 @@ def test_authz_rejects_hosted_or_expression_runners(name: str, route: Any) -> No
     assert job != original
     with pytest.raises(AssertionError):
         assert_canonical_authz(job)
+
+
+AUTHZ_REPO = "pineforge/pineforge-data"
+
+
+def authz_inputs(event: str = "pull_request", **overrides: str) -> dict[str, str]:
+    inputs = {
+        "EVENT": event,
+        "REPO": AUTHZ_REPO,
+        "HEAD_REPO": "",
+        "HEAD_IS_FORK": "",
+        "ASSOCIATION": "",
+        "PR_AUTHOR": "",
+        "WR_HEAD_REPO": "",
+        "WR_ACTOR": "",
+        "GH_TOKEN": "unit-test-token",
+        "ALLOWED_BOTS": "dependabot[bot] pineforge-app[bot]",
+        "FAKE_GH_PERMISSION": "none",
+        "FAKE_GH_FAIL": "false",
+    }
+    if event == "pull_request":
+        inputs.update(
+            HEAD_REPO=AUTHZ_REPO,
+            HEAD_IS_FORK="false",
+            ASSOCIATION="MEMBER",
+            PR_AUTHOR="alice",
+        )
+    elif event == "workflow_run":
+        inputs.update(WR_HEAD_REPO=AUTHZ_REPO, WR_ACTOR="alice")
+    return {**inputs, **overrides}
+
+
+# Each row is (environment, exit code, refusal reason, permission lookup expected).
+# Refusal reasons are literal expectations, independent of the workflow being executed.
+AUTHZ_DECISIONS: dict[str, tuple[dict[str, str], int, str, bool]] = {
+    **{
+        f"pr-{association.lower()}": (
+            authz_inputs(ASSOCIATION=association),
+            0,
+            "",
+            False,
+        )
+        for association in ("MEMBER", "OWNER", "COLLABORATOR")
+    },
+    **{
+        f"pr-{author}": (
+            authz_inputs(ASSOCIATION="NONE", PR_AUTHOR=author),
+            0,
+            "",
+            False,
+        )
+        for author in ("dependabot[bot]", "pineforge-app[bot]")
+    },
+    **{
+        event: (authz_inputs(event), 0, "", False)
+        for event in (
+            "push",
+            "workflow_dispatch",
+            "schedule",
+            "merge_group",
+            "release",
+            "workflow_call",
+            "repository_dispatch",
+        )
+    },
+    **{
+        f"workflow-run-{actor}": (
+            authz_inputs("workflow_run", WR_ACTOR=actor),
+            0,
+            "",
+            False,
+        )
+        for actor in ("dependabot[bot]", "pineforge-app[bot]")
+    },
+    **{
+        f"workflow-run-{permission}": (
+            authz_inputs("workflow_run", FAKE_GH_PERMISSION=permission),
+            0,
+            "",
+            True,
+        )
+        for permission in ("write", "admin", "maintain")
+    },
+    "pr-other-repository": (
+        authz_inputs(HEAD_REPO="outsider/pineforge-data", HEAD_IS_FORK="true"),
+        1,
+        "pull request from another repository (outsider/pineforge-data)",
+        False,
+    ),
+    "pr-fork-flag": (
+        authz_inputs(HEAD_IS_FORK="true"),
+        1,
+        "pull request from a fork",
+        False,
+    ),
+    "pr-empty-head": (
+        authz_inputs(HEAD_REPO=""),
+        1,
+        "pull request from another repository (unknown)",
+        False,
+    ),
+    **{
+        f"pr-outsider-{association}": (
+            authz_inputs(ASSOCIATION=association, PR_AUTHOR="outsider"),
+            1,
+            f"author outsider ({association}) is not an owner, member, "
+            "collaborator or allowlisted bot",
+            False,
+        )
+        for association in ("NONE", "CONTRIBUTOR")
+    },
+    **{
+        f"pr-unlisted-{author}": (
+            authz_inputs(ASSOCIATION="NONE", PR_AUTHOR=author),
+            1,
+            f"author {author} (NONE) is not an owner, member, collaborator or allowlisted bot",
+            False,
+        )
+        for author in (
+            "github-actions[bot]",
+            "renovate[bot]",
+            "pineforge-app",
+            "pineforge-app[bot]x",
+            "xpineforge-app[bot]",
+            "dependabot",
+            "dependabot[bot]x",
+        )
+    },
+    **{
+        event: (
+            authz_inputs(event),
+            1,
+            f"event {event} does not run CI "
+            "(pull_request_target and other events are not allowed)",
+            False,
+        )
+        for event in ("pull_request_target", "unknown_event")
+    },
+    "workflow-run-other-repository": (
+        authz_inputs(
+            "workflow_run",
+            WR_HEAD_REPO="outsider/pineforge-data",
+            FAKE_GH_PERMISSION="write",
+        ),
+        1,
+        "workflow_run triggered from another repository (outsider/pineforge-data)",
+        False,
+    ),
+    "workflow-run-fork-bot": (
+        authz_inputs(
+            "workflow_run",
+            WR_HEAD_REPO="outsider/pineforge-data",
+            WR_ACTOR="dependabot[bot]",
+        ),
+        1,
+        "workflow_run triggered from another repository (outsider/pineforge-data)",
+        False,
+    ),
+    "workflow-run-empty-head": (
+        authz_inputs("workflow_run", WR_HEAD_REPO="", FAKE_GH_PERMISSION="write"),
+        1,
+        "workflow_run triggered from another repository (unknown)",
+        False,
+    ),
+    **{
+        f"workflow-run-{permission}": (
+            authz_inputs("workflow_run", FAKE_GH_PERMISSION=permission),
+            1,
+            f"workflow_run triggering actor alice has permission '{permission}', not write",
+            True,
+        )
+        for permission in ("read", "triage", "none")
+    },
+    "workflow-run-lookup-fails": (
+        authz_inputs("workflow_run", FAKE_GH_PERMISSION="write", FAKE_GH_FAIL="true"),
+        1,
+        "workflow_run triggering actor alice has permission 'none', not write",
+        True,
+    ),
+}
+
+FAKE_AUTHZ_GH = r"""#!/bin/bash
+set -eu
+printf '%s\n' "$@" >> "$FAKE_GH_CALLS"
+[ "$#" -eq 4 ] || exit 97
+[ "$1" = api ] || exit 97
+[ "$2" = "repos/$REPO/collaborators/$WR_ACTOR/permission" ] || exit 97
+[ "$3" = --jq ] || exit 97
+[ "$4" = .permission ] || exit 97
+[ "$GH_TOKEN" = unit-test-token ] || exit 97
+printf '%s\n' validated >> "$FAKE_GH_CALLS"
+[ "$FAKE_GH_FAIL" = false ] || exit 1
+printf '%s\n' "$FAKE_GH_PERMISSION"
+"""
+
+
+def run_authz(
+    tmp_path: Path,
+    name: str,
+    inputs: dict[str, str],
+    *,
+    lookup: bool,
+    script: str | None = None,
+) -> tuple[int, str, str]:
+    """Execute the workflow's decision with no inherited environment or real gh."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(FAKE_AUTHZ_GH)
+    gh.chmod(0o700)
+    summary = tmp_path / "summary"
+    summary.write_text("")
+    calls = tmp_path / "gh-calls"
+    calls.write_text("")
+    if script is None:
+        script = load(name)["jobs"]["authz"]["steps"][0]["run"]
+    completed = subprocess.run(
+        ["/bin/bash", "-c", script],
+        cwd=tmp_path,
+        env={
+            **inputs,
+            # The stub is the only PATH entry; both scripts use shell builtins.
+            "PATH": str(bin_dir),
+            "GITHUB_STEP_SUMMARY": str(summary),
+            "FAKE_GH_CALLS": str(calls),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    expected_calls = (
+        [
+            "api",
+            f"repos/{inputs['REPO']}/collaborators/{inputs['WR_ACTOR']}/permission",
+            "--jq",
+            ".permission",
+            "validated",
+        ]
+        if lookup
+        else []
+    )
+    assert calls.read_text().splitlines() == expected_calls
+    assert completed.stderr == ""
+    return completed.returncode, summary.read_text(), completed.stdout
+
+
+def allowed_authz_summary(inputs: dict[str, str]) -> str:
+    author = f" by {inputs['PR_AUTHOR']}" if inputs["PR_AUTHOR"] else ""
+    return f"authz: allowed ({inputs['EVENT']}{author})\n"
+
+
+@pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
+@pytest.mark.parametrize("case", list(AUTHZ_DECISIONS))
+def test_authz_executes_the_frozen_decision(tmp_path: Path, name: str, case: str) -> None:
+    inputs, expected_code, reason, lookup = AUTHZ_DECISIONS[case]
+    returncode, summary, output = run_authz(tmp_path, name, inputs, lookup=lookup)
+    assert returncode == expected_code
+    if expected_code == 1:
+        assert summary == f"authz: REFUSED: {reason}\n"
+        assert output == f"::error title=authz::{reason}\n"
+    else:
+        assert reason == ""
+        assert summary == allowed_authz_summary(inputs)
+        assert output == ""
+
+
+@pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
+@pytest.mark.parametrize(
+    "case",
+    [
+        "pr-other-repository",
+        "pr-fork-flag",
+        "pr-empty-head",
+        "pr-outsider-NONE",
+        "pr-unlisted-github-actions[bot]",
+        "pull_request_target",
+        "unknown_event",
+        "workflow-run-fork-bot",
+        "workflow-run-read",
+        "workflow-run-lookup-fails",
+    ],
+)
+def test_authz_decisions_depend_on_fail(tmp_path: Path, name: str, case: str) -> None:
+    inputs, expected_code, reason, lookup = AUTHZ_DECISIONS[case]
+    assert expected_code == 1
+    script = load(name)["jobs"]["authz"]["steps"][0]["run"]
+    fail_definition = CANONICAL_AUTHZ_SCRIPT.splitlines()[1]
+    assert script.count(fail_definition) == 1
+    mutated = script.replace(fail_definition, "fail() { :; }", 1)
+    assert mutated != script
+    assert fail_definition not in mutated
+    assert "fail() { :; }" in mutated
+    original = run_authz(tmp_path / "original", name, inputs, lookup=lookup, script=script)
+    assert original == (1, f"authz: REFUSED: {reason}\n", f"::error title=authz::{reason}\n")
+    changed = run_authz(tmp_path / "mutated", name, inputs, lookup=lookup, script=mutated)
+    assert changed == (0, allowed_authz_summary(inputs), "")
+
+
+@pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
+def test_authz_decision_depends_on_the_exact_bot_allowlist(tmp_path: Path, name: str) -> None:
+    inputs, expected_code, reason, lookup = AUTHZ_DECISIONS["pr-unlisted-github-actions[bot]"]
+    assert expected_code == 1
+    script = load(name)["jobs"]["authz"]["steps"][0]["run"]
+    mutated = (
+        'ALLOWED_BOTS="dependabot[bot] pineforge-app[bot] github-actions[bot]"\n' + script
+    )
+    assert mutated != script
+    original = run_authz(tmp_path / "original", name, inputs, lookup=lookup, script=script)
+    assert original == (1, f"authz: REFUSED: {reason}\n", f"::error title=authz::{reason}\n")
+    changed = run_authz(tmp_path / "mutated", name, inputs, lookup=lookup, script=mutated)
+    assert changed == (0, allowed_authz_summary(inputs), "")
 
 
 def assert_docs_only_policy(jobs: dict[str, Any]) -> None:
@@ -710,13 +1166,16 @@ def test_an_aggregate_that_a_cancelled_run_can_skip_is_rejected(fault: str) -> N
 
 
 @pytest.mark.parametrize(
-    "fault", ["always", "no-refusal", "refusal-not-first", "unguarded-checkout"]
+    # old: "always" wrote "always()" back unchanged after the canon was frozen.
+    "fault", ["cancelled-only", "no-refusal", "refusal-not-first", "unguarded-checkout"]
 )
 def test_always_job_rejects_missing_first_refusal_or_unguarded_repo_code(fault: str) -> None:
-    job = copy.deepcopy(load("ci.yml")["jobs"]["ready"])
-    assert_always_job_refuses_first(job)
-    if fault == "always":
-        job["if"] = "always()"
+    original = load("ci.yml")["jobs"]["ready"]
+    assert_always_job_refuses_first(original)
+    job = copy.deepcopy(original)
+    if fault == "cancelled-only":
+        # old: job["if"] = "always()"
+        job["if"] = "${{ !cancelled() }}"
     elif fault == "no-refusal":
         del job["steps"][0]
     elif fault == "refusal-not-first":
@@ -724,6 +1183,7 @@ def test_always_job_rejects_missing_first_refusal_or_unguarded_repo_code(fault: 
     else:
         checkout = next(s for s in job["steps"] if "actions/checkout" in s.get("uses", ""))
         checkout["if"] = "steps.gate.outputs.evidence == 'true'"
+    assert job != original
     with pytest.raises(AssertionError):
         assert_always_job_refuses_first(job)
 

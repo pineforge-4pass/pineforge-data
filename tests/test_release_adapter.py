@@ -961,6 +961,7 @@ def test_completed_receipt_replay_does_not_dispatch_or_publish(
 
 def assert_pull_request_filter_policy(workflow: dict[str, Any], name: str) -> None:
     assert "pull_request" in workflow["on"]
+    assert "pull_request_target" not in workflow["on"]
     pull_request = workflow["on"]["pull_request"]
     if name == "native-feed.yml":
         assert isinstance(pull_request, dict)
@@ -980,6 +981,17 @@ def assert_pull_request_filter_policy(workflow: dict[str, Any], name: str) -> No
 def test_pull_request_trigger_filters_match_authz_roles(name: str) -> None:
     workflow = yaml.load((ROOT / ".github/workflows" / name).read_text(), Loader=yaml.BaseLoader)
     assert_pull_request_filter_policy(workflow, name)
+
+
+@pytest.mark.parametrize("name", ["ci.yml", "docs.yml", "native-feed.yml"])
+def test_pr_tier_triggers_reject_pull_request_target(name: str) -> None:
+    original = yaml.load((ROOT / ".github/workflows" / name).read_text(), Loader=yaml.BaseLoader)
+    assert_pull_request_filter_policy(original, name)
+    workflow = copy.deepcopy(original)
+    workflow["on"]["pull_request_target"] = ""
+    assert workflow != original
+    with pytest.raises(AssertionError):
+        assert_pull_request_filter_policy(workflow, name)
 
 
 @pytest.mark.parametrize("name", ["ci.yml", "docs.yml"])
@@ -1041,11 +1053,17 @@ def test_workflows_keep_every_gate_ahead_of_oidc_publication() -> None:
     workflows = ROOT / ".github/workflows"
     ci = yaml.load((workflows / "ci.yml").read_text(), Loader=yaml.BaseLoader)
     assert ci["jobs"]["test"]["strategy"]["matrix"]["python-version"] == ["3.11", "3.12", "3.13"]
+    ready_job = ci["jobs"]["ready"]
     # old: assert set(ci["jobs"]["ready"]["needs"]) == evidence.NEEDS | {"changes"}
-    assert_ready_dependencies(ci["jobs"]["ready"])
-    # old: assert ci["jobs"]["ready"]["if"] == "always()"  (#830 made it "${{ !cancelled() }}", reverted)
-    assert ci["jobs"]["ready"]["if"] == "always()"
-    assert ci["jobs"]["ready"]["name"] == "release/ready"
+    assert_ready_dependencies(ready_job)
+    # old: #830 temporarily required "${{ !cancelled() }}"; the frozen canon reverts it.
+    assert ready_job["if"] == "always()"
+    assert ready_job["name"] == "release/ready"
+    assert ready_job["steps"][0] == {
+        "name": "authz must have passed",
+        "if": "needs.authz.result != 'success'",
+        "run": "exit 1",
+    }
     for job, suite, enabled in (
         ("docker", "docker", "PINEFORGE_DOCKER_TEST=1"),
         ("database-e2e", "database", None),

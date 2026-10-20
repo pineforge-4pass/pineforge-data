@@ -167,7 +167,7 @@ def assert_native_release_matrix(matrix: dict[str, Any]) -> None:
 def assert_runner_policy(workflow: dict[str, Any], name: str = "ci.yml") -> None:
     for job_id, job in workflow["jobs"].items():
         if name == "docs.yml" and job_id == "deploy":
-            assert job["runs-on"] == "ubuntu-latest"
+            assert job["runs-on"] == ["self-hosted", "pf-ci", "pf-ci-release"]
         elif name == "native-feed.yml" and job_id == "release":
             # old: assert job["runs-on"] == "${{ matrix.runner || matrix.os }}"
             assert job["runs-on"] == "${{ matrix.runner }}"

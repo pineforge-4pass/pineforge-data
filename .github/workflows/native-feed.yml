@@ -100,7 +100,6 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
-    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - name: Linux prerequisites
@@ -128,7 +127,6 @@ jobs:
     runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
-    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - run: sudo apt-get update && sudo apt-get install -y ninja-build libssl-dev clang-18
@@ -151,7 +149,6 @@ jobs:
     runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
-    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - run: sudo apt-get update && sudo apt-get install -y ninja-build libssl-dev clang-18 llvm-18

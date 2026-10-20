@@ -231,10 +231,6 @@ def assert_authz_dependencies(workflow: dict[str, Any]) -> None:
             assert "authz" in needs(job)
 
 
-def normalized_authz_script(script: str) -> list[str]:
-    return [line.strip() for line in script.splitlines() if not line.lstrip().startswith("#")]
-
-
 def assert_canonical_authz(job: dict[str, Any]) -> None:
     # old: assert set(job) == {"runs-on", "steps"}
     assert set(job) == {"name", "runs-on", "permissions", "steps"}
@@ -253,8 +249,10 @@ def assert_canonical_authz(job: dict[str, Any]) -> None:
     assert step["env"] == CANONICAL_AUTHZ_ENV
     script = step["run"]
     assert isinstance(script, str)
-    # old: assert " ".join(script.split()) == " ".join(CANONICAL_AUTHZ_SCRIPT.split())
-    assert normalized_authz_script(script) == normalized_authz_script(CANONICAL_AUTHZ_SCRIPT)
+    # Line by line (newlines are shell syntax), comments included: the canon says "copy as is".
+    assert [line.strip() for line in script.strip().splitlines()] == [
+        line.strip() for line in CANONICAL_AUTHZ_SCRIPT.strip().splitlines()
+    ]
 
 
 def assert_ready_authz(job: dict[str, Any]) -> None:

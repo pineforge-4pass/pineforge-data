@@ -267,7 +267,7 @@ jobs:
 
   ready:
     name: release/ready
-    if: always()
+    if: ${{ !cancelled() }}
     needs: [authz, changes, test, contract, docker, database-e2e, distribution]
     runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
     env:

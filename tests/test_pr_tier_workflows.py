@@ -18,6 +18,8 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github/workflows"
 PR_TIER_WORKFLOWS = ("ci.yml", "docs.yml", "native-feed.yml")
 RUNTIME_JOBS = ("docker", "database-e2e", "contract", "distribution")
+# ci-labels.md #830: the aggregate job runs unless the run was cancelled (never `always()`).
+AGGREGATE_IF = "${{ !cancelled() }}"
 
 HOSTED_GUARD = (
     "${{ github.event_name != 'pull_request' && "
@@ -582,7 +584,9 @@ def assert_docs_only_policy(jobs: dict[str, Any]) -> None:
         assert " ".join(jobs[name]["if"].split()) == RUNTIME_IF
     # old: assert set(jobs["ready"]["needs"]) == {"changes", "test", *RUNTIME_JOBS}
     assert set(jobs["ready"]["needs"]) == {"authz", "changes", "test", *RUNTIME_JOBS}
-    assert jobs["ready"]["if"] == "always()"
+    # old: assert jobs["ready"]["if"] == "always()"
+    # ci-labels.md #830: the aggregate uses !cancelled() so a superseded run never blocks the head.
+    assert jobs["ready"]["if"] == AGGREGATE_IF
     assert jobs["ready"]["name"] == "release/ready"
 
 
@@ -642,8 +646,9 @@ REFUSE_STEP = {
 
 
 def assert_always_job_refuses_first(job: dict[str, Any]) -> None:
-    """ci-labels.md rule 3a for a job with `if: always()` that needs authz."""
-    assert job["if"] == "always()"
+    """ci-labels.md rule 3a for an aggregate job (status function) that needs authz."""
+    # old: assert job["if"] == "always()"
+    assert job["if"] == AGGREGATE_IF
     assert "authz" in needs(job)
     steps = job["steps"]
     assert steps[0] == REFUSE_STEP, "the refusal is the FIRST step, before any checkout"
@@ -666,11 +671,21 @@ def test_always_jobs_refuse_a_failed_authz_before_any_repo_code() -> None:
                 assert "needs.authz.result == 'success'" in condition, (workflow, job_id)
 
 
-@pytest.mark.parametrize("fault", ["no-refusal", "refusal-not-first", "unguarded-checkout"])
+@pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
+def test_no_job_uses_always_so_a_superseded_run_never_blocks_the_head(name: str) -> None:
+    for job_id, job in load(name)["jobs"].items():
+        assert "always()" not in job.get("if", ""), (name, job_id)
+
+
+@pytest.mark.parametrize(
+    "fault", ["always", "no-refusal", "refusal-not-first", "unguarded-checkout"]
+)
 def test_always_job_rejects_missing_first_refusal_or_unguarded_repo_code(fault: str) -> None:
     job = copy.deepcopy(load("ci.yml")["jobs"]["ready"])
     assert_always_job_refuses_first(job)
-    if fault == "no-refusal":
+    if fault == "always":
+        job["if"] = "always()"
+    elif fault == "no-refusal":
         del job["steps"][0]
     elif fault == "refusal-not-first":
         job["steps"].insert(1, job["steps"].pop(0))

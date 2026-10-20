@@ -89,7 +89,6 @@ jobs:
     needs: authz
     if: github.event_name == 'pull_request'
     runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
-    timeout-minutes: 5
     outputs:
       code: ${{ steps.paths.outputs.code }}
     steps:

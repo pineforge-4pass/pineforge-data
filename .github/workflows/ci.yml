@@ -11,8 +11,8 @@ permissions:
 
 # Only a superseded pull_request run is cancelled: every other event (push to main,
 # whose run authorizes publication) gets its own run_id group and is never cancelled.
-# Pull requests (same-repo, fork, dependabot) run on GitHub-hosted ubuntu-24.04 only;
-# push keeps the pool. Docs-only PRs skip the four runtime jobs (docker, database-e2e,
+# Every job runs on the pf-ci pool (plain labels, no hosted fallback); dependabot counts as ours.
+# Fork PRs fail authz. Docs-only PRs skip the four runtime jobs (docker, database-e2e,
 # contract, distribution); the Python matrix always runs because tests/test_documentation.py
 # checks the links in README.md, CONTRIBUTING.md and docs/. release/ready then accepts
 # those four as skipped and writes no release evidence; release PRs change code, so the
@@ -22,9 +22,48 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  authz:
+    name: authz
+    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    steps:
+      - shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.triggering_actor }}
+          REPO: ${{ github.repository }}
+          FORK_PR: >-
+            ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') &&
+                (github.event.pull_request.head.repo.full_name != github.repository || github.event.pull_request.head.repo.fork != false) }}
+        run: |
+          set -euo pipefail
+          if [ "$FORK_PR" = "true" ]; then
+            echo "::error::Actor '$ACTOR' permission '<not checked>': fork pull requests are not authorized."
+            exit 1
+          fi
+          if [ "$ACTOR" = 'dependabot[bot]' ]; then
+            echo "Authorized dependabot[bot]."
+            exit 0
+          fi
+          if ! perm=$(gh api "repos/${REPO}/collaborators/${ACTOR}/permission" --jq '.permission'); then
+            echo "::error::Actor '$ACTOR' permission '<unavailable>': collaborator permission API request failed."
+            exit 1
+          fi
+          if [ -z "$perm" ]; then
+            echo "::error::Actor '$ACTOR' permission '<empty>': collaborator permission API returned no permission."
+            exit 1
+          fi
+          case "$perm" in
+            admin|maintain|write) exit 0 ;;
+            *) echo "::error::Actor '$ACTOR' permission '$perm': write access is required."; exit 1 ;;
+          esac
+
   changes:
+    needs: authz
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
     timeout-minutes: 5
     outputs:
       code: ${{ steps.paths.outputs.code }}
@@ -50,13 +89,8 @@ jobs:
 
   test:
     name: Python ${{ matrix.python-version }}
-    runs-on: >-
-      ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' &&
-          github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
-          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
-          (github.event_name != 'pull_request' ||
-           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
-          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
+    needs: authz
+    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     strategy:
@@ -88,18 +122,12 @@ jobs:
 
   docker:
     name: Docker runtime
-    needs: changes
+    needs: [authz, changes]
     if: >-
       !cancelled() &&
       (github.event_name != 'pull_request' ||
        (needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))
-    runs-on: >-
-      ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' &&
-          github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
-          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
-          (github.event_name != 'pull_request' ||
-           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
-          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
+    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     steps:
@@ -117,18 +145,12 @@ jobs:
 
   database-e2e:
     name: Database E2E
-    needs: changes
+    needs: [authz, changes]
     if: >-
       !cancelled() &&
       (github.event_name != 'pull_request' ||
        (needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))
-    runs-on: >-
-      ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' &&
-          github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
-          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
-          (github.event_name != 'pull_request' ||
-           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
-          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
+    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
     services:
       mysql:
         image: mysql:8.4
@@ -181,18 +203,12 @@ jobs:
 
   contract:
     name: Release contract
-    needs: changes
+    needs: [authz, changes]
     if: >-
       !cancelled() &&
       (github.event_name != 'pull_request' ||
        (needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))
-    runs-on: >-
-      ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' &&
-          github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
-          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
-          (github.event_name != 'pull_request' ||
-           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
-          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
+    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     steps:
@@ -209,18 +225,12 @@ jobs:
 
   distribution:
     name: Distribution
-    needs: changes
+    needs: [authz, changes]
     if: >-
       !cancelled() &&
       (github.event_name != 'pull_request' ||
        (needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))
-    runs-on: >-
-      ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' &&
-          github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
-          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
-          (github.event_name != 'pull_request' ||
-           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
-          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
+    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     steps:
@@ -277,20 +287,15 @@ jobs:
   ready:
     name: release/ready
     if: always()
-    needs: [changes, test, contract, docker, database-e2e, distribution]
-    runs-on: >-
-      ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' &&
-          github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
-          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
-          (github.event_name != 'pull_request' ||
-           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
-          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
+    needs: [authz, changes, test, contract, docker, database-e2e, distribution]
+    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     steps:
       - name: Require the path decision and every expected job result
         id: gate
         env:
+          AUTHZ_RESULT: ${{ needs.authz.result }}
           EVENT_NAME: ${{ github.event_name }}
           CHANGES_RESULT: ${{ needs.changes.result }}
           CODE_CHANGED: ${{ needs.changes.outputs.code }}
@@ -299,6 +304,7 @@ jobs:
             ${{ needs.contract.result }} ${{ needs.docker.result }}
             ${{ needs.database-e2e.result }} ${{ needs.distribution.result }}
         run: |
+          if [ "$AUTHZ_RESULT" != "success" ]; then echo "authz: $AUTHZ_RESULT"; exit 1; fi
           evidence=true
           if [ "$EVENT_NAME" = pull_request ]; then
             if [ "$CHANGES_RESULT" != success ]; then

@@ -12,28 +12,63 @@ permissions:
   contents: read
 
 # Only a superseded pull_request run is cancelled; push and dispatch are never cancelled.
-# Pull requests run on GitHub-hosted runners only (ubuntu-24.04, ubuntu-24.04-arm, macos-14);
-# push and dispatch keep the pool for the Linux x64 jobs.
+# authz, asan-ubsan, tsan and the Linux release legs run on the pf-ci pool (x64 and arm64 labels, no hosted fallback).
+# Fork PRs fail authz; only macos-14 stays on GitHub.
 concurrency:
   group: native-feed-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  authz:
+    name: authz
+    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    steps:
+      - shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.triggering_actor }}
+          REPO: ${{ github.repository }}
+          FORK_PR: >-
+            ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') &&
+                (github.event.pull_request.head.repo.full_name != github.repository || github.event.pull_request.head.repo.fork != false) }}
+        run: |
+          set -euo pipefail
+          if [ "$FORK_PR" = "true" ]; then
+            echo "::error::Actor '$ACTOR' permission '<not checked>': fork pull requests are not authorized."
+            exit 1
+          fi
+          if [ "$ACTOR" = 'dependabot[bot]' ]; then
+            echo "Authorized dependabot[bot]."
+            exit 0
+          fi
+          if ! perm=$(gh api "repos/${REPO}/collaborators/${ACTOR}/permission" --jq '.permission'); then
+            echo "::error::Actor '$ACTOR' permission '<unavailable>': collaborator permission API request failed."
+            exit 1
+          fi
+          if [ -z "$perm" ]; then
+            echo "::error::Actor '$ACTOR' permission '<empty>': collaborator permission API returned no permission."
+            exit 1
+          fi
+          case "$perm" in
+            admin|maintain|write) exit 0 ;;
+            *) echo "::error::Actor '$ACTOR' permission '$perm': write access is required."; exit 1 ;;
+          esac
+
   release:
     name: Release (${{ matrix.os }})
+    needs: authz
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14]
         include:
           - os: ubuntu-24.04
-            runner: >-
-              ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' &&
-                  github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
-                  contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
-                  (github.event_name != 'pull_request' ||
-                   (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
-                  fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
+            runner: ${{ fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') }}
+          - os: ubuntu-24.04-arm
+            runner: ${{ fromJSON('["self-hosted","pf-ci","pf-ci-arm64"]') }}
     runs-on: ${{ matrix.runner || matrix.os }}
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
@@ -61,13 +96,8 @@ jobs:
 
   asan-ubsan:
     name: ASan + UBSan
-    runs-on: >-
-      ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' &&
-          github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
-          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
-          (github.event_name != 'pull_request' ||
-           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
-          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
+    needs: authz
+    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     timeout-minutes: 30
@@ -89,13 +119,8 @@ jobs:
 
   tsan:
     name: TSan
-    runs-on: >-
-      ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' &&
-          github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
-          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
-          (github.event_name != 'pull_request' ||
-           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
-          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
+    needs: authz
+    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     timeout-minutes: 30

@@ -10,20 +10,53 @@ permissions:
   contents: read
 
 # Only a superseded pull_request run is cancelled; a push to main (Pages deploy) and a
-# dispatch are never cancelled. Pull requests run on a GitHub-hosted runner.
+# dispatch are never cancelled. authz and build run on the pf-ci pool (plain labels, no hosted fallback); fork PRs fail authz.
 concurrency:
   group: pages-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  authz:
+    name: authz
+    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    steps:
+      - shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.triggering_actor }}
+          REPO: ${{ github.repository }}
+          FORK_PR: >-
+            ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') &&
+                (github.event.pull_request.head.repo.full_name != github.repository || github.event.pull_request.head.repo.fork != false) }}
+        run: |
+          set -euo pipefail
+          if [ "$FORK_PR" = "true" ]; then
+            echo "::error::Actor '$ACTOR' permission '<not checked>': fork pull requests are not authorized."
+            exit 1
+          fi
+          if [ "$ACTOR" = 'dependabot[bot]' ]; then
+            echo "Authorized dependabot[bot]."
+            exit 0
+          fi
+          if ! perm=$(gh api "repos/${REPO}/collaborators/${ACTOR}/permission" --jq '.permission'); then
+            echo "::error::Actor '$ACTOR' permission '<unavailable>': collaborator permission API request failed."
+            exit 1
+          fi
+          if [ -z "$perm" ]; then
+            echo "::error::Actor '$ACTOR' permission '<empty>': collaborator permission API returned no permission."
+            exit 1
+          fi
+          case "$perm" in
+            admin|maintain|write) exit 0 ;;
+            *) echo "::error::Actor '$ACTOR' permission '$perm': write access is required."; exit 1 ;;
+          esac
+
   build:
-    runs-on: >-
-      ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' &&
-          github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
-          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
-          (github.event_name != 'pull_request' ||
-           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
-          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
+    needs: authz
+    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     steps:
@@ -44,7 +77,7 @@ jobs:
 
   deploy:
     if: github.event_name != 'pull_request'
-    needs: build
+    needs: [authz, build]
     runs-on: ubuntu-latest
     environment:
       name: github-pages

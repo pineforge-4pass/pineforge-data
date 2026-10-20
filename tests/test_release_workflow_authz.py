@@ -19,7 +19,6 @@ ALLOWED_BOTS = "dependabot[bot] pineforge-app[bot]"
 AUTHZ_PASSED = "needs.authz.result == 'success'"
 AUTHZ_REFUSED = "needs.authz.result != 'success'"
 
-# old: Literal transcription of ci-labels.md, frozen sha 99de80f9, lines 53-109.
 # Literal transcription of ci-labels.md, frozen sha d7ba0680, lines 53-114.
 # Full-line comments are omitted; adjacent literals only split long source lines.
 CANON_SCRIPT = (
@@ -51,8 +50,6 @@ CANON_SCRIPT = (
     '      *)\n'
     '        case " $ALLOWED_BOTS " in\n'
     '          *" $PR_AUTHOR "*) ;;\n'
-    # old: '          *) fail "author ${PR_AUTHOR:-unknown} (${ASSOCIATION:-NONE}) '
-    # old: 'is not an owner, member, collaborator or allowlisted bot" ;;\n'
     '          *)\n'
     '            perm=$(gh api "repos/$REPO/collaborators/$PR_AUTHOR/permission" '
     '--jq .permission 2>/dev/null || echo none)\n'

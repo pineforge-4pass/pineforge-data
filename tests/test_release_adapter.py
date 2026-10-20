@@ -978,7 +978,13 @@ def test_workflows_keep_every_gate_ahead_of_oidc_publication() -> None:
             assert ci["jobs"][job]["env"]["PINEFORGE_DATABASE_E2E"] == "1"
     release = yaml.load((workflows / "release.yml").read_text(), Loader=yaml.BaseLoader)
     assert release["on"]["workflow_run"]["workflows"] == ["CI"]
-    assert set(release["jobs"]["publish"]["needs"]) == {"prepare", "build", "github-release"}
+    # old: assert set(release["jobs"]["publish"]["needs"]) == {"prepare", "build", "github-release"}
+    assert set(release["jobs"]["publish"]["needs"]) == {
+        "authz",
+        "prepare",
+        "build",
+        "github-release",
+    }
     steps = release["jobs"]["publish"]["steps"]
     preflight = next(i for i, step in enumerate(steps) if "preflight" in step.get("run", ""))
     publish = next(i for i, step in enumerate(steps) if step.get("uses", "").startswith("pypa/"))

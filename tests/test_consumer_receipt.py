@@ -954,4 +954,8 @@ def test_automatic_triggers_wait_for_a_configured_chain():
         "(github.event_name != 'schedule' && github.event_name != 'workflow_run')) &&"
     )
     report_if = coordinator["jobs"]["report"]["if"]
-    assert report_if == "always() && needs.reconcile.result != 'skipped'"
+    # old: assert report_if == "always() && needs.reconcile.result != 'skipped'"
+    # The report job (a reusable-workflow call, secrets: inherit) must not run when authz failed.
+    assert report_if == (
+        "always() && needs.authz.result == 'success' && needs.reconcile.result != 'skipped'"
+    )

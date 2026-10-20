@@ -460,11 +460,12 @@ jobs:
         with:
           python-version: '3.13'
       - uses: actions/download-artifact@v6
+        if: needs.authz.result == 'success'
         with:
           name: validated-release-bundle-${{ github.run_attempt }}
           path: bundle/
       - uses: actions/download-artifact@v6
-        if: needs.prepare.outputs.has_target == 'true'
+        if: needs.authz.result == 'success' && needs.prepare.outputs.has_target == 'true'
         with:
           name: release-stage-${{ github.run_attempt }}-30-github
           path: report/

@@ -1050,6 +1050,14 @@ def test_workflows_keep_every_gate_ahead_of_oidc_publication() -> None:
         ("docker", "docker", "PINEFORGE_DOCKER_TEST=1"),
         ("database-e2e", "database", None),
     ):
+        steps = ci["jobs"][job]["steps"]
+        assert steps[0] == {
+            "name": "authz must have passed",
+            "if": "needs.authz.result != 'success'",
+            "run": "exit 1",
+        }
+        assert steps[1]["uses"] == "actions/checkout@v7"
+        assert steps[1]["if"] == "needs.authz.result == 'success'"
         commands = "\n".join(step.get("run", "") for step in ci["jobs"][job]["steps"])
         assert f"--suite {suite}" in commands
         if enabled:

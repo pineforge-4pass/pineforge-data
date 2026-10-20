@@ -109,14 +109,21 @@ jobs:
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     steps:
+      - name: authz must have passed
+        if: needs.authz.result != 'success'
+        run: exit 1
       - uses: actions/checkout@v7
+        if: needs.authz.result == 'success'
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
           cache: pip
       - run: python -m pip install -e '.[dev]'
+        if: needs.authz.result == 'success'
       - run: PINEFORGE_DOCKER_TEST=1 pytest tests/test_docker_integration.py --junitxml=docker.xml
+        if: needs.authz.result == 'success'
       - name: Require every real runtime test with zero skips
+        if: needs.authz.result == 'success'
         env:
           PYTHONPATH: scripts
         run: python -m release_chain.evidence junit --suite docker --path docker.xml
@@ -167,15 +174,23 @@ jobs:
       PINEFORGE_MYSQL_URL: mysql+pymysql://pineforge:pineforge@127.0.0.1:3306/pineforge
       PINEFORGE_POSTGRES_URL: postgresql+psycopg://pineforge:pineforge@127.0.0.1:5432/pineforge
     steps:
+      - name: authz must have passed
+        if: needs.authz.result != 'success'
+        run: exit 1
       - uses: actions/checkout@v7
+        if: needs.authz.result == 'success'
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
           cache: pip
       - run: python -m pip install --upgrade pip
+        if: needs.authz.result == 'success'
       - run: python -m pip install -e '.[dev,database-e2e]'
+        if: needs.authz.result == 'success'
       - run: pytest tests/test_database_e2e.py --junitxml=database.xml
+        if: needs.authz.result == 'success'
       - name: Require the disposable database E2E inventory with zero skips
+        if: needs.authz.result == 'success'
         env:
           PYTHONPATH: scripts
         run: python -m release_chain.evidence junit --suite database --path database.xml
@@ -192,13 +207,18 @@ jobs:
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     steps:
+      - name: authz must have passed
+        if: needs.authz.result != 'success'
+        run: exit 1
       - uses: actions/checkout@v7
+        if: needs.authz.result == 'success'
         with:
           persist-credentials: false
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
       - name: Verify synchronized defaults, immutable manifest, source, facts and both OCI children
+        if: needs.authz.result == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
         run: python scripts/release_adapter.py local
@@ -215,7 +235,11 @@ jobs:
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     steps:
+      - name: authz must have passed
+        if: needs.authz.result != 'success'
+        run: exit 1
       - uses: actions/checkout@v7
+        if: needs.authz.result == 'success'
         with:
           persist-credentials: false
       - uses: actions/setup-python@v6
@@ -223,17 +247,23 @@ jobs:
           python-version: '3.13'
           cache: pip
       - run: python -m pip install -e '.[release]'
+        if: needs.authz.result == 'success'
       - name: Set reproducible archive timestamps
+        if: needs.authz.result == 'success'
         run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
       - run: python -m build
+        if: needs.authz.result == 'success'
       - run: python -m twine check --strict dist/*
+        if: needs.authz.result == 'success'
       - name: The canonical sdist does not ship the native feed
+        if: needs.authz.result == 'success'
         run: |
           if tar -tzf dist/*.tar.gz | grep -E '^[^/]+/native/'; then
             echo "native/ must stay out of the Python sdist" >&2
             exit 1
           fi
       - name: Install and backtest both built distributions without importing checkout source
+        if: needs.authz.result == 'success'
         env:
           PYTHONPATH: scripts
         run: |
@@ -278,6 +308,7 @@ jobs:
         run: exit 1
       - name: Require the path decision and every expected job result
         id: gate
+        if: needs.authz.result == 'success'
         env:
           AUTHZ_RESULT: ${{ needs.authz.result }}
           EVENT_NAME: ${{ github.event_name }}

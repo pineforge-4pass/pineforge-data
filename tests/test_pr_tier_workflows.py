@@ -645,25 +645,37 @@ REFUSE_STEP = {
 }
 
 
-def assert_always_job_refuses_first(job: dict[str, Any]) -> None:
-    """ci-labels.md rule 3a for an aggregate job (status function) that needs authz."""
-    # old: assert job["if"] == "always()"
-    assert job["if"] == AGGREGATE_IF
+def assert_always_job_refuses_first(job: dict[str, Any], *, runtime: bool = False) -> None:
+    """ci-labels.md rule 3a for a job with a status function that needs authz."""
+    # old: assert job["if"] == AGGREGATE_IF
+    if runtime:
+        assert " ".join(job["if"].split()) == RUNTIME_IF
+    else:
+        # old: assert job["if"] == "always()"
+        assert job["if"] == AGGREGATE_IF
     assert "authz" in needs(job)
     steps = job["steps"]
     assert steps[0] == REFUSE_STEP, "the refusal is the FIRST step, before any checkout"
     for step in steps[1:]:
-        uses_repo = "actions/checkout" in step.get("uses", "") or "run" in step
-        if uses_repo and step.get("id") != "gate":
+        # old: uses_repo = "actions/checkout" in step.get("uses", "") or "run" in step
+        uses_repo = (
+            "actions/checkout" in step.get("uses", "")
+            or step.get("uses", "").startswith("./")
+            or "run" in step
+        )
+        # old: if uses_repo and step.get("id") != "gate":
+        # old:     assert "needs.authz.result == 'success'" in step.get("if", ""), step
+        if uses_repo:
             assert "needs.authz.result == 'success'" in step.get("if", ""), step
 
 
 def test_always_jobs_refuse_a_failed_authz_before_any_repo_code() -> None:
     ci = load("ci.yml")["jobs"]
     assert_always_job_refuses_first(ci["ready"])
-    # The four runtime jobs use !cancelled(); their own if requires a successful authz.
+    # Status functions require the refusal and step guards even with a job-level authz check.
     for name in RUNTIME_JOBS:
         assert "needs.authz.result == 'success'" in ci[name]["if"]
+        assert_always_job_refuses_first(ci[name], runtime=True)
     for workflow in ("ci.yml", "docs.yml", "native-feed.yml"):
         for job_id, job in load(workflow)["jobs"].items():
             condition = job.get("if", "")
@@ -708,6 +720,23 @@ def test_always_job_rejects_missing_first_refusal_or_unguarded_repo_code(fault: 
         checkout["if"] = "steps.gate.outputs.evidence == 'true'"
     with pytest.raises(AssertionError):
         assert_always_job_refuses_first(job)
+
+
+@pytest.mark.parametrize("job_id", [*RUNTIME_JOBS, "ready"])
+@pytest.mark.parametrize("fault", ["no-refusal", "unguarded-run"])
+def test_status_jobs_reject_missing_refusal_or_unguarded_run(job_id: str, fault: str) -> None:
+    original = load("ci.yml")["jobs"][job_id]
+    runtime = job_id in RUNTIME_JOBS
+    assert_always_job_refuses_first(original, runtime=runtime)
+    job = copy.deepcopy(original)
+    if fault == "no-refusal":
+        del job["steps"][0]
+    else:
+        run = next(step for step in job["steps"][1:] if "run" in step)
+        del run["if"]
+    assert job != original
+    with pytest.raises(AssertionError):
+        assert_always_job_refuses_first(job, runtime=runtime)
 
 
 def git(repo: Path, *args: str) -> str:

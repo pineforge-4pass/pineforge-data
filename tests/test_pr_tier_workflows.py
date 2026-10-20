@@ -59,18 +59,14 @@ RUNTIME_IF = (
     "(github.event_name != 'pull_request' || "
     "(needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))"
 )
-FORK_TEST = 'if [ "$FORK_PR" = "true" ]; then'
-BOT_TEST = (
-    'if [ "$ACTOR" = \'dependabot[bot]\' ] || [ "$ACTOR" = \'pineforge-app[bot]\' ]; then'
-)
-PERMISSION_API = (
-    'if ! perm=$(gh api "repos/${REPO}/collaborators/${ACTOR}/permission" '
-    "--jq '.permission'); then"
-)
-FORK_PR_ENV = (
-    "${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && "
-    "(github.event.pull_request.head.repo.full_name != github.repository || "
-    "github.event.pull_request.head.repo.fork != false) }}"
+CANONICAL_AUTHZ_SCRIPT = (
+    'case "$EVENT" in\n'
+    '  pull_request_target) echo "::error::pull_request_target is not allowed for CI"; '
+    "exit 1 ;;\n"
+    '  pull_request) [ "$HEAD_REPO" = "$REPO" ] || { '
+    'echo "::error::fork pull requests do not run CI"; exit 1; } ;;\n'
+    "esac\n"
+    'echo "authz ok: $EVENT"\n'
 )
 READY_AUTHZ_CHECK = (
     'if [ "$AUTHZ_RESULT" != "success" ]; then echo "authz: $AUTHZ_RESULT"; exit 1; fi'
@@ -132,22 +128,15 @@ def assert_secret_references(value: Any, allowed: set[str]) -> None:
 
 def assert_permission_policy(workflow: dict[str, Any], name: str) -> None:
     assert set(workflow["permissions"].values()) == {"read"}
-    # old: assert "secrets." not in (WORKFLOWS / name).read_text()
-    for key, value in workflow.items():
-        if key != "jobs":
-            assert_secret_references(value, set())
+    # old: allowed = {"secrets.GITHUB_TOKEN"} if job_id == "authz" else set()
+    assert_secret_references(workflow, set())
     for job_id, job in workflow["jobs"].items():
-        allowed = {"secrets.GITHUB_TOKEN"} if job_id == "authz" else set()
-        assert_secret_references(job, allowed)
-        # old: assert job_id == "deploy"
-        # The old restriction applied whenever a job had its own permissions.
-        if job_id == "authz":
-            assert job.get("permissions") == {"contents": "read"}
-        elif name == "docs.yml" and job_id == "deploy":
+        if name == "docs.yml" and job_id == "deploy":
             assert job["permissions"] == {"pages": "write", "id-token": "write"}
             assert job["if"] == "github.event_name != 'pull_request'"
             assert job["environment"]["name"] == "github-pages"
         else:
+            # old (for authz): assert job.get("permissions") == {"contents": "read"}
             assert "permissions" not in job
 
 
@@ -166,55 +155,24 @@ def assert_authz_dependencies(workflow: dict[str, Any]) -> None:
             assert "authz" in needs(job)
 
 
-def assert_authz_branch(lines: list[str], condition: str, result: str) -> tuple[int, int]:
-    assert condition in lines
-    start = lines.index(condition)
-    assert "fi" in lines[start + 1 :]
-    end = lines.index("fi", start + 1)
-    body = lines[start + 1 : end]
-    assert len(body) == 2, "each identity branch reports its decision, then exits"
-    assert re.fullmatch(r'echo "[^"]*"', body[0]) is not None
-    assert body[1] == f"exit {result}"
-    return start, end
-
-
-def assert_authz_identity(job: dict[str, Any]) -> None:
-    assert "if" not in job
-    assert "continue-on-error" not in job
+def assert_canonical_authz(job: dict[str, Any]) -> None:
+    assert set(job) == {"runs-on", "steps"}
+    assert job["runs-on"] == ["self-hosted", "pf-ci", "pf-ci-x64"]
+    assert_secret_references(job, set())
     steps = job["steps"]
-    for step in steps:
-        assert "${{" not in step.get("run", "")
-    assert len(steps) == 1, "authz is one bash identity check"
+    assert isinstance(steps, list)
+    assert len(steps) == 1, "authz is exactly the canonical same-repository check"
     step = steps[0]
-    assert step["shell"] == "bash"
-    assert "if" not in step
-    assert "continue-on-error" not in step
-    env = step["env"]
-    assert env["GH_TOKEN"] == "${{ secrets.GITHUB_TOKEN }}"
-    assert env["ACTOR"] == "${{ github.triggering_actor }}"
-    assert env["REPO"] == "${{ github.repository }}"
-    assert "FORK_PR" in env
-    assert " ".join(env["FORK_PR"].split()) == FORK_PR_ENV
+    assert set(step) == {"name", "env", "run"}
+    assert step["name"] == "Same-repository pull requests only"
+    assert step["env"] == {
+        "EVENT": "${{ github.event_name }}",
+        "HEAD_REPO": "${{ github.event.pull_request.head.repo.full_name }}",
+        "REPO": "${{ github.repository }}",
+    }
     script = step["run"]
-    assert "=~" not in script
-    lines = [line.strip() for line in script.splitlines() if line.strip()]
-    assert lines[0] == "set -euo pipefail"
-    fork_start, fork_end = assert_authz_branch(lines, FORK_TEST, "1")
-    bot_start, bot_end = assert_authz_branch(lines, BOT_TEST, "0")
-    assert "*" not in lines[bot_start]
-    assert "case" not in lines[bot_start]
-    api_start, api_end = assert_authz_branch(lines, PERMISSION_API, "1")
-    empty_start, empty_end = assert_authz_branch(lines, 'if [ -z "$perm" ]; then', "1")
-    assert fork_start == 1, "fork rejection precedes every identity shortcut"
-    assert bot_start == fork_end + 1
-    assert api_start == bot_end + 1
-    assert empty_start == api_end + 1
-    permission_case = lines[empty_end + 1 :]
-    assert len(permission_case) == 4
-    assert permission_case[0] == 'case "$perm" in'
-    assert permission_case[1] == "admin|maintain|write) exit 0 ;;"
-    assert re.fullmatch(r'\*\) echo "[^"]*"; exit 1 ;;', permission_case[2]) is not None
-    assert permission_case[3] == "esac"
+    assert isinstance(script, str)
+    assert " ".join(script.split()) == " ".join(CANONICAL_AUTHZ_SCRIPT.split())
 
 
 def assert_ready_authz(job: dict[str, Any]) -> None:
@@ -367,6 +325,7 @@ def test_unconditional_cancellation_is_rejected() -> None:
 def test_pull_request_jobs_hold_no_secret_and_no_write_scope(name: str) -> None:
     workflow = load(name)
     # old: assert "secrets." not in (WORKFLOWS / name).read_text()
+    assert "secrets." not in (WORKFLOWS / name).read_text()
     # old: assert set(workflow["permissions"].values()) == {"read"}
     # old: assert job_id == "deploy"
     # old: assert job["if"] == "github.event_name != 'pull_request'"
@@ -378,7 +337,9 @@ def test_pull_request_jobs_hold_no_secret_and_no_write_scope(name: str) -> None:
     "job_id,key,value",
     [
         ("authz", "permissions", {"contents": "write"}),
+        ("authz", "permissions", {"contents": "read"}),
         ("authz", "permissions", {"contents": "read", "actions": "read"}),
+        ("authz", "env", {"TOKEN": "${{ secrets.GITHUB_TOKEN }}"}),
         ("authz", "env", {"TOKEN": "${{ secrets.OTHER_TOKEN }}"}),
         ("authz", "env", {"TOKEN": "${{ secrets.GITHUB_TOKEN_EXTRA }}"}),
         ("authz", "env", {"TOKEN": "${{ secrets['GITHUB_TOKEN'] }}"}),
@@ -391,9 +352,11 @@ def test_pull_request_jobs_hold_no_secret_and_no_write_scope(name: str) -> None:
 def test_secret_and_permission_policy_rejects_unauthorized_scope(
     name: str, job_id: str, key: str, value: Any
 ) -> None:
-    workflow = copy.deepcopy(load(name))
-    assert_permission_policy(workflow, name)
+    original = load(name)
+    assert_permission_policy(original, name)
+    workflow = copy.deepcopy(original)
     workflow["jobs"].setdefault(job_id, {})[key] = value
+    assert workflow != original
     with pytest.raises(AssertionError):
         assert_permission_policy(workflow, name)
 
@@ -451,142 +414,156 @@ def test_missing_authz_dependencies_and_authz_prerequisites_are_rejected(name: s
 
 
 @pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
-def test_authz_checks_exact_bots_then_collaborator_permissions(name: str) -> None:
-    assert_authz_identity(load(name)["jobs"]["authz"])
+def test_authz_matches_the_canonical_same_repository_job(name: str) -> None:
+    assert_canonical_authz(load(name)["jobs"]["authz"])
 
 
 @pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
 @pytest.mark.parametrize(
-    "login",
+    "comparison",
     [
-        "github-actions[bot]",
-        "pineforge-app",
-        "pineforge-app[bot]x",
-        "xpineforge-app[bot]",
-        "dependabot",
-        "dependabot[bot]x",
-        "xdependabot[bot]",
+        '[ "$HEAD_REPO" != "$REPO" ]',
+        '[[ "$HEAD_REPO" =~ "$REPO" ]]',
+        '[[ "$HEAD_REPO" == "$REPO"* ]]',
+        '[[ "$HEAD_REPO" == * ]]',
     ],
+    ids=["not-equal", "regex", "prefix", "glob"],
 )
-def test_authz_rejects_additional_or_lookalike_bot_shortcuts(name: str, login: str) -> None:
-    job = copy.deepcopy(load(name)["jobs"]["authz"])
-    assert_authz_identity(job)
+def test_authz_rejects_weakened_repository_comparisons(name: str, comparison: str) -> None:
+    original = load(name)["jobs"]["authz"]
+    assert_canonical_authz(original)
+    job = copy.deepcopy(original)
     script = job["steps"][0]["run"]
-    assert BOT_TEST in script
-    broader_test = BOT_TEST.removesuffix("; then") + f' || [ "$ACTOR" = \'{login}\' ]; then'
-    job["steps"][0]["run"] = script.replace(BOT_TEST, broader_test)
+    exact_comparison = '[ "$HEAD_REPO" = "$REPO" ]'
+    assert exact_comparison in script
+    job["steps"][0]["run"] = script.replace(exact_comparison, comparison)
+    assert job != original
     with pytest.raises(AssertionError):
-        assert_authz_identity(job)
-
-
-@pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
-@pytest.mark.parametrize(
-    "shortcut",
-    [
-        'if [[ "$ACTOR" == dependabot* || "$ACTOR" == pineforge-app* ]]; then\n'
-        'echo "Authorized bot ${ACTOR}."\nexit 0\nfi',
-        'if [[ "$ACTOR" =~ dependabot || "$ACTOR" =~ pineforge-app ]]; then\n'
-        'echo "Authorized bot ${ACTOR}."\nexit 0\nfi',
-        'case "$ACTOR" in\ndependabot*|pineforge-app*) exit 0 ;;\nesac',
-    ],
-    ids=["glob", "regex", "case-glob"],
-)
-def test_authz_rejects_pattern_bot_shortcuts(name: str, shortcut: str) -> None:
-    job = copy.deepcopy(load(name)["jobs"]["authz"])
-    assert_authz_identity(job)
-    lines = [line.strip() for line in job["steps"][0]["run"].splitlines()]
-    start = lines.index(BOT_TEST)
-    end = lines.index("fi", start)
-    job["steps"][0]["run"] = "\n".join([*lines[:start], shortcut, *lines[end + 1 :]])
-    with pytest.raises(AssertionError):
-        assert_authz_identity(job)
+        assert_canonical_authz(job)
 
 
 @pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
 @pytest.mark.parametrize(
     "old,new",
     [
-        ("set -euo pipefail", "set -eu"),
-        (PERMISSION_API, PERMISSION_API.replace("if ! ", "if ")),
-        ("collaborators/${ACTOR}/permission", "collaborators/permission"),
         (
-            'exit 1\nfi\nif [ -z "$perm" ]; then',
-            'exit 0\nfi\nif [ -z "$perm" ]; then',
+            'pull_request_target) echo "::error::pull_request_target is not allowed for CI"; '
+            "exit 1 ;;",
+            "",
         ),
-        ('if [ -z "$perm" ]; then', 'if [ -n "$perm" ]; then'),
-        ('exit 1\nfi\ncase "$perm" in', 'exit 0\nfi\ncase "$perm" in'),
-        ("admin|maintain|write) exit 0 ;;", "admin|maintain|write|read) exit 0 ;;"),
-        ("; exit 1 ;;", "; exit 0 ;;"),
-        ("Authorized bot ${ACTOR}.", "Authorized bot ${{ github.actor }}."),
+        (
+            'pull_request_target) echo "::error::pull_request_target is not allowed for CI"; '
+            "exit 1 ;;",
+            "pull_request_target) exit 0 ;;",
+        ),
+        ("; exit 1 ;;", " ;;"),
+        ("] || {", "] && {"),
+        ("exit 1; } ;;", "} ;;"),
+        ("exit 1; } ;;", "exit 0; } ;;"),
+        ("] || {", "] || true || {"),
+    ],
+    ids=[
+        "missing-target-rejection",
+        "target-success",
+        "target-exit-dropped",
+        "and-instead-of-or",
+        "fork-exit-dropped",
+        "fork-exit-zero",
+        "or-true",
     ],
 )
-def test_authz_rejects_identity_check_regressions(name: str, old: str, new: str) -> None:
-    job = copy.deepcopy(load(name)["jobs"]["authz"])
-    assert_authz_identity(job)
+def test_authz_rejects_canonical_script_regressions(name: str, old: str, new: str) -> None:
+    original = load(name)["jobs"]["authz"]
+    assert_canonical_authz(original)
+    job = copy.deepcopy(original)
     script = "\n".join(line.strip() for line in job["steps"][0]["run"].splitlines())
     assert old in script
     changed = script.replace(old, new)
     assert changed != script
     job["steps"][0]["run"] = changed
+    assert job != original
     with pytest.raises(AssertionError):
-        assert_authz_identity(job)
+        assert_canonical_authz(job)
 
 
 @pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
-@pytest.mark.parametrize(
-    "fault", ["missing-env", "wrong-env", "wrong-test", "exit-zero", "bot-before-fork"]
-)
-def test_authz_rejects_fork_bypasses(name: str, fault: str) -> None:
-    job = copy.deepcopy(load(name)["jobs"]["authz"])
-    assert_authz_identity(job)
-    step = job["steps"][0]
-    lines = [line.strip() for line in step["run"].splitlines()]
-    fork_start = lines.index(FORK_TEST)
-    fork_end = lines.index("fi", fork_start)
-    bot_end = lines.index("fi", lines.index(BOT_TEST))
-    if fault == "missing-env":
-        del step["env"]["FORK_PR"]
-    elif fault == "wrong-env":
-        step["env"]["FORK_PR"] = "${{ false }}"
-    elif fault == "wrong-test":
-        lines[fork_start] = 'if [ "$FORK_PR" = "false" ]; then'
-    elif fault == "exit-zero":
-        lines[fork_end - 1] = "exit 0"
-    else:
-        lines = [
-            *lines[:fork_start],
-            *lines[fork_end + 1 : bot_end + 1],
-            *lines[fork_start : fork_end + 1],
-            *lines[bot_end + 1 :],
-        ]
-    step["run"] = "\n".join(lines)
+@pytest.mark.parametrize("key", ["EVENT", "HEAD_REPO", "REPO"])
+def test_authz_rejects_missing_canonical_env(name: str, key: str) -> None:
+    original = load(name)["jobs"]["authz"]
+    assert_canonical_authz(original)
+    job = copy.deepcopy(original)
+    del job["steps"][0]["env"][key]
+    assert job != original
     with pytest.raises(AssertionError):
-        assert_authz_identity(job)
+        assert_canonical_authz(job)
 
 
 @pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
 @pytest.mark.parametrize(
     "target,key,value",
     [
+        ("job", "name", "Authorize CI"),
         ("job", "if", "false"),
+        ("job", "needs", "build"),
+        ("job", "permissions", {"contents": "read"}),
+        ("job", "permissions", {"contents": "write"}),
+        ("job", "timeout-minutes", "5"),
         ("job", "continue-on-error", "true"),
+        ("step", "name", "Authorize CI"),
+        ("step", "shell", "bash"),
         ("step", "shell", "sh"),
         ("step", "if", "false"),
         ("step", "continue-on-error", "true"),
-        ("env", "GH_TOKEN", "${{ secrets.OTHER_TOKEN }}"),
-        ("env", "ACTOR", "${{ github.actor }}"),
+        ("env", "EVENT", "${{ github.event.action }}"),
+        ("env", "HEAD_REPO", "${{ github.head_ref }}"),
+        ("env", "HEAD_REPO", "${{ github.event.pull_request.head.repo.fork }}"),
+        ("env", "HEAD_REPO", "${{ github.repository }}"),
         ("env", "REPO", "${{ github.event.pull_request.head.repo.full_name }}"),
+        ("env", "GH_TOKEN", "${{ secrets.GITHUB_TOKEN }}"),
+        ("env", "GH_TOKEN", "unused"),
+        ("env", "EXTRA", "unused"),
     ],
 )
 def test_authz_rejects_untrusted_env_and_masked_failures(
-    name: str, target: str, key: str, value: str
+    name: str, target: str, key: str, value: Any
 ) -> None:
-    job = copy.deepcopy(load(name)["jobs"]["authz"])
-    assert_authz_identity(job)
+    original = load(name)["jobs"]["authz"]
+    assert_canonical_authz(original)
+    job = copy.deepcopy(original)
     targets = {"job": job, "step": job["steps"][0], "env": job["steps"][0]["env"]}
     targets[target][key] = value
+    assert job != original
     with pytest.raises(AssertionError):
-        assert_authz_identity(job)
+        assert_canonical_authz(job)
+
+
+@pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
+@pytest.mark.parametrize("fault", ["missing-step", "second-step"])
+def test_authz_rejects_noncanonical_step_counts(name: str, fault: str) -> None:
+    original = load(name)["jobs"]["authz"]
+    assert_canonical_authz(original)
+    job = copy.deepcopy(original)
+    if fault == "missing-step":
+        job["steps"].clear()
+    else:
+        job["steps"].append({"name": "Extra step", "run": "true"})
+    assert job != original
+    with pytest.raises(AssertionError):
+        assert_canonical_authz(job)
+
+
+@pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
+@pytest.mark.parametrize(
+    "route", ["ubuntu-24.04", ["ubuntu-24.04"], MATRIX_RUNNERS["ubuntu-24.04"]]
+)
+def test_authz_rejects_hosted_or_expression_runners(name: str, route: Any) -> None:
+    original = load(name)["jobs"]["authz"]
+    assert_canonical_authz(original)
+    job = copy.deepcopy(original)
+    job["runs-on"] = route
+    assert job != original
+    with pytest.raises(AssertionError):
+        assert_canonical_authz(job)
 
 
 def assert_docs_only_policy(jobs: dict[str, Any]) -> None:
@@ -650,7 +627,58 @@ def test_evidence_inventory_stays_the_five_gated_jobs() -> None:
     assert set(needs) == evidence.NEEDS
     # create_evidence rejects anything else, so the path decision job must not leak in.
     assert "changes" not in needs
-    assert aggregate["if"] == "steps.gate.outputs.evidence == 'true'"
+    # old: assert aggregate["if"] == "steps.gate.outputs.evidence == 'true'"
+    # ci-labels.md rule 3a: a step that runs repo code also requires a successful authz.
+    assert aggregate["if"] == (
+        "needs.authz.result == 'success' && steps.gate.outputs.evidence == 'true'"
+    )
+
+
+REFUSE_STEP = {
+    "name": "authz must have passed",
+    "if": "needs.authz.result != 'success'",
+    "run": "exit 1",
+}
+
+
+def assert_always_job_refuses_first(job: dict[str, Any]) -> None:
+    """ci-labels.md rule 3a for a job with `if: always()` that needs authz."""
+    assert job["if"] == "always()"
+    assert "authz" in needs(job)
+    steps = job["steps"]
+    assert steps[0] == REFUSE_STEP, "the refusal is the FIRST step, before any checkout"
+    for step in steps[1:]:
+        uses_repo = "actions/checkout" in step.get("uses", "") or "run" in step
+        if uses_repo and step.get("id") != "gate":
+            assert "needs.authz.result == 'success'" in step.get("if", ""), step
+
+
+def test_always_jobs_refuse_a_failed_authz_before_any_repo_code() -> None:
+    ci = load("ci.yml")["jobs"]
+    assert_always_job_refuses_first(ci["ready"])
+    # The four runtime jobs use !cancelled(); their own if requires a successful authz.
+    for name in RUNTIME_JOBS:
+        assert "needs.authz.result == 'success'" in ci[name]["if"]
+    for workflow in ("ci.yml", "docs.yml", "native-feed.yml"):
+        for job_id, job in load(workflow)["jobs"].items():
+            condition = job.get("if", "")
+            if job_id != "ready" and ("always()" in condition or "!cancelled()" in condition):
+                assert "needs.authz.result == 'success'" in condition, (workflow, job_id)
+
+
+@pytest.mark.parametrize("fault", ["no-refusal", "refusal-not-first", "unguarded-checkout"])
+def test_always_job_rejects_missing_first_refusal_or_unguarded_repo_code(fault: str) -> None:
+    job = copy.deepcopy(load("ci.yml")["jobs"]["ready"])
+    assert_always_job_refuses_first(job)
+    if fault == "no-refusal":
+        del job["steps"][0]
+    elif fault == "refusal-not-first":
+        job["steps"].insert(1, job["steps"].pop(0))
+    else:
+        checkout = next(s for s in job["steps"] if "actions/checkout" in s.get("uses", ""))
+        checkout["if"] = "steps.gate.outputs.evidence == 'true'"
+    with pytest.raises(AssertionError):
+        assert_always_job_refuses_first(job)
 
 
 def git(repo: Path, *args: str) -> str:

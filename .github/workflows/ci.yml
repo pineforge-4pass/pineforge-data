@@ -273,6 +273,9 @@ jobs:
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     steps:
+      - name: authz must have passed
+        if: needs.authz.result != 'success'
+        run: exit 1
       - name: Require the path decision and every expected job result
         id: gate
         env:
@@ -322,11 +325,11 @@ jobs:
           fi
           echo "evidence=$evidence" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v7
-        if: steps.gate.outputs.evidence == 'true'
+        if: needs.authz.result == 'success' && steps.gate.outputs.evidence == 'true'
         with:
           persist-credentials: false
       - uses: actions/setup-python@v6
-        if: steps.gate.outputs.evidence == 'true'
+        if: needs.authz.result == 'success' && steps.gate.outputs.evidence == 'true'
         with:
           python-version: '3.13'
       - uses: actions/download-artifact@v6
@@ -335,7 +338,7 @@ jobs:
           name: python-package-distributions-${{ github.run_attempt }}
           path: dist/
       - name: Require the complete job inventory and bind evidence to this head/base/tree
-        if: steps.gate.outputs.evidence == 'true'
+        if: needs.authz.result == 'success' && steps.gate.outputs.evidence == 'true'
         env:
           PYTHONPATH: scripts
           NEEDS_JSON: >-

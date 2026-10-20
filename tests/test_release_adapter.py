@@ -959,6 +959,79 @@ def test_completed_receipt_replay_does_not_dispatch_or_publish(
     assert report["deployed"] == saved["deployed"]
 
 
+def assert_pull_request_filter_policy(workflow: dict[str, Any], name: str) -> None:
+    assert "pull_request" in workflow["on"]
+    pull_request = workflow["on"]["pull_request"]
+    if name == "native-feed.yml":
+        assert isinstance(pull_request, dict)
+        assert pull_request.get("paths") == [
+            "native/feed/**",
+            ".github/workflows/native-feed.yml",
+        ]
+    else:
+        assert name in {"ci.yml", "docs.yml"}
+        assert pull_request in (None, "") or isinstance(pull_request, dict)
+        if isinstance(pull_request, dict):
+            filters = {"paths", "paths-ignore", "branches", "branches-ignore"}
+            assert not filters & pull_request.keys()
+
+
+@pytest.mark.parametrize("name", ["ci.yml", "docs.yml", "native-feed.yml"])
+def test_pull_request_trigger_filters_match_authz_roles(name: str) -> None:
+    workflow = yaml.load((ROOT / ".github/workflows" / name).read_text(), Loader=yaml.BaseLoader)
+    assert_pull_request_filter_policy(workflow, name)
+
+
+@pytest.mark.parametrize("name", ["ci.yml", "docs.yml"])
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("paths", ["src/**"]),
+        ("paths-ignore", ["docs/**"]),
+        ("branches", ["main"]),
+        ("branches-ignore", ["release/**"]),
+    ],
+)
+def test_required_authz_rejects_pull_request_filters(
+    name: str, key: str, value: list[str]
+) -> None:
+    original = yaml.load((ROOT / ".github/workflows" / name).read_text(), Loader=yaml.BaseLoader)
+    assert_pull_request_filter_policy(original, name)
+    workflow = copy.deepcopy(original)
+    workflow["on"]["pull_request"] = {key: value}
+    assert workflow != original
+    with pytest.raises(AssertionError):
+        assert_pull_request_filter_policy(workflow, name)
+
+
+@pytest.mark.parametrize("name", ["ci.yml", "docs.yml"])
+def test_required_authz_rejects_missing_pull_request_trigger(name: str) -> None:
+    original = yaml.load((ROOT / ".github/workflows" / name).read_text(), Loader=yaml.BaseLoader)
+    assert_pull_request_filter_policy(original, name)
+    workflow = copy.deepcopy(original)
+    del workflow["on"]["pull_request"]
+    assert workflow != original
+    with pytest.raises(AssertionError):
+        assert_pull_request_filter_policy(workflow, name)
+
+
+@pytest.mark.parametrize("paths", [None, [], ["src/**"]])
+def test_native_authz_guard_rejects_missing_or_changed_pull_request_paths(
+    paths: list[str] | None,
+) -> None:
+    name = "native-feed.yml"
+    original = yaml.load((ROOT / ".github/workflows" / name).read_text(), Loader=yaml.BaseLoader)
+    assert_pull_request_filter_policy(original, name)
+    workflow = copy.deepcopy(original)
+    if paths is None:
+        del workflow["on"]["pull_request"]["paths"]
+    else:
+        workflow["on"]["pull_request"]["paths"] = paths
+    assert workflow != original
+    with pytest.raises(AssertionError):
+        assert_pull_request_filter_policy(workflow, name)
+
+
 def assert_ready_dependencies(job: dict[str, Any]) -> None:
     # old: assert set(ci["jobs"]["ready"]["needs"]) == evidence.NEEDS | {"changes"}
     assert set(job["needs"]) == evidence.NEEDS | {"changes", "authz"}

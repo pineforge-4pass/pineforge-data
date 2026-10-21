@@ -13,7 +13,7 @@ permissions:
 
 # Only a superseded pull_request run is cancelled; push and dispatch are never cancelled.
 # authz, asan-ubsan, tsan and the release legs run on GitHub-hosted runners (owner decision
-# CI-2 = A, 10-21: ubuntu-latest, ubuntu-24.04, ubuntu-24.04-arm, macos-14; no secret in any).
+# CI-2 = A, 10-21: ubuntu-24.04, ubuntu-24.04-arm, macos-14; no secret in any).
 # Fork PRs fail authz.
 concurrency:
   group: native-feed-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
@@ -22,8 +22,8 @@ concurrency:
 jobs:
   authz:
     name: authz
-    # GitHub-hosted (CI-2 = A): needs no toolchain or Docker and holds no secret.
-    runs-on: ubuntu-latest
+    # Standard GitHub-hosted label (owner #1050); never a larger-runner label.
+    runs-on: ubuntu-24.04
     permissions: {}
     # No timeout-minutes: the owner's no-time-limits rule (check-no-time-limits refuses new ones).
     steps:
@@ -99,7 +99,7 @@ jobs:
             runner: macos-14
     runs-on: ${{ matrix.runner }}
     env:
-      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
+      PF_CI_LABELS: '["ubuntu-24.04"]'
     steps:
       - uses: actions/checkout@v7
       - name: Linux prerequisites
@@ -124,9 +124,9 @@ jobs:
   asan-ubsan:
     name: ASan + UBSan
     needs: authz
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
-      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
+      PF_CI_LABELS: '["ubuntu-24.04"]'
     steps:
       - uses: actions/checkout@v7
       - run: sudo apt-get update && sudo apt-get install -y ninja-build libssl-dev clang-18
@@ -146,9 +146,9 @@ jobs:
   tsan:
     name: TSan
     needs: authz
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
-      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
+      PF_CI_LABELS: '["ubuntu-24.04"]'
     steps:
       - uses: actions/checkout@v7
       - run: sudo apt-get update && sudo apt-get install -y ninja-build libssl-dev clang-18 llvm-18

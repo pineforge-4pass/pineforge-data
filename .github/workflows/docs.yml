@@ -10,8 +10,8 @@ permissions:
   contents: read
 
 # Only a superseded pull_request run is cancelled; a push to main (Pages deploy) and a
-# dispatch are never cancelled. authz and build run on GitHub-hosted ubuntu-latest (owner
-# decision CI-2 = A, 10-21: no secret in either job); fork PRs fail authz.
+# dispatch are never cancelled. every job runs on GitHub-hosted ubuntu-24.04 (owner
+# decisions CI-2 = A, 10-21, and #1050: no job holds a secret; deploy uses the github-pages environment); fork PRs fail authz.
 concurrency:
   group: pages-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -19,8 +19,8 @@ concurrency:
 jobs:
   authz:
     name: authz
-    # GitHub-hosted (CI-2 = A): needs no toolchain or Docker and holds no secret.
-    runs-on: ubuntu-latest
+    # Standard GitHub-hosted label (owner #1050); never a larger-runner label.
+    runs-on: ubuntu-24.04
     permissions: {}
     # No timeout-minutes: the owner's no-time-limits rule (check-no-time-limits refuses new ones).
     steps:
@@ -81,9 +81,9 @@ jobs:
 
   build:
     needs: authz
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
-      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
+      PF_CI_LABELS: '["ubuntu-24.04"]'
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
@@ -103,7 +103,7 @@ jobs:
   deploy:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: [authz, build]
-    runs-on: ["self-hosted", "pf-ci", "pf-ci-release"]
+    runs-on: ubuntu-24.04
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

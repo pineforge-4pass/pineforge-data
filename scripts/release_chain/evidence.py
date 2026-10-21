@@ -6,6 +6,7 @@ import io
 import json
 import os
 import subprocess
+import time
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -78,6 +79,33 @@ def distribution_hashes(directory: Path) -> dict[str, str]:
     return {path.name: sha256(path.read_bytes()) for path in sorted(files)}
 
 
+JOBS_CLOSE_TIMEOUT = 60.0
+JOBS_CLOSE_INTERVAL = 5.0
+
+
+def attempt_jobs(repo: str, run_id: int, attempt: int) -> list[dict[str, Any]]:
+    return object_json(
+        gh_bytes(f"repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100")
+    )["jobs"]
+
+
+def closed_jobs(repo: str, run_id: int, attempt: int) -> list[dict[str, Any]]:
+    """Poll the attempt's job list until every required job is reported completed.
+
+    The jobs API can lag a leg that has just finished (2026-10-21: release/ready read
+    Python 3.11 as unfinished 17 s after that leg's recorded completion, and the run then
+    failed the exact inventory check). Only the wait is bounded; validate_jobs still
+    refuses anything that is not completed and successful.
+    """
+    deadline = time.monotonic() + JOBS_CLOSE_TIMEOUT
+    while True:
+        jobs = attempt_jobs(repo, run_id, attempt)
+        completed = {job["name"] for job in jobs if job["status"] == "completed"}
+        if all(name in completed for name in JOBS) or time.monotonic() >= deadline:
+            return jobs
+        time.sleep(JOBS_CLOSE_INTERVAL)
+
+
 def create_evidence(root: Path, directory: Path, needs: dict[str, Any]) -> dict[str, Any]:
     require(set(needs) == NEEDS, "required CI job inventory changed")
     require(
@@ -91,9 +119,7 @@ def create_evidence(root: Path, directory: Path, needs: dict[str, Any]) -> dict[
     repo = os.environ["GITHUB_REPOSITORY"]
     run_id = int(os.environ["GITHUB_RUN_ID"])
     attempt = int(os.environ["GITHUB_RUN_ATTEMPT"])
-    jobs = object_json(
-        gh_bytes(f"repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100")
-    )["jobs"]
+    jobs = closed_jobs(repo, run_id, attempt)
     validate_jobs(jobs, aggregate=False)
     return {
         "run_id": run_id,

@@ -11,8 +11,8 @@ permissions:
 
 # Only a superseded pull_request run is cancelled: every other event (push to main,
 # whose run authorizes publication) gets its own run_id group and is never cancelled.
-# Every job runs on GitHub-hosted ubuntu-latest (owner decision CI-2 = A, 10-21 04:01: this
-# repository is public and no job here holds a secret); dependabot counts as ours.
+# Every job runs on GitHub-hosted ubuntu-24.04 (owner decision CI-2 = A, 10-21 04:01, and #1050:
+# this repository is public and no job here holds a secret); dependabot counts as ours.
 # Fork PRs fail authz. Docs-only PRs skip the four runtime jobs (docker, database-e2e,
 # contract, distribution); the Python matrix always runs because tests/test_documentation.py
 # checks the links in README.md, CONTRIBUTING.md and docs/. release/ready then accepts
@@ -25,8 +25,8 @@ concurrency:
 jobs:
   authz:
     name: authz
-    # GitHub-hosted (CI-2 = A): needs no toolchain or Docker and holds no secret.
-    runs-on: ubuntu-latest
+    # Standard GitHub-hosted label (owner #1050); never a larger-runner label.
+    runs-on: ubuntu-24.04
     permissions: {}
     # No timeout-minutes: the owner's no-time-limits rule (check-no-time-limits refuses new ones).
     steps:
@@ -88,7 +88,7 @@ jobs:
   changes:
     needs: authz
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       code: ${{ steps.paths.outputs.code }}
     steps:
@@ -114,9 +114,9 @@ jobs:
   test:
     name: Python ${{ matrix.python-version }}
     needs: authz
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
-      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
+      PF_CI_LABELS: '["ubuntu-24.04"]'
     strategy:
       fail-fast: false
       matrix:
@@ -152,9 +152,9 @@ jobs:
       needs.authz.result == 'success' &&
       (github.event_name != 'pull_request' ||
        (needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
-      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
+      PF_CI_LABELS: '["ubuntu-24.04"]'
     steps:
       - name: authz must have passed
         if: needs.authz.result != 'success'
@@ -183,7 +183,7 @@ jobs:
       needs.authz.result == 'success' &&
       (github.event_name != 'pull_request' ||
        (needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       mysql:
         image: mysql:8.4
@@ -215,7 +215,7 @@ jobs:
           --health-retries=30
           --health-start-period=10s
     env:
-      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
+      PF_CI_LABELS: '["ubuntu-24.04"]'
       PINEFORGE_DATABASE_E2E: "1"
       PINEFORGE_CORPUS_OHLCV: tests/fixtures/corpus_ohlcv_ETH-USDT-USDT_1m_sample.csv
       PINEFORGE_MYSQL_URL: mysql+pymysql://pineforge:pineforge@127.0.0.1:3306/pineforge
@@ -250,9 +250,9 @@ jobs:
       needs.authz.result == 'success' &&
       (github.event_name != 'pull_request' ||
        (needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
-      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
+      PF_CI_LABELS: '["ubuntu-24.04"]'
     steps:
       - name: authz must have passed
         if: needs.authz.result != 'success'
@@ -278,9 +278,9 @@ jobs:
       needs.authz.result == 'success' &&
       (github.event_name != 'pull_request' ||
        (needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
-      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
+      PF_CI_LABELS: '["ubuntu-24.04"]'
     steps:
       - name: authz must have passed
         if: needs.authz.result != 'success'
@@ -346,9 +346,9 @@ jobs:
     name: release/ready
     if: always()
     needs: [authz, changes, test, contract, docker, database-e2e, distribution]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
-      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
+      PF_CI_LABELS: '["ubuntu-24.04"]'
     steps:
       - name: authz must have passed
         if: needs.authz.result != 'success'

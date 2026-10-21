@@ -25,7 +25,7 @@ concurrency:
 jobs:
   authz:
     name: authz
-    # GitHub-hosted (CI-2 = A): needs no toolchain or Docker and holds no secret.
+    # Standard GitHub-hosted label (owner #1050); never a larger-runner label.
     runs-on: ubuntu-24.04
     permissions: {}
     # No timeout-minutes: the owner's no-time-limits rule (check-no-time-limits refuses new ones).
@@ -116,7 +116,7 @@ jobs:
     needs: authz
     runs-on: ubuntu-24.04
     env:
-      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
+      PF_CI_LABELS: '["ubuntu-24.04"]'
     strategy:
       fail-fast: false
       matrix:
@@ -154,7 +154,7 @@ jobs:
        (needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))
     runs-on: ubuntu-24.04
     env:
-      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
+      PF_CI_LABELS: '["ubuntu-24.04"]'
     steps:
       - name: authz must have passed
         if: needs.authz.result != 'success'
@@ -215,7 +215,7 @@ jobs:
           --health-retries=30
           --health-start-period=10s
     env:
-      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
+      PF_CI_LABELS: '["ubuntu-24.04"]'
       PINEFORGE_DATABASE_E2E: "1"
       PINEFORGE_CORPUS_OHLCV: tests/fixtures/corpus_ohlcv_ETH-USDT-USDT_1m_sample.csv
       PINEFORGE_MYSQL_URL: mysql+pymysql://pineforge:pineforge@127.0.0.1:3306/pineforge
@@ -252,7 +252,7 @@ jobs:
        (needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))
     runs-on: ubuntu-24.04
     env:
-      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
+      PF_CI_LABELS: '["ubuntu-24.04"]'
     steps:
       - name: authz must have passed
         if: needs.authz.result != 'success'
@@ -280,7 +280,7 @@ jobs:
        (needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))
     runs-on: ubuntu-24.04
     env:
-      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
+      PF_CI_LABELS: '["ubuntu-24.04"]'
     steps:
       - name: authz must have passed
         if: needs.authz.result != 'success'
@@ -348,7 +348,7 @@ jobs:
     needs: [authz, changes, test, contract, docker, database-e2e, distribution]
     runs-on: ubuntu-24.04
     env:
-      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
+      PF_CI_LABELS: '["ubuntu-24.04"]'
     steps:
       - name: authz must have passed
         if: needs.authz.result != 'success'

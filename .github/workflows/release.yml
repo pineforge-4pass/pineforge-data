@@ -41,8 +41,7 @@ env:
 jobs:
   authz:
     name: authz
-    # Pool label (needs no toolchain or Docker). Switch to pf-ci-crj once laneboss's
-    # bulletin says the Cloud Run class is live.
+    # Standard GitHub-hosted label (owner #1050); never a larger-runner label.
     runs-on: ubuntu-24.04
     permissions: {}
     # No timeout-minutes: the owner's no-time-limits rule (check-no-time-limits refuses new ones).
@@ -312,7 +311,7 @@ jobs:
     needs: [authz, prepare]
     runs-on: ubuntu-24.04
     env:
-      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-release"]'
+      PF_CI_LABELS: '["ubuntu-24.04"]'
     steps:
       - uses: actions/checkout@v7
         with:
@@ -341,7 +340,7 @@ jobs:
     if: needs.prepare.outputs.eligible == 'true' && !inputs.claim_placeholder
     runs-on: ubuntu-24.04
     env:
-      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-release"]'
+      PF_CI_LABELS: '["ubuntu-24.04"]'
     permissions:
       contents: write
       actions: read
@@ -425,7 +424,7 @@ jobs:
     needs: [authz, prepare, github-release, publish]
     runs-on: ubuntu-24.04
     env:
-      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-release"]'
+      PF_CI_LABELS: '["ubuntu-24.04"]'
     permissions:
       contents: write
       actions: read

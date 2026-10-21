@@ -24,8 +24,7 @@ concurrency:
 jobs:
   authz:
     name: authz
-    # Pool label (needs no toolchain or Docker). Switch to pf-ci-crj once laneboss's
-    # bulletin says the Cloud Run class is live.
+    # Standard GitHub-hosted label (owner #1050); never a larger-runner label.
     runs-on: ubuntu-24.04
     permissions: {}
     # No timeout-minutes: the owner's no-time-limits rule (check-no-time-limits refuses new ones).

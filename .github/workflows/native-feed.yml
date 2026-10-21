@@ -12,8 +12,9 @@ permissions:
   contents: read
 
 # Only a superseded pull_request run is cancelled; push and dispatch are never cancelled.
-# authz, asan-ubsan, tsan and the Linux release legs run on the pf-ci pool (x64 and arm64 labels, no hosted fallback).
-# Fork PRs fail authz; only macos-14 stays on GitHub.
+# authz, asan-ubsan, tsan and the release legs run on GitHub-hosted runners (owner decision
+# CI-2 = A, 10-21: ubuntu-latest, ubuntu-24.04, ubuntu-24.04-arm, macos-14; no secret in any).
+# Fork PRs fail authz.
 concurrency:
   group: native-feed-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -21,9 +22,8 @@ concurrency:
 jobs:
   authz:
     name: authz
-    # Pool label (needs no toolchain or Docker). Switch to pf-ci-crj once laneboss's
-    # bulletin says the Cloud Run class is live.
-    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
+    # GitHub-hosted (CI-2 = A): needs no toolchain or Docker and holds no secret.
+    runs-on: ubuntu-latest
     permissions: {}
     # No timeout-minutes: the owner's no-time-limits rule (check-no-time-limits refuses new ones).
     steps:
@@ -91,10 +91,10 @@ jobs:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14]
         include:
           - os: ubuntu-24.04
-            runner: ["self-hosted", "pf-ci", "pf-ci-x64"]
+            runner: ubuntu-24.04
           - os: ubuntu-24.04-arm
-            runner: ["self-hosted", "pf-ci", "pf-ci-arm64"]
-          # The one named exception: macOS stays on GitHub-hosted until there is Mac hardware.
+            runner: ubuntu-24.04-arm
+          # macOS has no self-hosted hardware; every leg here is GitHub-hosted (CI-2 = A).
           - os: macos-14
             runner: macos-14
     runs-on: ${{ matrix.runner }}
@@ -124,7 +124,7 @@ jobs:
   asan-ubsan:
     name: ASan + UBSan
     needs: authz
-    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
+    runs-on: ubuntu-latest
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     steps:
@@ -146,7 +146,7 @@ jobs:
   tsan:
     name: TSan
     needs: authz
-    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
+    runs-on: ubuntu-latest
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     steps:

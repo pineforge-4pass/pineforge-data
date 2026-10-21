@@ -34,7 +34,8 @@ ARM_POOL_LABELS = ["self-hosted", "pf-ci", "pf-ci-arm64"]
 # CI-2 = A (owner 10-21 04:01): every secret-free PR/CI job in this public repository runs on
 # a GitHub-hosted runner. HOSTED is the only accepted route for those jobs.
 # old: HOSTED = "ubuntu-latest"
-# #1050 / laneboss map #1051: the one standard hosted label is ubuntu-24.04 (ubuntu-latest is rejected).
+# #1050 / laneboss map #1051: the one standard hosted label is ubuntu-24.04
+# (ubuntu-latest is rejected).
 HOSTED = "ubuntu-24.04"
 MATRIX_RUNNERS = {
     # old: "ubuntu-24.04": "${{ fromJSON('[\"self-hosted\",\"pf-ci\",\"pf-ci-x64\"]') }}",

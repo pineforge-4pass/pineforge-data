@@ -628,8 +628,10 @@ def test_reconcile_admits_a_release_run_only_from_main() -> None:
         "(vars.RELEASE_APP_ID != '' || "
         "(github.event_name != 'schedule' && github.event_name != 'workflow_run')) && "
         "(github.event_name != 'workflow_run' || "
-        "(github.event.workflow_run.name == 'CI' && github.event.workflow_run.event == 'pull_request') || "
-        "(github.event.workflow_run.name == 'Release' && github.event.workflow_run.head_branch == 'main'))"
+        "(github.event.workflow_run.name == 'CI' && "
+        "github.event.workflow_run.event == 'pull_request') || "
+        "(github.event.workflow_run.name == 'Release' && "
+        "github.event.workflow_run.head_branch == 'main'))"
     )
 
 

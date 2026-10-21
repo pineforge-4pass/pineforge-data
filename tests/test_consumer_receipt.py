@@ -956,12 +956,6 @@ def test_automatic_triggers_wait_for_a_configured_chain():
     report_if = coordinator["jobs"]["report"]["if"]
     # old: assert report_if == "always() && needs.reconcile.result != 'skipped'"
     # The report job (a reusable-workflow call, secrets: inherit) must not run when authz failed.
-    # old: assert report_if == (
-    # old:     "always() && needs.authz.result == 'success' && needs.reconcile.result != 'skipped'"
-    # old: )
-    # The reconcile after a pull request's CI is its own job (reconcile-pr) on the x64 pool; the
-    # report runs after whichever of the two ran.
     assert report_if == (
-        "always() && needs.authz.result == 'success' && "
-        "(needs.reconcile.result != 'skipped' || needs.reconcile-pr.result != 'skipped')"
+        "always() && needs.authz.result == 'success' && needs.reconcile.result != 'skipped'"
     )

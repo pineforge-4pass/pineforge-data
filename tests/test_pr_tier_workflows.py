@@ -200,7 +200,11 @@ def assert_permission_policy(workflow: dict[str, Any], name: str) -> None:
     for job_id, job in workflow["jobs"].items():
         if name == "docs.yml" and job_id == "deploy":
             assert job["permissions"] == {"pages": "write", "id-token": "write"}
-            assert job["if"] == "github.event_name != 'pull_request'"
+            # old: assert job["if"] == "github.event_name != 'pull_request'"
+            # The release pool admits a deploy only from main: no pull request, no other ref.
+            assert job["if"] == (
+                "github.event_name != 'pull_request' && github.ref == 'refs/heads/main'"
+            )
             assert job["environment"]["name"] == "github-pages"
         elif job_id == "authz":
             # BaseLoader preserves an empty YAML mapping as a Python dict.

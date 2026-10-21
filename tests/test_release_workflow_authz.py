@@ -188,8 +188,13 @@ def test_structure_checker_rejects_unsafe_mutations(name: str, mutation: str) ->
         before, after = "    needs: authz\n", ""
         finding = "needs authz"
     elif mutation == "unguarded-report":
-        before = f"  report:\n    if: always() && {AUTHZ_PASSED} && "
-        after = "  report:\n    if: always() && "
+        if name == "pineforge-release.yml":
+            # Its report condition spans two lines (it waits on reconcile or reconcile-pr).
+            before = f"  report:\n    if: >-\n      always() && {AUTHZ_PASSED} &&"
+            after = "  report:\n    if: >-\n      always() &&"
+        else:
+            before = f"  report:\n    if: always() && {AUTHZ_PASSED} && "
+            after = "  report:\n    if: always() && "
         finding = "report: authz condition"
     else:
         before = f'ALLOWED_BOTS: "{ALLOWED_BOTS}"'

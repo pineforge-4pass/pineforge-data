@@ -101,9 +101,9 @@ jobs:
           path: site
 
   deploy:
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: [authz, build]
-    runs-on: ubuntu-latest
+    runs-on: ["self-hosted", "pf-ci", "pf-ci-release"]
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

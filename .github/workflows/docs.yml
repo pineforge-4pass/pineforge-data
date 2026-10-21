@@ -10,7 +10,8 @@ permissions:
   contents: read
 
 # Only a superseded pull_request run is cancelled; a push to main (Pages deploy) and a
-# dispatch are never cancelled. authz and build run on the pf-ci pool (plain labels, no hosted fallback); fork PRs fail authz.
+# dispatch are never cancelled. authz and build run on GitHub-hosted ubuntu-latest (owner
+# decision CI-2 = A, 10-21: no secret in either job); fork PRs fail authz.
 concurrency:
   group: pages-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -18,9 +19,8 @@ concurrency:
 jobs:
   authz:
     name: authz
-    # Pool label (needs no toolchain or Docker). Switch to pf-ci-crj once laneboss's
-    # bulletin says the Cloud Run class is live.
-    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
+    # GitHub-hosted (CI-2 = A): needs no toolchain or Docker and holds no secret.
+    runs-on: ubuntu-latest
     permissions: {}
     # No timeout-minutes: the owner's no-time-limits rule (check-no-time-limits refuses new ones).
     steps:
@@ -81,7 +81,7 @@ jobs:
 
   build:
     needs: authz
-    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
+    runs-on: ubuntu-latest
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     steps:

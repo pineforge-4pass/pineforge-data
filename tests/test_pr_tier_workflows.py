@@ -33,7 +33,9 @@ POOL_LABELS = ["self-hosted", "pf-ci", "pf-ci-x64"]
 ARM_POOL_LABELS = ["self-hosted", "pf-ci", "pf-ci-arm64"]
 # CI-2 = A (owner 10-21 04:01): every secret-free PR/CI job in this public repository runs on
 # a GitHub-hosted runner. HOSTED is the only accepted route for those jobs.
-HOSTED = "ubuntu-latest"
+# old: HOSTED = "ubuntu-latest"
+# #1050 / laneboss map #1051: the one standard hosted label is ubuntu-24.04 (ubuntu-latest is rejected).
+HOSTED = "ubuntu-24.04"
 MATRIX_RUNNERS = {
     # old: "ubuntu-24.04": "${{ fromJSON('[\"self-hosted\",\"pf-ci\",\"pf-ci-x64\"]') }}",
     "ubuntu-24.04": "ubuntu-24.04",
@@ -288,7 +290,8 @@ def test_the_old_same_repo_route_and_the_pool_are_rejected() -> None:
     for route in (
         OLD_ROUTE,
         GUARDED_ROUTE,
-        "ubuntu-24.04",
+        # old: "ubuntu-24.04",
+        "ubuntu-latest",
         "macos-14",
         "windows-latest",
         POOL_LABELS,
@@ -316,7 +319,8 @@ def test_the_old_same_repo_route_and_the_pool_are_rejected() -> None:
 
 @pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
 @pytest.mark.parametrize(
-    "route", [GUARDED_ROUTE, "ubuntu-24.04", POOL, POOL_LABELS, ARM_POOL_LABELS]
+    # old: "route", [GUARDED_ROUTE, "ubuntu-24.04", POOL, POOL_LABELS, ARM_POOL_LABELS]
+    "route", [GUARDED_ROUTE, "ubuntu-latest", POOL, POOL_LABELS, ARM_POOL_LABELS]
 )
 def test_each_job_rejects_the_pool_an_expression_or_another_runner(
     name: str, route: Any
@@ -336,7 +340,8 @@ def test_each_job_rejects_the_pool_an_expression_or_another_runner(
     "name,job_id,route",
     [
         ("docs.yml", "deploy", POOL_LABELS),
-        ("docs.yml", "deploy", "ubuntu-24.04"),
+        # old: ("docs.yml", "deploy", "ubuntu-24.04"),
+        ("docs.yml", "deploy", "ubuntu-latest"),
         ("native-feed.yml", "release", POOL_LABELS),
         ("native-feed.yml", "release", "ubuntu-24.04"),
         ("native-feed.yml", "release", "${{ matrix.runner || matrix.os }}"),
@@ -734,7 +739,8 @@ def test_authz_rejects_noncanonical_step_counts(name: str, fault: str) -> None:
 @pytest.mark.parametrize(
     # old: the expression fixture was MATRIX_RUNNERS["ubuntu-24.04"].
     # CI-2 = A: authz is hosted, so the old self-hosted pool is now the rejected route.
-    "route", ["ubuntu-24.04", POOL_LABELS, ARM_POOL_LABELS, "${{ " + POOL + " }}"]
+    # old: "route", ["ubuntu-24.04", POOL_LABELS, ARM_POOL_LABELS, "${{ " + POOL + " }}"]
+    "route", ["ubuntu-latest", POOL_LABELS, ARM_POOL_LABELS, "${{ " + POOL + " }}"]
 )
 def test_authz_rejects_any_route_other_than_the_pinned_hosted_runner(
     name: str, route: Any

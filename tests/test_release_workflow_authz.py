@@ -116,7 +116,8 @@ def assert_workflow_authz(workflow: dict[str, Any]) -> None:
     authz = jobs["authz"]
     assert set(authz) == {"name", "runs-on", "permissions", "steps"}
     assert authz["name"] == "authz"
-    assert authz["runs-on"] == "ubuntu-latest"
+    # old: assert authz["runs-on"] == ["self-hosted", "pf-ci", "pf-ci-x64"]
+    assert authz["runs-on"] == "ubuntu-24.04"
     assert authz["permissions"] == {}
     assert len(authz["steps"]) == 1
     step = authz["steps"][0]
@@ -595,3 +596,44 @@ def test_missing_head_check_mutation_allows_fork_writer(
         "--jq",
         ".permission",
     ]
+
+
+HOSTED_RELEASE_RUNNER = "ubuntu-24.04"
+
+
+def flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+# #1050: every release-class job runs on the standard hosted label; none selects a runner pool.
+# The reconcile after a pull request's CI and the report that follows are the single `reconcile`
+# and `report` jobs again (no `reconcile-pr` / `report-pr` copies).
+@pytest.mark.parametrize(
+    "name", ("docs.yml", "pineforge-release.yml", "release.yml", "release-report.yml")
+)
+def test_release_class_jobs_run_on_the_hosted_runner_and_never_on_a_pool(name: str) -> None:
+    jobs = load(name)["jobs"]
+    assert jobs
+    for job_id, job in jobs.items():
+        if "uses" in job:  # a reusable-workflow call has no runner of its own
+            continue
+        assert job["runs-on"] == HOSTED_RELEASE_RUNNER, f"{name}:{job_id}"
+    assert "reconcile-pr" not in jobs
+    assert "report-pr" not in jobs
+
+
+def test_reconcile_admits_a_release_run_only_from_main() -> None:
+    reconcile = load("pineforge-release.yml")["jobs"]["reconcile"]
+    assert flat(reconcile["if"]) == (
+        "(vars.RELEASE_APP_ID != '' || "
+        "(github.event_name != 'schedule' && github.event_name != 'workflow_run')) && "
+        "(github.event_name != 'workflow_run' || "
+        "(github.event.workflow_run.name == 'CI' && github.event.workflow_run.event == 'pull_request') || "
+        "(github.event.workflow_run.name == 'Release' && github.event.workflow_run.head_branch == 'main'))"
+    )
+
+
+def test_pages_deploy_is_main_only_and_never_a_pull_request() -> None:
+    deploy = load("docs.yml")["jobs"]["deploy"]
+    assert deploy["if"] == "github.event_name != 'pull_request' && github.ref == 'refs/heads/main'"
+    assert deploy["runs-on"] == HOSTED_RELEASE_RUNNER

@@ -145,12 +145,13 @@ def assert_workflow_authz(workflow: dict[str, Any]) -> None:
         assert "authz" in needs, f"{job_id}: needs authz"
 
     report_tail = (
-        "needs.reconcile.result != 'skipped'"
+        "(needs.reconcile.result != 'skipped' || needs.reconcile-pr.result != 'skipped')"
         if "reconcile" in jobs
         else "!inputs.claim_placeholder"
     )
     report = jobs["report"]
-    assert report["if"] == f"always() && {AUTHZ_PASSED} && {report_tail}", "report: authz condition"
+    expected_if = f"always() && {AUTHZ_PASSED} && {report_tail}"
+    assert " ".join(report["if"].split()) == expected_if, "report: authz condition"
     assert report["uses"] == "./.github/workflows/release-report.yml"
     assert report["secrets"] == "inherit"
 
@@ -595,3 +596,85 @@ def test_missing_head_check_mutation_allows_fork_writer(
         "--jq",
         ".permission",
     ]
+
+
+X64_POOL = ["self-hosted", "pf-ci", "pf-ci-x64"]
+RELEASE_POOL = ["self-hosted", "pf-ci", "pf-ci-release"]
+
+
+def flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+# The release pool refuses (and cancels) a workflow_run that started from a pull request or whose
+# head branch is not main. The reconcile and the report that follow a pull request's CI therefore
+# run as a second job on the credentialed x64 pool; the release-class job never admits that event.
+# The two jobs of each pair must keep identical steps, so the PR case cannot drift from the other.
+PR_ORIGINATED = (
+    "github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request'"
+)
+SPLIT_PAIRS = (
+    ("pineforge-release.yml", "reconcile", "reconcile-pr"),
+    ("release-report.yml", "report", "report-pr"),
+)
+RECONCILE_IF = (
+    "(vars.RELEASE_APP_ID != '' || "
+    "(github.event_name != 'schedule' && github.event_name != 'workflow_run')) && "
+    "(github.event_name != 'workflow_run' || (github.event.workflow_run.name == 'Release' && "
+    "github.event.workflow_run.head_branch == 'main'))"
+)
+RECONCILE_PR_IF = (
+    "vars.RELEASE_APP_ID != '' && github.event_name == 'workflow_run' && "
+    "github.event.workflow_run.name == 'CI' && github.event.workflow_run.event == 'pull_request'"
+)
+REPORT_IF = "${{ !(" + PR_ORIGINATED + ") }}"
+REPORT_PR_IF = "${{ " + PR_ORIGINATED + " }}"
+PAIR_CONDITIONS = {
+    "reconcile": RECONCILE_IF,
+    "reconcile-pr": RECONCILE_PR_IF,
+    "report": REPORT_IF,
+    "report-pr": REPORT_PR_IF,
+}
+
+
+@pytest.mark.parametrize(("name", "release_job", "pr_job"), SPLIT_PAIRS)
+def test_release_pool_is_never_requested_for_a_pull_request_originated_run(
+    name: str, release_job: str, pr_job: str
+) -> None:
+    jobs = load(name)["jobs"]
+    assert jobs[release_job]["runs-on"] == RELEASE_POOL
+    assert jobs[pr_job]["runs-on"] == X64_POOL
+    assert flat(jobs[release_job]["if"]) == flat(PAIR_CONDITIONS[release_job])
+    assert flat(jobs[pr_job]["if"]) == flat(PAIR_CONDITIONS[pr_job])
+    assert "'pull_request'" not in flat(jobs[release_job]["if"]).replace(PR_ORIGINATED, "")
+    if pr_job == "reconcile-pr":
+        assert "authz" in jobs[pr_job]["needs"]
+
+
+@pytest.mark.parametrize(("name", "release_job", "pr_job"), SPLIT_PAIRS)
+def test_the_pull_request_copy_has_exactly_the_release_jobs_steps(
+    name: str, release_job: str, pr_job: str
+) -> None:
+    jobs = load(name)["jobs"]
+    assert jobs[pr_job]["steps"] == jobs[release_job]["steps"]
+    assert len(jobs[release_job]["steps"]) > 3
+
+
+def test_the_report_runs_after_either_reconcile_and_fails_when_either_failed() -> None:
+    report = load("pineforge-release.yml")["jobs"]["report"]
+    assert report["needs"] == ["authz", "reconcile", "reconcile-pr"]
+    assert flat(report["if"]) == (
+        "always() && needs.authz.result == 'success' && "
+        "(needs.reconcile.result != 'skipped' || needs.reconcile-pr.result != 'skipped')"
+    )
+    failed = flat(report["with"]["failed"])
+    for job in ("reconcile", "reconcile-pr"):
+        for result in ("failure", "cancelled"):
+            assert f"needs.{job}.result == '{result}'" in failed
+    assert "success" not in failed
+
+
+def test_pages_deploy_is_main_only_and_never_a_pull_request() -> None:
+    deploy = load("docs.yml")["jobs"]["deploy"]
+    assert deploy["if"] == "github.event_name != 'pull_request' && github.ref == 'refs/heads/main'"
+    assert deploy["runs-on"] == RELEASE_POOL

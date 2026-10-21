@@ -89,12 +89,13 @@ jobs:
     needs: authz
     # Automatic triggers (schedule, workflow_run) run only once the chain is
     # configured (RELEASE_APP_ID set); a hub dispatch or a manual run without it
-    # still fails loudly.
+    # still fails loudly. This is the release-class copy: the release pool refuses (and cancels) a
+    # workflow_run that started from a pull request or whose head branch is not main, so the
+    # reconcile after a pull request's CI is the reconcile-pr job below, on the credentialed x64 pool.
     if: >-
       (vars.RELEASE_APP_ID != '' || (github.event_name != 'schedule' && github.event_name != 'workflow_run')) &&
       (github.event_name != 'workflow_run' ||
-      (github.event.workflow_run.name == 'CI' && github.event.workflow_run.event == 'pull_request') ||
-      github.event.workflow_run.name == 'Release')
+      (github.event.workflow_run.name == 'Release' && github.event.workflow_run.head_branch == 'main'))
     runs-on: ["self-hosted", "pf-ci", "pf-ci-release"]
     steps:
       - uses: actions/create-github-app-token@v2
@@ -135,9 +136,58 @@ jobs:
           path: ${{ runner.temp }}/release-receipt.json
           if-no-files-found: warn
 
+  # The same job for a workflow_run of a pull request's CI, which the release pool refuses; the steps
+  # are identical to reconcile's (a test pins that), only the pool and the condition differ.
+  reconcile-pr:
+    needs: authz
+    if: >-
+      vars.RELEASE_APP_ID != '' && github.event_name == 'workflow_run' &&
+      github.event.workflow_run.name == 'CI' && github.event.workflow_run.event == 'pull_request'
+    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
+    steps:
+      - uses: actions/create-github-app-token@v2
+        id: app
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-actions: write
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Verify ready event, reconcile update PR and respect release gates
+        if: github.event.workflow_run.name != 'Release' && inputs.publication_run == ''
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          RELEASE_BOT_LOGIN: ${{ steps.app.outputs.app-slug }}[bot]
+        run: python scripts/release_adapter.py reconcile --receipt "$RUNNER_TEMP/release-receipt.json"
+      - name: Verify the completed publication from trusted coordinator code
+        if: github.event.workflow_run.name == 'Release' || inputs.publication_run != ''
+        env:
+          PYTHONPATH: scripts
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          PUBLICATION_RUN: ${{ inputs.publication_run || github.event.workflow_run.id }}
+        run: python -m release_chain.reporting publication --run "$PUBLICATION_RUN" --receipt "$RUNNER_TEMP/release-receipt.json"
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: release-stage-${{ github.run_attempt }}-10-adapter
+          path: ${{ runner.temp }}/release-receipt.json
+          if-no-files-found: warn
+
   report:
-    if: always() && needs.authz.result == 'success' && needs.reconcile.result != 'skipped'
-    needs: [authz, reconcile]
+    if: >-
+      always() && needs.authz.result == 'success' &&
+      (needs.reconcile.result != 'skipped' || needs.reconcile-pr.result != 'skipped')
+    needs: [authz, reconcile, reconcile-pr]
     uses: ./.github/workflows/release-report.yml
     permissions:
       contents: read
@@ -145,6 +195,6 @@ jobs:
       issues: write
     with:
       hub: true
-      failed: ${{ needs.reconcile.result != 'success' }}
+      failed: ${{ needs.reconcile.result == 'failure' || needs.reconcile.result == 'cancelled' || needs.reconcile-pr.result == 'failure' || needs.reconcile-pr.result == 'cancelled' }}
       stage: reconcile
     secrets: inherit

@@ -20,7 +20,90 @@ permissions:
 
 jobs:
   report:
+    # Called by pineforge-release.yml for every reconcile, including the one after a pull request's CI.
+    # The caller's event context applies here, and the release pool refuses (and cancels) a workflow_run
+    # that started from a pull request, so that case is the report-pr job below, on the x64 pool.
+    if: ${{ !(github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request') }}
     runs-on: ["self-hosted", "pf-ci", "pf-ci-release"]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v6
+        with:
+          pattern: release-stage-${{ github.run_attempt }}-*
+          path: receipts
+      - name: Preserve contract evidence and alert the configured owner
+        id: receipt
+        env:
+          PYTHONPATH: scripts
+          GH_TOKEN: ${{ github.token }}
+          FAILED: ${{ inputs.failed }}
+          STAGE: ${{ inputs.stage }}
+          RELEASE_ALERT_OWNER: ${{ vars.RELEASE_ALERT_OWNER }}
+        run: python -m release_chain.reporting collect
+      - name: Upload the single hub receipt snapshot
+        id: upload
+        if: inputs.hub && steps.receipt.outputs.has_event == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: release-receipt-data
+          path: release-receipt.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 90
+      - name: Mint a consumer-only token for the immutable completion asset
+        if: inputs.hub && steps.upload.outcome == 'success'
+        uses: actions/create-github-app-token@v2
+        id: consumer
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: read
+      - name: Retain this same verified contract as an immutable distribution asset
+        if: inputs.hub && steps.upload.outcome == 'success'
+        env:
+          PYTHONPATH: scripts
+          GH_TOKEN: ${{ steps.consumer.outputs.token }}
+        run: python -m release_chain.reporting retain
+      - name: Mint a separate token scoped only to the hub
+        if: inputs.hub && steps.upload.outcome == 'success'
+        uses: actions/create-github-app-token@v2
+        id: hub
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: pineforge-4pass
+          repositories: pineforge-release
+          permission-contents: write
+      - name: Wake the hub collector with the exact consumer-signal/v1 callback
+        if: inputs.hub && steps.upload.outcome == 'success'
+        env:
+          PYTHONPATH: scripts
+          GH_TOKEN: ${{ steps.hub.outputs.token }}
+        run: python -m release_chain.reporting callback
+      - name: Alert locally if receipt delivery or reporting failed
+        if: failure()
+        env:
+          PYTHONPATH: scripts
+          GH_TOKEN: ${{ github.token }}
+          FAILED: 'true'
+          STAGE: receipt-transport
+          RELEASE_ALERT_OWNER: ${{ vars.RELEASE_ALERT_OWNER }}
+        run: python -m release_chain.reporting collect --receipt incident-release-receipt.json
+
+  # The same job for the report after a pull request's CI; its steps are identical to report's (a test
+  # pins that), only the pool and the condition differ.
+  report-pr:
+    if: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request' }}
+    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
     steps:
       - uses: actions/checkout@v7
         with:

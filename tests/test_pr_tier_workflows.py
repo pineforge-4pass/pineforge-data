@@ -30,11 +30,15 @@ HOSTED_GUARD = (
 HOSTED_FALLBACK = "|| 'ubuntu-24.04' }}"
 POOL = "fromJSON('[\"self-hosted\",\"pf-ci\",\"pf-ci-x64\"]')"
 POOL_LABELS = ["self-hosted", "pf-ci", "pf-ci-x64"]
+ARM_POOL_LABELS = ["self-hosted", "pf-ci", "pf-ci-arm64"]
+# CI-2 = A (owner 10-21 04:01): every secret-free PR/CI job in this public repository runs on
+# a GitHub-hosted runner. HOSTED is the only accepted route for those jobs.
+HOSTED = "ubuntu-latest"
 MATRIX_RUNNERS = {
     # old: "ubuntu-24.04": "${{ fromJSON('[\"self-hosted\",\"pf-ci\",\"pf-ci-x64\"]') }}",
-    "ubuntu-24.04": ["self-hosted", "pf-ci", "pf-ci-x64"],
+    "ubuntu-24.04": "ubuntu-24.04",
     # old: "ubuntu-24.04-arm": "${{ fromJSON('[\"self-hosted\",\"pf-ci\",\"pf-ci-arm64\"]') }}",
-    "ubuntu-24.04-arm": ["self-hosted", "pf-ci", "pf-ci-arm64"],
+    "ubuntu-24.04-arm": "ubuntu-24.04-arm",
     "macos-14": "macos-14",
 }
 # These expressions are rejection fixtures for the superseded hosted-fallback policy.
@@ -167,13 +171,13 @@ def assert_native_release_matrix(matrix: dict[str, Any]) -> None:
 def assert_runner_policy(workflow: dict[str, Any], name: str = "ci.yml") -> None:
     for job_id, job in workflow["jobs"].items():
         if name == "docs.yml" and job_id == "deploy":
-            assert job["runs-on"] == "ubuntu-latest"
+            assert job["runs-on"] == HOSTED
         elif name == "native-feed.yml" and job_id == "release":
             # old: assert job["runs-on"] == "${{ matrix.runner || matrix.os }}"
             assert job["runs-on"] == "${{ matrix.runner }}"
             assert_native_release_matrix(job["strategy"]["matrix"])
         else:
-            assert job["runs-on"] == POOL_LABELS
+            assert job["runs-on"] == HOSTED
 
 
 def strings(value: Any) -> list[str]:
@@ -230,7 +234,9 @@ def assert_canonical_authz(job: dict[str, Any]) -> None:
     # old: assert set(job) == {"runs-on", "steps"}
     assert set(job) == {"name", "runs-on", "permissions", "steps"}
     assert job["name"] == "authz"
-    assert job["runs-on"] == ["self-hosted", "pf-ci", "pf-ci-x64"]
+    # CI-2 = A: the canonical authz job is secret-free, so it runs on a GitHub-hosted runner
+    # in every workflow that has no credentialed job left on pf-ci.
+    assert job["runs-on"] == HOSTED
     assert job["permissions"] == {}
     assert_secret_references(job, set())
     steps = job["steps"]
@@ -265,17 +271,24 @@ def cancels_only_pull_requests(concurrency: dict[str, str]) -> bool:
 
 # old: test_pull_requests_never_select_the_pool
 @pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
-def test_pool_jobs_use_plain_labels_without_hosted_fallback(name: str) -> None:
+def test_every_secret_free_pr_tier_job_runs_on_the_pinned_hosted_runner(name: str) -> None:
     workflow = load(name)
-    # old: assert pool_routes(workflow), "push and dispatch keep the pool"
-    assert workflow["jobs"]["authz"]["runs-on"] == POOL_LABELS
-    # old: assert unguarded(workflow) == []
+    # CI-2 = A: no job of these secret-free workflows may select the self-hosted pool.
+    assert workflow["jobs"]["authz"]["runs-on"] == HOSTED
     assert_runner_policy(workflow, name)
 
 
-def test_the_old_same_repo_route_to_the_pool_is_rejected() -> None:
+def test_the_old_same_repo_route_and_the_pool_are_rejected() -> None:
     # old: assert unguarded({"jobs": {"build": {"runs-on": OLD_ROUTE}}}) == ["build#0"]
-    for route in (OLD_ROUTE, GUARDED_ROUTE, "ubuntu-24.04", "macos-14", "windows-latest"):
+    for route in (
+        OLD_ROUTE,
+        GUARDED_ROUTE,
+        "ubuntu-24.04",
+        "macos-14",
+        "windows-latest",
+        POOL_LABELS,
+        ARM_POOL_LABELS,
+    ):
         with pytest.raises(AssertionError):
             assert_runner_policy({"jobs": {"build": {"runs-on": route}}})
     matrix = copy.deepcopy(load("native-feed.yml"))
@@ -286,19 +299,23 @@ def test_the_old_same_repo_route_to_the_pool_is_rejected() -> None:
         assert_runner_policy(matrix, "native-feed.yml")
     # old: assert unguarded(mixed) == ["b#0"]
     for job_id in ("a", "b"):
-        mixed = {"jobs": {"a": {"runs-on": POOL_LABELS}, "b": {"runs-on": POOL_LABELS}}}
+        mixed = {"jobs": {"a": {"runs-on": HOSTED}, "b": {"runs-on": HOSTED}}}
         mixed["jobs"][job_id]["runs-on"] = OLD_ROUTE
         with pytest.raises(AssertionError):
             assert_runner_policy(mixed)
     # old: assert unguarded({"jobs": {"a": {"runs-on": GUARDED_ROUTE}}}) == []
     with pytest.raises(AssertionError):
         assert_runner_policy({"jobs": {"a": {"runs-on": GUARDED_ROUTE}}})
-    assert_runner_policy({"jobs": {"a": {"runs-on": POOL_LABELS}}})
+    assert_runner_policy({"jobs": {"a": {"runs-on": HOSTED}}})
 
 
 @pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
-@pytest.mark.parametrize("route", [GUARDED_ROUTE, "ubuntu-24.04", POOL])
-def test_each_pool_job_rejects_expression_or_hosted_routes(name: str, route: str) -> None:
+@pytest.mark.parametrize(
+    "route", [GUARDED_ROUTE, "ubuntu-24.04", POOL, POOL_LABELS, ARM_POOL_LABELS]
+)
+def test_each_job_rejects_the_pool_an_expression_or_another_runner(
+    name: str, route: Any
+) -> None:
     workflow = load(name)
     assert_runner_policy(workflow, name)
     for job_id in workflow["jobs"]:
@@ -338,11 +355,12 @@ def test_native_release_matrix_pins_every_runner_and_the_macos_exception() -> No
     "os_name,runner",
     [
         ("ubuntu-24.04", GUARDED_ROUTE),
-        ("ubuntu-24.04", "ubuntu-24.04"),
+        # CI-2 = A: the self-hosted pool must not come back as a leg's runner.
+        ("ubuntu-24.04", POOL_LABELS),
         ("ubuntu-24.04", "macos-14"),
         ("ubuntu-24.04", MATRIX_RUNNERS["ubuntu-24.04-arm"]),
         ("ubuntu-24.04", "${{ " + POOL + " }}"),
-        ("ubuntu-24.04-arm", "ubuntu-24.04-arm"),
+        ("ubuntu-24.04-arm", ARM_POOL_LABELS),
         ("ubuntu-24.04-arm", "macos-14"),
         ("ubuntu-24.04-arm", MATRIX_RUNNERS["ubuntu-24.04"]),
         (
@@ -710,9 +728,12 @@ def test_authz_rejects_noncanonical_step_counts(name: str, fault: str) -> None:
 @pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
 @pytest.mark.parametrize(
     # old: the expression fixture was MATRIX_RUNNERS["ubuntu-24.04"].
-    "route", ["ubuntu-24.04", ["ubuntu-24.04"], "${{ " + POOL + " }}"]
+    # CI-2 = A: authz is hosted, so the old self-hosted pool is now the rejected route.
+    "route", ["ubuntu-24.04", POOL_LABELS, ARM_POOL_LABELS, "${{ " + POOL + " }}"]
 )
-def test_authz_rejects_hosted_or_expression_runners(name: str, route: Any) -> None:
+def test_authz_rejects_any_route_other_than_the_pinned_hosted_runner(
+    name: str, route: Any
+) -> None:
     original = load(name)["jobs"]["authz"]
     assert_canonical_authz(original)
     job = copy.deepcopy(original)

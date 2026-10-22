@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 import shutil
+import subprocess
+import time
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
@@ -389,6 +391,154 @@ def test_green_workflow_cannot_hide_a_missing_or_failed_gate(job_name, result) -
         next(job for job in jobs if job["name"] == job_name)["conclusion"] = result
     with pytest.raises(ValueError, match="required job"):
         evidence.validate_gate(gate, run, jobs, head="a" * 40, base="b" * 40, pr=7)
+
+
+@pytest.fixture
+def evidence_inputs(tmp_path: Path, monkeypatch):
+    root = tmp_path / "repository"
+    workflow = root / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_bytes((ROOT / ".github" / "workflows" / "ci.yml").read_bytes())
+    hooks = tmp_path / "empty-hooks"
+    hooks.mkdir()
+    subprocess.run(
+        ["git", "-c", "commit.gpgsign=false", "init"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-c", "commit.gpgsign=false", "add", ".github/workflows/ci.yml"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Release evidence test",
+            "-c",
+            "user.email=release-evidence@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            f"core.hooksPath={hooks}",
+            "commit",
+            "-m",
+            "Test release evidence",
+        ],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    directory = tmp_path / "dist"
+    directory.mkdir()
+    (directory / "pineforge_data-0.0.0-py3-none-any.whl").write_bytes(b"wheel")
+    (directory / "pineforge_data-0.0.0.tar.gz").write_bytes(b"sdist")
+    event = tmp_path / "event.json"
+    event.write_text("{}")
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "pineforge-4pass/pineforge-data")
+    monkeypatch.setenv("GITHUB_RUN_ID", "70")
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "push")
+    needs = {name: {"result": "success"} for name in evidence.NEEDS}
+    jobs = [{"name": name} for name in evidence.JOBS]
+
+    def attempt_jobs(repo, run_id, attempt):
+        assert (repo, run_id, attempt) == ("pineforge-4pass/pineforge-data", 70, 2)
+        return jobs
+
+    monkeypatch.setattr(evidence, "attempt_jobs", attempt_jobs)
+    return root, directory, needs, jobs
+
+
+@pytest.mark.parametrize("stale_statuses", [False, True], ids=["names-only", "stale-statuses"])
+def test_create_evidence_accepts_api_inventory_without_waiting(
+    evidence_inputs, monkeypatch, stale_statuses
+) -> None:
+    root, directory, needs, jobs = evidence_inputs
+    if stale_statuses:
+        for index, job in enumerate(jobs):
+            job["status"] = "in_progress" if index % 2 == 0 else "queued"
+
+    def reject_sleep(_seconds: float) -> None:
+        raise AssertionError("sleep")
+
+    monkeypatch.setattr(time, "sleep", reject_sleep)
+    result = evidence.create_evidence(root, directory, needs)
+    assert result["jobs"] == dict.fromkeys(evidence.JOBS, "success")
+    assert not hasattr(evidence, "JOBS_CLOSE_TIMEOUT")
+    assert not hasattr(evidence, "closed_jobs")
+
+
+@pytest.mark.parametrize("job_id", sorted(evidence.NEEDS))
+@pytest.mark.parametrize("result", ["failure", "cancelled", "skipped"])
+def test_create_evidence_rejects_unsuccessful_needs(evidence_inputs, job_id, result) -> None:
+    root, directory, needs, _jobs = evidence_inputs
+    needs[job_id]["result"] = result
+    with pytest.raises(ValueError, match="a required CI job failed"):
+        evidence.create_evidence(root, directory, needs)
+
+
+def test_create_evidence_rejects_missing_need(evidence_inputs) -> None:
+    root, directory, needs, _jobs = evidence_inputs
+    needs.pop("test")
+    with pytest.raises(ValueError, match="required CI job inventory changed"):
+        evidence.create_evidence(root, directory, needs)
+
+
+@pytest.mark.parametrize("job_name", evidence.JOBS)
+@pytest.mark.parametrize("defect", ["missing", "duplicated"])
+def test_create_evidence_rejects_missing_or_duplicated_api_names(
+    evidence_inputs, job_name, defect
+) -> None:
+    root, directory, needs, jobs = evidence_inputs
+    if defect == "missing":
+        jobs[:] = [job for job in jobs if job["name"] != job_name]
+    else:
+        jobs.append({"name": job_name})
+    with pytest.raises(ValueError, match="missing or duplicated"):
+        evidence.create_evidence(root, directory, needs)
+
+
+@pytest.mark.parametrize(
+    "workflow",
+    [
+        (ROOT / ".github" / "workflows" / "ci.yml")
+        .read_text()
+        .replace("  test:\n", "  test:\n    continue-on-error: true\n", 1),
+        (ROOT / ".github" / "workflows" / "ci.yml").read_text() + "# continue-on-error: true\n",
+        (ROOT / ".github" / "workflows" / "ci.yml")
+        .read_text()
+        .replace("  test:\n", '  test:\n    "\\u0063ontinue-on-error": true\n', 1),
+        (ROOT / ".github" / "workflows" / "ci.yml").read_text() + "\n",
+    ],
+    ids=["enabled", "comment", "escaped-key", "whitespace-only"],
+)
+def test_create_evidence_rejects_continue_on_error(evidence_inputs, workflow) -> None:
+    root, directory, needs, _jobs = evidence_inputs
+    (root / ".github" / "workflows" / "ci.yml").write_text(workflow)
+    with pytest.raises(ValueError, match=r"ci\.yml changed or uses continue-on-error"):
+        evidence.create_evidence(root, directory, needs)
+
+
+def test_reviewed_ci_workflow_pin_matches_the_file() -> None:
+    assert (
+        evidence.sha256((ROOT / ".github" / "workflows" / "ci.yml").read_bytes())
+        == evidence.REVIEWED_CI_WORKFLOW_SHA256
+    ), (
+        "ci.yml changed: update REVIEWED_CI_WORKFLOW_SHA256 after reviewing that "
+        'needs.<job>.result == "success" still proves every matrix leg succeeded'
+    )
+
+
+def test_create_evidence_rejects_missing_workflow(evidence_inputs) -> None:
+    root, directory, needs, _jobs = evidence_inputs
+    (root / ".github" / "workflows" / "ci.yml").unlink()
+    with pytest.raises(ValueError, match=r"cannot read ci\.yml"):
+        evidence.create_evidence(root, directory, needs)
 
 
 @pytest.mark.parametrize(

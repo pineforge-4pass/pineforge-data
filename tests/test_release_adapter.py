@@ -520,7 +520,7 @@ def test_create_evidence_rejects_missing_or_duplicated_api_names(
 def test_create_evidence_rejects_continue_on_error(evidence_inputs, workflow) -> None:
     root, directory, needs, _jobs = evidence_inputs
     (root / ".github" / "workflows" / "ci.yml").write_text(workflow)
-    with pytest.raises(ValueError, match="ci.yml changed or uses continue-on-error"):
+    with pytest.raises(ValueError, match=r"ci\.yml changed or uses continue-on-error"):
         evidence.create_evidence(root, directory, needs)
 
 
@@ -537,7 +537,7 @@ def test_reviewed_ci_workflow_pin_matches_the_file() -> None:
 def test_create_evidence_rejects_missing_workflow(evidence_inputs) -> None:
     root, directory, needs, _jobs = evidence_inputs
     (root / ".github" / "workflows" / "ci.yml").unlink()
-    with pytest.raises(ValueError, match="ci.yml"):
+    with pytest.raises(ValueError, match=r"cannot read ci\.yml"):
         evidence.create_evidence(root, directory, needs)
 
 

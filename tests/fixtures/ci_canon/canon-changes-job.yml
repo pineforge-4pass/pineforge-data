@@ -32,11 +32,18 @@ jobs:
           code=true
           if [[ "$EVENT" == pull_request ]]; then
             [[ "$PR_BASE" =~ ^[0-9a-f]{40}$ && "$PR_HEAD" =~ ^[0-9a-f]{40}$ ]]
-            [[ "$(git rev-parse --verify HEAD)" == "$PR_HEAD" ]]
-            git rev-parse --verify "$PR_BASE^{commit}" > /dev/null
-            git rev-parse --verify "$PR_HEAD^{commit}" > /dev/null
+            if ! checkout_head=$(git rev-parse --verify HEAD) ||
+               ! git rev-parse --verify "$PR_BASE^{commit}" > /dev/null ||
+               ! git rev-parse --verify "$PR_HEAD^{commit}" > /dev/null; then
+              printf 'docs_only=false\nworkflows_only=false\ncode=true\n' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            [[ "$checkout_head" == "$PR_HEAD" ]]
             diff_paths=$(mktemp "$RUNNER_TEMP/ci-changes.XXXXXXXX")
-            git diff --no-ext-diff --no-textconv --no-renames --ignore-submodules=none --raw --no-abbrev -z "$PR_BASE...$PR_HEAD" -- > "$diff_paths"
+            if ! git diff --no-ext-diff --no-textconv --no-renames --ignore-submodules=none --raw --no-abbrev -z "$PR_BASE...$PR_HEAD" -- > "$diff_paths"; then
+              printf 'docs_only=false\nworkflows_only=false\ncode=true\n' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             has_docs=false
             has_workflows=false
             has_code=false
@@ -82,8 +89,23 @@ jobs:
               has_code=true
             fi
             if [[ "$has_code" == false && "$has_workflows" == true ]]; then
-              workflows_only=true
-              code=false
+              # LB-570: only tracked head files outside .github may opt in.
+              if inside_worktree=$(git rev-parse --is-inside-work-tree) &&
+                 [[ "$inside_worktree" == true ]] &&
+                 workflow_tests=$(git ls-tree -r --name-only "$PR_HEAD" -- ':(top,literal)ci/workflow-tests'); then
+                if [[ "$workflow_tests" != ci/workflow-tests ]]; then
+                  grep_errors=$(mktemp "$RUNNER_TEMP/ci-workflow-deps.XXXXXXXX")
+                  if git grep --no-textconv -F -l -e '.github/workflows' "$PR_HEAD" -- . ':(top,exclude).github' > /dev/null 2> "$grep_errors"; then
+                    has_code=true
+                  else
+                    grep_status=$?
+                    if [[ "$grep_status" -eq 1 && ! -s "$grep_errors" ]]; then
+                      workflows_only=true
+                      code=false
+                    fi
+                  fi
+                fi
+              fi
             elif [[ "$has_code" == false && "$has_docs" == true ]]; then
               docs_only=true
               code=false

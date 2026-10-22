@@ -1607,6 +1607,8 @@ def classify(
         environment["PR_BASE"] = "not-a-sha"
     elif sha_fault == "missing-base":
         environment["PR_BASE"] = "0" * 40
+    elif sha_fault == "missing-head":
+        environment["PR_HEAD"] = "0" * 40
     elif sha_fault == "invalid-head":
         environment["PR_HEAD"] = "not-a-sha"
     elif sha_fault == "head-mismatch":
@@ -1727,12 +1729,24 @@ def test_non_pr_events_run_full_suites_even_for_documentation(
 
 
 @pytest.mark.parametrize("job_id", ["changes", "check"])
-@pytest.mark.parametrize("fault", ["invalid-base", "missing-base", "invalid-head", "head-mismatch"])
+@pytest.mark.parametrize(
+    "fault,expected",
+    [
+        ("invalid-base", None),
+        ("missing-base", ("false", "false", "true")),
+        ("missing-head", ("false", "false", "true")),
+        ("invalid-head", None),
+        ("head-mismatch", None),
+    ],
+)
 def test_classification_fails_closed_for_invalid_or_missing_objects(
-    tmp_path: Path, job_id: str, fault: str
+    tmp_path: Path, job_id: str, fault: str, expected: tuple[str, str, str] | None
 ) -> None:
-    with pytest.raises(subprocess.CalledProcessError):
-        classify(tmp_path, {"docs/a.md": "x"}, job_id, sha_fault=fault)
+    if expected is None:
+        with pytest.raises(subprocess.CalledProcessError):
+            classify(tmp_path, {"docs/a.md": "x"}, job_id, sha_fault=fault)
+    else:
+        assert classify(tmp_path, {"docs/a.md": "x"}, job_id, sha_fault=fault) == expected
 
 
 def gate_inputs(

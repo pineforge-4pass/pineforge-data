@@ -228,7 +228,7 @@ jobs:
               exit 1 ;;
           esac
           lint_dir=$(mktemp -d "$RUNNER_TEMP/workflow-lint.XXXXXXXX")
-          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 120 \
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --retry 3 --retry-all-errors --speed-limit 1024 --speed-time 60 \
             --output "$lint_dir/$archive" "https://github.com/rhysd/actionlint/releases/download/v1.7.12/$archive"
           if ! printf '%s  %s\n' "$sha256" "$lint_dir/$archive" | sha256sum --check --strict --status; then
             echo "::error::actionlint archive checksum did not match the published pin"

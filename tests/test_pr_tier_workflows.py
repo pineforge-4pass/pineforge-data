@@ -1,4 +1,4 @@
-"""Pull-request tier of CI: pool runners, authorization, cancellation and the docs-only path."""
+"""Pull-request CI: runner pins, authorization, cancellation and canonical cheap PRs."""
 
 from __future__ import annotations
 
@@ -16,12 +16,9 @@ from release_chain import evidence
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github/workflows"
+CI_CANON = ROOT / "tests/fixtures/ci_canon"
 PR_TIER_WORKFLOWS = ("ci.yml", "docs.yml", "native-feed.yml")
 RUNTIME_JOBS = ("docker", "database-e2e", "contract", "distribution")
-# ci-labels.md ac875205 (frozen 10-20): the required aggregate runs `if: always()`; never
-# `!cancelled()` (a cancelled run would SKIP it and GitHub counts a skipped required check as
-# success). old: AGGREGATE_IF = "${{ !cancelled() }}" (#830, reverted for security).
-AGGREGATE_IF = "always()"
 
 HOSTED_GUARD = (
     "${{ github.event_name != 'pull_request' && "
@@ -62,15 +59,6 @@ PR_OR_RUN_KEY = (
 
 OLD_RUNTIME_IF = (
     "!cancelled() && (github.event_name != 'pull_request' || "
-    "(needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))"
-)
-# old: RUNTIME_IF = (
-#     "!cancelled() && (github.event_name != 'pull_request' || "
-#     "(needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))"
-# )
-RUNTIME_IF = (
-    "!cancelled() && needs.authz.result == 'success' && "
-    "(github.event_name != 'pull_request' || "
     "(needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))"
 )
 CANONICAL_AUTHZ_ENV = {
@@ -141,15 +129,18 @@ CANONICAL_AUTHZ_SCRIPT = (
     "esac\n"
     'echo "authz: allowed ($EVENT${PR_AUTHOR:+ by $PR_AUTHOR})" >> "$GITHUB_STEP_SUMMARY"\n'
 )
-READY_AUTHZ_CHECK = (
-    'if [ "$AUTHZ_RESULT" != "success" ]; then echo "authz: $AUTHZ_RESULT"; exit 1; fi'
-)
 
 
 def load(name: str) -> dict[str, Any]:
     loaded = yaml.load((WORKFLOWS / name).read_text(), Loader=yaml.BaseLoader)
     assert isinstance(loaded, dict)
     return loaded
+
+
+def canon_job(filename: str, job_id: str) -> dict[str, Any]:
+    loaded = yaml.load((CI_CANON / filename).read_text(), Loader=yaml.BaseLoader)
+    # The heavy-job example is a job fragment; the other fixtures include jobs:.
+    return dict(loaded.get("jobs", loaded)[job_id])
 
 
 def step_script(workflow: str, job: str, step_id: str) -> str:
@@ -218,6 +209,12 @@ def assert_permission_policy(workflow: dict[str, Any], name: str) -> None:
             # BaseLoader preserves an empty YAML mapping as a Python dict.
             # old: assert "permissions" not in job
             assert job["permissions"] == {}
+        elif name == "ci.yml" and job_id in ("changes", "workflow-lint", "check"):
+            canonical_permissions = canon_job("canon-changes-job.yml", "changes")["permissions"]
+            assert job["permissions"] == canonical_permissions
+        elif name == "ci.yml" and job_id == "docs-tests":
+            # The light documentation job may read the repository and nothing else.
+            assert job["permissions"] == {"contents": "read"}
         else:
             # old (for authz): assert job.get("permissions") == {"contents": "read"}
             assert "permissions" not in job
@@ -250,6 +247,7 @@ def assert_canonical_authz(job: dict[str, Any]) -> None:
     steps = job["steps"]
     assert isinstance(steps, list)
     assert len(steps) == 1, "authz is exactly the frozen canonical decision"
+    assert steps == canon_job("canon-authz-job.yml", "authz")["steps"]
     step = steps[0]
     assert set(step) == {"name", "env", "run"}
     # old: assert step["name"] == "Same-repository pull requests only"
@@ -262,12 +260,6 @@ def assert_canonical_authz(job: dict[str, Any]) -> None:
     assert [line.strip() for line in script.strip().splitlines()] == [
         line.strip() for line in CANONICAL_AUTHZ_SCRIPT.strip().splitlines()
     ]
-
-
-def assert_ready_authz(job: dict[str, Any]) -> None:
-    gate = next(step for step in job["steps"] if step.get("id") == "gate")
-    assert gate["env"].get("AUTHZ_RESULT") == "${{ needs.authz.result }}"
-    assert gate["run"].splitlines()[0] == READY_AUTHZ_CHECK
 
 
 def cancels_only_pull_requests(concurrency: dict[str, str]) -> bool:
@@ -496,6 +488,21 @@ def test_secret_and_permission_policy_rejects_unauthorized_scope(
     assert workflow != original
     with pytest.raises(AssertionError):
         assert_permission_policy(workflow, name)
+
+
+def test_documentation_permission_policy_rejects_wider_scopes() -> None:
+    original = load("ci.yml")
+    assert_permission_policy(original, "ci.yml")
+    for job_id, permissions in (
+        ("docs-tests", {"contents": "write"}),
+        ("docs-tests", {"contents": "read", "pull-requests": "write"}),
+        ("docker", {"contents": "read"}),
+    ):
+        workflow = copy.deepcopy(original)
+        workflow["jobs"][job_id]["permissions"] = permissions
+        assert workflow != original
+        with pytest.raises(AssertionError):
+            assert_permission_policy(workflow, "ci.yml")
 
 
 @pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
@@ -1197,30 +1204,59 @@ def test_authz_decision_depends_on_the_exact_bot_allowlist(tmp_path: Path, name:
     assert changed == (0, allowed_authz_summary(inputs), "")
 
 
-def assert_docs_only_policy(jobs: dict[str, Any]) -> None:
-    assert jobs["changes"]["if"] == "github.event_name == 'pull_request'"
-    assert jobs["changes"]["needs"] == "authz"
-    # The unit matrix always runs: tests/test_documentation.py checks README.md, CONTRIBUTING.md
-    # and docs/ links, and its check names stay reported.
-    # old: assert "needs" not in jobs["test"]
-    assert jobs["test"]["needs"] == "authz"
-    assert "if" not in jobs["test"]
-    for name in RUNTIME_JOBS:
-        # old: assert jobs[name]["needs"] == "changes"
-        assert needs(jobs[name]) == {"authz", "changes"}
-        # old: assert " ".join(jobs[name]["if"].split()) == RUNTIME_IF
-        # old: RUNTIME_IF had "!cancelled() &&" immediately followed by the event condition.
-        assert " ".join(jobs[name]["if"].split()) == RUNTIME_IF
-    # old: assert set(jobs["ready"]["needs"]) == {"changes", "test", *RUNTIME_JOBS}
-    assert set(jobs["ready"]["needs"]) == {"authz", "changes", "test", *RUNTIME_JOBS}
-    # old: assert jobs["ready"]["if"] == "always()"  (then #830: "${{ !cancelled() }}", reverted)
-    # ci-labels.md ac875205: the required aggregate is always(), never skippable by a cancel.
-    assert jobs["ready"]["if"] == AGGREGATE_IF
+def heavy_job_ids(jobs: dict[str, Any]) -> list[str]:
+    return sorted(
+        job_id for job_id, job in jobs.items() if job_id != "check" and "changes" in needs(job)
+    )
+
+
+def assert_cheap_pr_policy(workflow: dict[str, Any]) -> None:
+    jobs = workflow["jobs"]
+    assert {"authz", "changes", "workflow-lint", "check"} <= set(jobs)
+    assert "env" not in workflow
+    assert "defaults" not in workflow
+    pull_request = workflow["on"]["pull_request"] or {}
+    assert isinstance(pull_request, dict)
+    assert not {"paths", "paths-ignore", "branches", "branches-ignore"} & set(pull_request)
+    assert jobs["changes"] == canon_job("canon-changes-job.yml", "changes")
+    assert jobs["workflow-lint"] == canon_job("canon-workflow-lint-job.yml", "workflow-lint")
+    example = canon_job("canon-heavy-job-example.yml", "shard-a")
+    for job_id in ("test", *RUNTIME_JOBS):
+        assert jobs[job_id]["needs"] == example["needs"]
+    assert needs(jobs["ready"]) == evidence.NEEDS | needs(example)
     assert jobs["ready"]["name"] == "release/ready"
+    heavy = heavy_job_ids(jobs)
+    assert heavy
+    for job_id in heavy:
+        assert needs(jobs[job_id]) >= needs(example)
+        assert jobs[job_id].get("if") == example["if"]
+        assert jobs[job_id].get("continue-on-error", "false") == "false"
+    for job_id, job in jobs.items():
+        assert "timeout-minutes" not in job
+        if job_id != "check":
+            assert re.search(r"\balways\s*\(", job.get("if", ""), re.IGNORECASE) is None
+    expected = canon_job("canon-check-aggregate-job.yml", "check")
+    expected["needs"] = [job_id for job_id in jobs if job_id != "check"]
+    expected["steps"][-1]["env"]["HEAVY_JOBS"] = json.dumps(heavy, separators=(",", ":"))
+    assert jobs["check"] == expected
 
 
-def test_docs_only_prs_skip_only_the_runtime_jobs() -> None:
-    assert_docs_only_policy(load("ci.yml")["jobs"])
+def test_cheap_pr_jobs_match_the_canon_and_cover_every_dependency() -> None:
+    assert_cheap_pr_policy(load("ci.yml"))
+
+
+def test_documentation_tests_are_a_light_job_the_aggregate_requires() -> None:
+    jobs = load("ci.yml")["jobs"]
+    docs = jobs["docs-tests"]
+    assert needs(docs) == {"authz"}
+    # A light job carries no job-level condition: every step is guarded by authz
+    # success, so it cannot be skipped and cannot use a status function (R7/R10).
+    assert "if" not in docs
+    assert docs["runs-on"] == "ubuntu-24.04"
+    assert docs["env"]["PF_CI_LABELS"] == '["ubuntu-24.04"]'
+    commands = "\n".join(step.get("run", "") for step in docs["steps"])
+    assert "pytest tests/test_documentation.py" in commands
+    assert "docs-tests" in needs(jobs["check"])
 
 
 @pytest.mark.parametrize(
@@ -1228,7 +1264,7 @@ def test_docs_only_prs_skip_only_the_runtime_jobs() -> None:
     [
         ("changes", "needs", []),
         ("test", "needs", []),
-        ("test", "if", "needs.changes.outputs.code == 'true'"),
+        ("test", "needs", ["authz"]),
         ("ready", "needs", ["changes", "test", *RUNTIME_JOBS]),
         ("ready", "needs", ["authz", "changes", "test", *RUNTIME_JOBS, "extra"]),
         *[(job_id, "needs", ["changes"]) for job_id in RUNTIME_JOBS],
@@ -1236,14 +1272,102 @@ def test_docs_only_prs_skip_only_the_runtime_jobs() -> None:
         *[(job_id, "if", OLD_RUNTIME_IF) for job_id in RUNTIME_JOBS],
     ],
 )
-def test_docs_only_policy_rejects_missing_authz_and_extra_dependencies(
+def test_cheap_pr_policy_rejects_missing_authz_and_extra_dependencies(
     job_id: str, key: str, value: Any
 ) -> None:
-    jobs = copy.deepcopy(load("ci.yml")["jobs"])
-    assert_docs_only_policy(jobs)
-    jobs[job_id][key] = value
+    workflow = copy.deepcopy(load("ci.yml"))
+    assert_cheap_pr_policy(workflow)
+    workflow["jobs"][job_id][key] = value
     with pytest.raises(AssertionError):
-        assert_docs_only_policy(jobs)
+        assert_cheap_pr_policy(workflow)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing-lint-dependency",
+        "unlisted-heavy-job",
+        "renamed-check",
+        "named-check",
+        "always-outside-check",
+        "conditional-lint",
+        "missing-lint",
+        "missing-docs-tests-dependency",
+        "duplicate-dependency",
+        "workflow-env",
+        "workflow-defaults",
+        "paths-filter",
+    ],
+)
+def test_cheap_pr_structure_rejects_unsafe_mutations(fault: str) -> None:
+    original = load("ci.yml")
+    assert_cheap_pr_policy(original)
+    workflow = copy.deepcopy(original)
+    jobs = workflow["jobs"]
+    if fault == "missing-lint-dependency":
+        jobs["check"]["needs"].remove("workflow-lint")
+    elif fault == "unlisted-heavy-job":
+        jobs["extra-heavy"] = canon_job("canon-heavy-job-example.yml", "shard-a")
+        jobs["check"]["needs"].append("extra-heavy")
+    elif fault == "renamed-check":
+        jobs["aggregate"] = jobs.pop("check")
+    elif fault == "named-check":
+        jobs["check"]["name"] = "check"
+    elif fault == "always-outside-check":
+        jobs["authz"]["if"] = "${{ always() }}"
+    elif fault == "conditional-lint":
+        jobs["workflow-lint"]["if"] = "github.event_name == 'push'"
+    elif fault == "missing-lint":
+        del jobs["workflow-lint"]
+    elif fault == "missing-docs-tests-dependency":
+        jobs["check"]["needs"].remove("docs-tests")
+    elif fault == "duplicate-dependency":
+        jobs["check"]["needs"].append("authz")
+    elif fault == "workflow-env":
+        workflow["env"] = {"BASH_ENV": "untrusted.sh"}
+    elif fault == "workflow-defaults":
+        workflow["defaults"] = {"run": {"shell": "bash untrusted.sh {0}"}}
+    else:
+        workflow["on"]["pull_request"] = {"paths": ["src/**"]}
+    assert workflow != original
+    with pytest.raises(AssertionError):
+        assert_cheap_pr_policy(workflow)
+
+
+@pytest.mark.parametrize("job_id", ["changes", "check"])
+def test_cheap_pr_structure_rejects_one_changed_classifier_byte(job_id: str) -> None:
+    workflow = copy.deepcopy(load("ci.yml"))
+    assert_cheap_pr_policy(workflow)
+    step = next(s for s in workflow["jobs"][job_id]["steps"] if s.get("id") == "classify")
+    script = step["run"]
+    step["run"] = script.replace("code=true", "code=True", 1)
+    assert sum(a != b for a, b in zip(script, step["run"], strict=True)) == 1
+    with pytest.raises(AssertionError):
+        assert_cheap_pr_policy(workflow)
+
+
+@pytest.mark.parametrize("job_id", ["test", *RUNTIME_JOBS, "ready"])
+@pytest.mark.parametrize(
+    "condition",
+    [
+        None,
+        OLD_RUNTIME_IF,
+        "!cancelled() && needs.changes.outputs.code == 'true'",
+        "${{ needs.changes.outputs.code == 'true' }}",
+        "always()",
+    ],
+)
+def test_every_heavy_job_requires_the_exact_canon_condition(
+    job_id: str, condition: str | None
+) -> None:
+    workflow = copy.deepcopy(load("ci.yml"))
+    assert_cheap_pr_policy(workflow)
+    if condition is None:
+        del workflow["jobs"][job_id]["if"]
+    else:
+        workflow["jobs"][job_id]["if"] = condition
+    with pytest.raises(AssertionError):
+        assert_cheap_pr_policy(workflow)
 
 
 def test_evidence_inventory_stays_the_five_gated_jobs() -> None:
@@ -1260,11 +1384,26 @@ def test_evidence_inventory_stays_the_five_gated_jobs() -> None:
     assert set(needs) == evidence.NEEDS
     # create_evidence rejects anything else, so the path decision job must not leak in.
     assert "changes" not in needs
-    # old: assert aggregate["if"] == "steps.gate.outputs.evidence == 'true'"
-    # ci-labels.md rule 3a: a step that runs repo code also requires a successful authz.
-    assert aggregate["if"] == (
-        "needs.authz.result == 'success' && steps.gate.outputs.evidence == 'true'"
-    )
+    assert aggregate["if"] == "needs.authz.result == 'success'"
+    assert aggregate["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert aggregate["run"] == "python -m release_chain.evidence aggregate --path dist"
+    assert len(steps) == 5
+    assert [step["uses"] for step in steps[:3]] == [
+        "actions/checkout@v7",
+        "actions/setup-python@v6",
+        "actions/download-artifact@v6",
+    ]
+    assert steps[-1] == {
+        "uses": "actions/upload-artifact@v5",
+        "if": "needs.authz.result == 'success'",
+        "with": {
+            "name": "release-evidence-${{ github.run_attempt }}",
+            "path": "evidence.json",
+            "if-no-files-found": "error",
+        },
+    }
+    for step in steps:
+        assert step["if"] == "needs.authz.result == 'success'"
 
 
 REFUSE_STEP = {
@@ -1274,53 +1413,57 @@ REFUSE_STEP = {
 }
 
 
-def assert_always_job_refuses_first(job: dict[str, Any], *, runtime: bool = False) -> None:
-    """ci-labels.md rule 3a for a job with a status function that needs authz."""
-    # old: assert job["if"] == AGGREGATE_IF
-    if runtime:
-        assert " ".join(job["if"].split()) == RUNTIME_IF
-    else:
-        # old: assert job["if"] == "always()"
-        assert job["if"] == AGGREGATE_IF
+def assert_always_job_refuses_first(job: dict[str, Any]) -> None:
+    canonical = canon_job("canon-check-aggregate-job.yml", "check")
+    assert job["if"] == canonical["if"]
     assert "authz" in needs(job)
     steps = job["steps"]
-    assert steps[0] == REFUSE_STEP, "the refusal is the FIRST step, before any checkout"
-    for step in steps[1:]:
-        # old: uses_repo = "actions/checkout" in step.get("uses", "") or "run" in step
+    assert steps[0] == canonical["steps"][0], "the refusal is FIRST, before any checkout"
+    assert_guarded_repo_steps(steps[1:])
+
+
+def assert_guarded_repo_steps(steps: list[dict[str, Any]]) -> None:
+    for step in steps:
         uses_repo = (
             "actions/checkout" in step.get("uses", "")
             or step.get("uses", "").startswith("./")
             or "run" in step
         )
-        # old: if uses_repo and step.get("id") != "gate":
-        # old:     assert "needs.authz.result == 'success'" in step.get("if", ""), step
         if uses_repo:
             assert "needs.authz.result == 'success'" in step.get("if", ""), step
 
 
+def assert_runtime_job_guards(job: dict[str, Any]) -> None:
+    example = canon_job("canon-heavy-job-example.yml", "shard-a")
+    assert job["if"] == example["if"]
+    assert needs(job) >= needs(example)
+    steps = job["steps"]
+    assert steps[0] == REFUSE_STEP
+    assert_guarded_repo_steps(steps[1:])
+
+
 def test_always_jobs_refuse_a_failed_authz_before_any_repo_code() -> None:
     ci = load("ci.yml")["jobs"]
-    assert_always_job_refuses_first(ci["ready"])
-    # Status functions require the refusal and step guards even with a job-level authz check.
+    assert_always_job_refuses_first(ci["check"])
     for name in RUNTIME_JOBS:
-        assert "needs.authz.result == 'success'" in ci[name]["if"]
-        assert_always_job_refuses_first(ci[name], runtime=True)
-    for workflow in ("ci.yml", "docs.yml", "native-feed.yml"):
+        assert_runtime_job_guards(ci[name])
+    assert_guarded_repo_steps(ci["ready"]["steps"])
+    for workflow in PR_TIER_WORKFLOWS:
         for job_id, job in load(workflow)["jobs"].items():
             condition = job.get("if", "")
-            if job_id != "ready" and ("always()" in condition or "!cancelled()" in condition):
+            if job_id != "check" and ("always()" in condition or "!cancelled()" in condition):
                 assert "needs.authz.result == 'success'" in condition, (workflow, job_id)
 
 
 def assert_aggregate_is_always(jobs: dict[str, Any]) -> None:
-    # old: assert "always()" not in job.get("if", "") for every job (the #830 pin, reverted).
-    assert jobs["ready"]["if"] == "always()"
+    assert jobs["check"]["if"] == canon_job("canon-check-aggregate-job.yml", "check")["if"]
     for job_id, job in jobs.items():
         condition = job.get("if", "")
-        if job_id == "ready":
+        if job_id == "check":
             continue
         # No other job may be a bare `!cancelled()` aggregate that a cancelled run skips.
         assert condition.replace(" ", "") not in ("!cancelled()", "${{!cancelled()}}"), job_id
+        assert re.search(r"\balways\s*\(", condition, re.IGNORECASE) is None, job_id
 
 
 def test_the_required_aggregate_runs_always_never_cancelled_only() -> None:
@@ -1331,21 +1474,19 @@ def test_the_required_aggregate_runs_always_never_cancelled_only() -> None:
 def test_an_aggregate_that_a_cancelled_run_can_skip_is_rejected(fault: str) -> None:
     jobs = copy.deepcopy(load("ci.yml")["jobs"])
     assert_aggregate_is_always(jobs)
-    jobs["ready"]["if"] = fault
+    jobs["check"]["if"] = fault
     with pytest.raises(AssertionError):
         assert_aggregate_is_always(jobs)
 
 
 @pytest.mark.parametrize(
-    # old: "always" wrote "always()" back unchanged after the canon was frozen.
     "fault", ["cancelled-only", "no-refusal", "refusal-not-first", "unguarded-checkout"]
 )
 def test_always_job_rejects_missing_first_refusal_or_unguarded_repo_code(fault: str) -> None:
-    original = load("ci.yml")["jobs"]["ready"]
+    original = load("ci.yml")["jobs"]["check"]
     assert_always_job_refuses_first(original)
     job = copy.deepcopy(original)
     if fault == "cancelled-only":
-        # old: job["if"] = "always()"
         job["if"] = "${{ !cancelled() }}"
     elif fault == "no-refusal":
         del job["steps"][0]
@@ -1353,18 +1494,17 @@ def test_always_job_rejects_missing_first_refusal_or_unguarded_repo_code(fault: 
         job["steps"].insert(1, job["steps"].pop(0))
     else:
         checkout = next(s for s in job["steps"] if "actions/checkout" in s.get("uses", ""))
-        checkout["if"] = "steps.gate.outputs.evidence == 'true'"
+        del checkout["if"]
     assert job != original
     with pytest.raises(AssertionError):
         assert_always_job_refuses_first(job)
 
 
-@pytest.mark.parametrize("job_id", [*RUNTIME_JOBS, "ready"])
+@pytest.mark.parametrize("job_id", RUNTIME_JOBS)
 @pytest.mark.parametrize("fault", ["no-refusal", "unguarded-run"])
-def test_status_jobs_reject_missing_refusal_or_unguarded_run(job_id: str, fault: str) -> None:
+def test_runtime_jobs_reject_missing_refusal_or_unguarded_run(job_id: str, fault: str) -> None:
     original = load("ci.yml")["jobs"][job_id]
-    runtime = job_id in RUNTIME_JOBS
-    assert_always_job_refuses_first(original, runtime=runtime)
+    assert_runtime_job_guards(original)
     job = copy.deepcopy(original)
     if fault == "no-refusal":
         del job["steps"][0]
@@ -1373,7 +1513,23 @@ def test_status_jobs_reject_missing_refusal_or_unguarded_run(job_id: str, fault:
         del run["if"]
     assert job != original
     with pytest.raises(AssertionError):
-        assert_always_job_refuses_first(job, runtime=runtime)
+        assert_runtime_job_guards(job)
+
+
+def test_ready_rejects_an_unguarded_repository_step() -> None:
+    job = copy.deepcopy(load("ci.yml")["jobs"]["ready"])
+    assert_guarded_repo_steps(job["steps"])
+    run = next(step for step in job["steps"] if "run" in step)
+    del run["if"]
+    with pytest.raises(AssertionError):
+        assert_guarded_repo_steps(job["steps"])
+
+
+@pytest.mark.parametrize("path", sorted(WORKFLOWS.glob("*.yml")), ids=lambda path: path.name)
+def test_job_level_always_is_reserved_for_check(path: Path) -> None:
+    for job_id, job in load(path.name)["jobs"].items():
+        if job_id != "check":
+            assert re.search(r"\balways\s*\(", job.get("if", ""), re.IGNORECASE) is None
 
 
 def git(repo: Path, *args: str) -> str:
@@ -1395,12 +1551,21 @@ def git(repo: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-def classify(tmp_path: Path, changed: dict[str, str | None]) -> str:
-    """Run the workflow's own classification step on a throwaway base and tested merge."""
+def classify(
+    tmp_path: Path,
+    changed: dict[str, str | None],
+    job_id: str,
+    *,
+    kind: str = "regular",
+    event: str = "pull_request",
+    sha_fault: str = "",
+) -> tuple[str, str, str]:
+    """Run the actual classifier on base/head commits, including Git file modes."""
     repo = tmp_path / "repo"
     repo.mkdir()
     git(repo, "init", "-q")
-    for name in ("README.md", "src/module.py", "docs/index.md"):
+    git(repo, "config", "core.filemode", "true")
+    for name in ("README.md", "src/module.py", "docs/index.md", "docs/a.md"):
         path = repo / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("base\n")
@@ -1414,44 +1579,94 @@ def classify(tmp_path: Path, changed: dict[str, str | None]) -> str:
             path = repo / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text)
+    if kind == "executable":
+        (repo / next(iter(changed))).chmod(0o755)
+    elif kind == "symlink":
+        path = repo / next(iter(changed))
+        path.unlink()
+        path.symlink_to("missing-target")
+    elif kind == "gitlink":
+        (repo / next(iter(changed))).unlink()
     git(repo, "add", "-A")
+    if kind == "gitlink":
+        git(repo, "update-index", "--add", "--cacheinfo", f"160000,{base},{next(iter(changed))}")
+        # The canon's explicit --ignore-submodules=none must override this setting.
+        git(repo, "config", "diff.ignoreSubmodules", "all")
     git(repo, "commit", "-q", "--allow-empty", "-m", "change")
+    head = git(repo, "rev-parse", "HEAD")
     output = tmp_path / "github-output"
     environment = {
         **os.environ,
-        "BASE_SHA": base,
+        "EVENT": event,
+        "PR_BASE": base,
+        "PR_HEAD": head,
         "RUNNER_TEMP": str(tmp_path),
         "GITHUB_OUTPUT": str(output),
     }
+    if sha_fault == "invalid-base":
+        environment["PR_BASE"] = "not-a-sha"
+    elif sha_fault == "missing-base":
+        environment["PR_BASE"] = "0" * 40
+    elif sha_fault == "invalid-head":
+        environment["PR_HEAD"] = "not-a-sha"
+    elif sha_fault == "head-mismatch":
+        environment["PR_HEAD"] = base
     subprocess.run(
-        ["bash", "-e", "-c", step_script("ci.yml", "changes", "paths")],
+        ["bash", "-e", "-c", step_script("ci.yml", job_id, "classify")],
         cwd=repo,
         env=environment,
         check=True,
+        capture_output=True,
+        text=True,
     )
-    return output.read_text().strip()
+    outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert set(outputs) == set(canon_job("canon-changes-job.yml", "changes")["outputs"])
+    return outputs["docs_only"], outputs["workflows_only"], outputs["code"]
 
 
 def label(changed: dict[str, str | None]) -> str:
     return "+".join(sorted(changed))
 
 
-DOCS_ONLY = [
+DOCS_ONLY: list[dict[str, str | None]] = [
     {"README.md": "x"},
     {"CONTRIBUTING.md": "x"},
+    {"CHANGELOG.md": "x"},
+    {"CODE_OF_CONDUCT.md": "x"},
+    {"SECURITY.md": "x"},
     {"LICENSE": "x"},
-    {"mkdocs.yml": "x"},
+    {"LICENSE.md": "x"},
+    {"LICENSE.txt": "x"},
+    {"docs/a.md": "x"},
     {"docs/index.md": "x"},
+    {"docs/a.rst": "x"},
+    {"docs/a.txt": "x"},
     {"docs/nested dir/with space.md": "x"},
-    {"README.md": "x", "docs/index.md": "y", "mkdocs.yml": "z"},
+    {"docs/line\nbreak.md": "x"},
+    {"README.md": "x", "docs/index.md": "y"},
+    {"docs/a.md": None},
+]
+WORKFLOWS_ONLY: list[dict[str, str | None]] = [
+    {".github/workflows/x.yml": "x"},
+    {".github/workflows/x.yaml": "x"},
+    {".github/workflows/x.yml": "x", "docs/a.md": "y"},
+    {".github/workflows/x.yaml": "x", "README.md": "y", "docs/a.txt": "z"},
 ]
 CODE_CHANGES: list[dict[str, str | None]] = [
+    {},
     {"src/module.py": "x"},
     {"pyproject.toml": "x"},
-    {".github/workflows/ci.yml": "x"},
+    {"mkdocs.yml": "x"},
+    {"README.md": "x", "docs/index.md": "y", "mkdocs.yml": "z"},
+    {".github/workflows/sub/x.yml": "x"},
+    {".github/actionlint.yaml": "x"},
+    {".github/workflows/x.yml": "x", "src/x.py": "y"},
+    {"tests/test_pr_tier_workflows.py": "x"},
     {"tests/fixtures/CORPUS.md": "x"},
     {"native/feed/README.md": "x"},
     {"src/README.md": "x"},
+    {"docs/a.MD": "x"},
+    {"docs/run.sh": "x"},
     {"docs.py": "x"},
     {"docs-extra/page.md": "x"},
     {"README.md.bak": "x"},
@@ -1459,156 +1674,195 @@ CODE_CHANGES: list[dict[str, str | None]] = [
     # A pure rename of code into docs/ is detected as a rename by default; --no-renames keeps
     # the code path in the list.
     {"src/module.py": None, "docs/module.py": "base\n"},
+    {"docs/a.md": None, "src/a.md": "base\n"},
 ]
 
 
+@pytest.mark.parametrize("job_id", ["changes", "check"])
 @pytest.mark.parametrize("changed", DOCS_ONLY, ids=label)
-def test_docs_only_changes_are_classified_as_docs(tmp_path: Path, changed: dict[str, str]) -> None:
-    assert classify(tmp_path, dict(changed)) == "code=false"
+def test_docs_only_changes_are_classified_as_docs(
+    tmp_path: Path, changed: dict[str, str | None], job_id: str
+) -> None:
+    assert classify(tmp_path, changed, job_id) == ("true", "false", "false")
 
 
+@pytest.mark.parametrize("job_id", ["changes", "check"])
+@pytest.mark.parametrize("changed", WORKFLOWS_ONLY, ids=label)
+def test_workflow_and_documentation_changes_are_classified_as_workflows(
+    tmp_path: Path, changed: dict[str, str | None], job_id: str
+) -> None:
+    assert classify(tmp_path, changed, job_id) == ("false", "true", "false")
+
+
+@pytest.mark.parametrize("job_id", ["changes", "check"])
 @pytest.mark.parametrize("changed", CODE_CHANGES, ids=label)
 def test_every_other_path_is_classified_as_code(
-    tmp_path: Path, changed: dict[str, str | None]
+    tmp_path: Path, changed: dict[str, str | None], job_id: str
 ) -> None:
-    assert classify(tmp_path, changed) == "code=true"
+    assert classify(tmp_path, changed, job_id) == ("false", "false", "true")
 
 
-def gate_inputs(event: str, changes: str, code: str, unit: str, runtime: str) -> dict[str, str]:
+@pytest.mark.parametrize("job_id", ["changes", "check"])
+@pytest.mark.parametrize("kind", ["executable", "symlink", "gitlink"])
+@pytest.mark.parametrize("path", ["docs/a.md", ".github/workflows/x.yml"])
+def test_nonregular_or_executable_files_are_always_code(
+    tmp_path: Path, job_id: str, kind: str, path: str
+) -> None:
+    assert classify(tmp_path, {path: "x"}, job_id, kind=kind) == ("false", "false", "true")
+
+
+@pytest.mark.parametrize("job_id", ["changes", "check"])
+@pytest.mark.parametrize(
+    "event",
+    ["push", "workflow_dispatch", "schedule", "merge_group", "release", "workflow_call"],
+)
+def test_non_pr_events_run_full_suites_even_for_documentation(
+    tmp_path: Path, job_id: str, event: str
+) -> None:
+    assert classify(tmp_path, {"docs/a.md": "x"}, job_id, event=event) == (
+        "false",
+        "false",
+        "true",
+    )
+
+
+@pytest.mark.parametrize("job_id", ["changes", "check"])
+@pytest.mark.parametrize("fault", ["invalid-base", "missing-base", "invalid-head", "head-mismatch"])
+def test_classification_fails_closed_for_invalid_or_missing_objects(
+    tmp_path: Path, job_id: str, fault: str
+) -> None:
+    with pytest.raises(subprocess.CalledProcessError):
+        classify(tmp_path, {"docs/a.md": "x"}, job_id, sha_fault=fault)
+
+
+def gate_inputs(
+    results: dict[str, str] | None = None,
+    *,
+    docs_only: str = "false",
+    workflows_only: str = "false",
+) -> dict[str, str]:
+    job = load("ci.yml")["jobs"]["check"]
+    outcomes = {job_id: {"result": "success"} for job_id in job["needs"]}
+    for job_id, result in (results or {}).items():
+        outcomes[job_id] = {"result": result}
     return {
-        # The previously accepted outcomes had no AUTHZ_RESULT input.
-        "AUTHZ_RESULT": "success",
-        "EVENT_NAME": event,
-        "CHANGES_RESULT": changes,
-        "CODE_CHANGED": code,
-        "UNIT_RESULT": unit,
-        "RUNTIME_RESULTS": runtime,
+        "NEEDS": json.dumps(outcomes),
+        "HEAVY_JOBS": job["steps"][-1]["env"]["HEAVY_JOBS"],
+        "DOCS_ONLY": docs_only,
+        "WORKFLOWS_ONLY": workflows_only,
     }
 
 
-def run_gate(tmp_path: Path, inputs: dict[str, str]) -> tuple[int, str, str]:
-    output = tmp_path / "github-output"
-    output.write_text("")
-    completed = subprocess.run(
-        ["bash", "-e", "-c", step_script("ci.yml", "ready", "gate")],
-        # old: env={**os.environ, **inputs, "GITHUB_OUTPUT": str(output)}
-        env={**inputs, "GITHUB_OUTPUT": str(output)},
+def run_gate(tmp_path: Path, inputs: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    script = load("ci.yml")["jobs"]["check"]["steps"][-1]["run"]
+    return subprocess.run(
+        ["bash", "-e", "-c", script],
+        cwd=tmp_path,
+        env={**os.environ, **inputs, "RUNNER_TEMP": str(tmp_path)},
         capture_output=True,
         text=True,
     )
-    return completed.returncode, output.read_text().strip(), completed.stdout
 
 
-ALL_SUCCESS = "success success success success"
-ALL_SKIPPED = "skipped skipped skipped skipped"
-ACCEPTED = {
-    "push": (gate_inputs("push", "skipped", "", "success", ALL_SUCCESS), "evidence=true"),
-    "code PR": (
-        gate_inputs("pull_request", "success", "true", "success", ALL_SUCCESS),
-        "evidence=true",
-    ),
-    "docs-only PR": (
-        gate_inputs("pull_request", "success", "false", "success", ALL_SKIPPED),
-        "evidence=false",
-    ),
-}
-AUTHZ_REJECTED = {
-    f"{case}: authz {result or 'empty'}": {**inputs, "AUTHZ_RESULT": result}
-    for case, (inputs, _expected) in ACCEPTED.items()
-    for result in ("failure", "cancelled", "skipped", "")
-}
-REJECTED = {
-    **AUTHZ_REJECTED,
-    "push skips a runtime job": gate_inputs(
-        "push", "skipped", "", "success", "success skipped success success"
-    ),
-    "code PR skips every runtime job": gate_inputs(
-        "pull_request", "success", "true", "success", ALL_SKIPPED
-    ),
-    "code PR with a failed runtime job": gate_inputs(
-        "pull_request", "success", "true", "success", "success success failure success"
-    ),
-    "docs-only PR ran the runtime jobs": gate_inputs(
-        "pull_request", "success", "false", "success", ALL_SUCCESS
-    ),
-    "docs-only PR with a failed runtime job": gate_inputs(
-        "pull_request", "success", "false", "success", "skipped skipped skipped failure"
-    ),
-    "PR whose path decision failed": gate_inputs(
-        "pull_request", "failure", "", "success", ALL_SKIPPED
-    ),
-    "PR whose path decision was skipped": gate_inputs(
-        "pull_request", "skipped", "", "success", ALL_SKIPPED
-    ),
-    "PR with an invalid path decision": gate_inputs(
-        "pull_request", "success", "maybe", "success", ALL_SKIPPED
-    ),
-    "PR with an empty path decision": gate_inputs(
-        "pull_request", "success", "", "success", ALL_SKIPPED
-    ),
-    "code PR with a failed unit matrix": gate_inputs(
-        "pull_request", "success", "true", "failure", ALL_SUCCESS
-    ),
-    "docs-only PR with a skipped unit matrix": gate_inputs(
-        "pull_request", "success", "false", "skipped", ALL_SKIPPED
-    ),
-    "push with a failed unit matrix": gate_inputs("push", "skipped", "", "failure", ALL_SUCCESS),
-    "a runtime result is missing": gate_inputs(
-        "push", "skipped", "", "success", "success success success"
-    ),
-    "an unknown runtime result is present": gate_inputs(
-        "push", "skipped", "", "success", "success success success success success"
-    ),
-}
-
-
-@pytest.mark.parametrize("case", list(ACCEPTED))
-def test_release_ready_accepts_only_the_complete_outcomes(tmp_path: Path, case: str) -> None:
-    inputs, expected = ACCEPTED[case]
-    assert inputs["AUTHZ_RESULT"] == "success"
-    returncode, output, _message = run_gate(tmp_path, inputs)
-    # old: assert run_gate(tmp_path, inputs) == (0, expected)
-    assert (returncode, output) == (0, expected)
-
-
-@pytest.mark.parametrize("case", list(REJECTED))
-def test_release_ready_rejects_every_unexpected_outcome(tmp_path: Path, case: str) -> None:
-    # old: returncode, output = run_gate(tmp_path, REJECTED[case])
-    returncode, output, _message = run_gate(tmp_path, REJECTED[case])
-    assert returncode != 0
-    assert output == ""
-
-
-def test_release_ready_checks_authz_first() -> None:
-    assert_ready_authz(load("ci.yml")["jobs"]["ready"])
-
-
-@pytest.mark.parametrize("fault", ["missing-result", "wrong-result", "late-check"])
-def test_release_ready_rejects_missing_or_late_authz_checks(fault: str) -> None:
-    job = copy.deepcopy(load("ci.yml")["jobs"]["ready"])
-    assert_ready_authz(job)
-    gate = next(step for step in job["steps"] if step.get("id") == "gate")
-    if fault == "missing-result":
-        del gate["env"]["AUTHZ_RESULT"]
-    elif fault == "wrong-result":
-        gate["env"]["AUTHZ_RESULT"] = "${{ needs.test.result }}"
-    else:
-        script = gate["run"]
-        assert script.startswith(READY_AUTHZ_CHECK + "\n")
-        gate["run"] = script.removeprefix(READY_AUTHZ_CHECK + "\n") + READY_AUTHZ_CHECK + "\n"
-    with pytest.raises(AssertionError):
-        assert_ready_authz(job)
-
-
-@pytest.mark.parametrize("case", list(AUTHZ_REJECTED))
-@pytest.mark.parametrize("other_failure", [False, True])
-def test_release_ready_rejects_failed_authz_before_other_outcomes(
-    tmp_path: Path, case: str, other_failure: bool
+@pytest.mark.parametrize(
+    "docs,workflows", [("false", "false"), ("true", "false"), ("false", "true")]
+)
+def test_aggregate_accepts_every_needed_job_succeeding(
+    tmp_path: Path, docs: str, workflows: str
 ) -> None:
-    inputs = dict(AUTHZ_REJECTED[case])
-    if other_failure:
-        inputs.update(CHANGES_RESULT="failure", UNIT_RESULT="failure")
-    returncode, output, message = run_gate(tmp_path, inputs)
-    assert returncode != 0
-    assert output == ""
-    assert message == f"authz: {inputs['AUTHZ_RESULT']}\n"
+    result = run_gate(tmp_path, gate_inputs(docs_only=docs, workflows_only=workflows))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("skipped", ["all", *heavy_job_ids(load("ci.yml")["jobs"])])
+@pytest.mark.parametrize(
+    "docs,workflows,expected",
+    [
+        ("true", "false", 0),
+        ("false", "true", 0),
+        ("false", "false", 1),
+        ("true", "true", 1),
+        ("", "false", 1),
+        ("maybe", "false", 1),
+        ("false", "", 1),
+        ("false", "maybe", 1),
+    ],
+)
+def test_heavy_skips_require_exactly_one_independent_cheap_proof(
+    tmp_path: Path, skipped: str, docs: str, workflows: str, expected: int
+) -> None:
+    heavy = heavy_job_ids(load("ci.yml")["jobs"])
+    results = dict.fromkeys(heavy if skipped == "all" else [skipped], "skipped")
+    result = run_gate(tmp_path, gate_inputs(results, docs_only=docs, workflows_only=workflows))
+    assert result.returncode == expected, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("job_id", load("ci.yml")["jobs"]["check"]["needs"])
+@pytest.mark.parametrize("status", ["failure", "cancelled", "", "unknown"])
+@pytest.mark.parametrize(
+    "docs,workflows", [("false", "false"), ("true", "false"), ("false", "true")]
+)
+def test_aggregate_rejects_every_failed_cancelled_or_invalid_needed_result(
+    tmp_path: Path, job_id: str, status: str, docs: str, workflows: str
+) -> None:
+    result = run_gate(
+        tmp_path,
+        gate_inputs({job_id: status}, docs_only=docs, workflows_only=workflows),
+    )
+    assert result.returncode != 0
+
+
+@pytest.mark.parametrize("job_id", ["authz", "changes", "workflow-lint", "extra-light"])
+@pytest.mark.parametrize("status", ["skipped", "failure", "cancelled"])
+@pytest.mark.parametrize("docs,workflows", [("true", "false"), ("false", "true")])
+def test_light_jobs_must_succeed_even_when_all_heavy_jobs_are_skipped(
+    tmp_path: Path, job_id: str, status: str, docs: str, workflows: str
+) -> None:
+    results = dict.fromkeys(heavy_job_ids(load("ci.yml")["jobs"]), "skipped")
+    results[job_id] = status
+    result = run_gate(tmp_path, gate_inputs(results, docs_only=docs, workflows_only=workflows))
+    assert result.returncode != 0
+
+
+@pytest.mark.parametrize(
+    "job_id",
+    ["authz", "changes", "workflow-lint", *heavy_job_ids(load("ci.yml")["jobs"])],
+)
+def test_gate_rejects_a_missing_needed_job(tmp_path: Path, job_id: str) -> None:
+    inputs = gate_inputs()
+    outcomes = json.loads(inputs["NEEDS"])
+    del outcomes[job_id]
+    inputs["NEEDS"] = json.dumps(outcomes)
+    assert run_gate(tmp_path, inputs).returncode != 0
+
+
+@pytest.mark.parametrize("heavy_json", ["[]", '["unlisted"]', "{}", "null", "invalid"])
+def test_gate_rejects_an_invalid_heavy_inventory(tmp_path: Path, heavy_json: str) -> None:
+    inputs = gate_inputs()
+    inputs["HEAVY_JOBS"] = heavy_json
+    assert run_gate(tmp_path, inputs).returncode != 0
+
+
+def test_gate_does_not_trust_the_changes_jobs_class_outputs(tmp_path: Path) -> None:
+    inputs = gate_inputs(dict.fromkeys(heavy_job_ids(load("ci.yml")["jobs"]), "skipped"))
+    outcomes = json.loads(inputs["NEEDS"])
+    outcomes["changes"]["outputs"] = {
+        "docs_only": "true",
+        "workflows_only": "false",
+        "code": "false",
+    }
+    inputs["NEEDS"] = json.dumps(outcomes)
+    assert run_gate(tmp_path, inputs).returncode != 0
+
+
+def test_check_refusal_script_exits_before_checkout(tmp_path: Path) -> None:
+    job = load("ci.yml")["jobs"]["check"]
+    assert_always_job_refuses_first(job)
+    result = subprocess.run(
+        ["bash", "-e", "-c", job["steps"][0]["run"]],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert "authz did not pass" in result.stdout

@@ -957,5 +957,5 @@ def test_automatic_triggers_wait_for_a_configured_chain():
     # old: assert report_if == "always() && needs.reconcile.result != 'skipped'"
     # The report job (a reusable-workflow call, secrets: inherit) must not run when authz failed.
     assert report_if == (
-        "always() && needs.authz.result == 'success' && needs.reconcile.result != 'skipped'"
+        "!cancelled() && needs.authz.result == 'success' && needs.reconcile.result != 'skipped'"
     )

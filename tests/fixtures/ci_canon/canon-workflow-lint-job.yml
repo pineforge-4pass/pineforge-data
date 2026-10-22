@@ -1,0 +1,57 @@
+jobs:
+  workflow-lint:
+    name: workflow-lint
+    needs: [authz]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: "Check out the exact head with full history"
+        if: "${{ needs.authz.result == 'success' }}"
+        uses: "actions/checkout@v7"
+        with:
+          ref: "${{ github.event.pull_request.head.sha || github.sha }}"
+          fetch-depth: 0
+          persist-credentials: false
+      - name: "Lint all workflow definitions with pinned actionlint v1.7.12"
+        if: "${{ needs.authz.result == 'success' }}"
+        shell: "bash"
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64)
+              archive=actionlint_1.7.12_linux_amd64.tar.gz
+              sha256=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8 ;;
+            aarch64|arm64)
+              archive=actionlint_1.7.12_linux_arm64.tar.gz
+              sha256=325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6 ;;
+            *)
+              echo "::error::workflow-lint requires a supported Linux architecture"
+              exit 1 ;;
+          esac
+          lint_dir=$(mktemp -d "$RUNNER_TEMP/workflow-lint.XXXXXXXX")
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 120 \
+            --output "$lint_dir/$archive" "https://github.com/rhysd/actionlint/releases/download/v1.7.12/$archive"
+          if ! printf '%s  %s\n' "$sha256" "$lint_dir/$archive" | sha256sum --check --strict --status; then
+            echo "::error::actionlint archive checksum did not match the published pin"
+            exit 1
+          fi
+          tar -xzf "$lint_dir/$archive" -C "$lint_dir" actionlint
+          "$lint_dir/actionlint" -version
+          printf '%s\n' '{"self-hosted-runner":{"labels":["pf-gcp-pr","pf-gcp-main","pf-gcp-post"]}}' > "$lint_dir/actionlint.yaml"
+          git ls-files -z -- .github/workflows > "$lint_dir/workflows"
+          workflows=()
+          while IFS= read -r -d '' path; do
+            case "$path" in
+              *.yml|*.yaml) workflows+=("$path") ;;
+            esac
+          done < "$lint_dir/workflows"
+          if [[ -n "${path-}" ]]; then
+            echo "::error::unterminated Git workflow path"
+            exit 1
+          fi
+          if [[ "${#workflows[@]}" -eq 0 ]]; then
+            echo "::error::no workflow YAML files were found"
+            exit 1
+          fi
+          "$lint_dir/actionlint" -config-file "$lint_dir/actionlint.yaml" -shellcheck= -pyflakes= "${workflows[@]}"

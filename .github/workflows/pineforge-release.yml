@@ -135,7 +135,8 @@ jobs:
           if-no-files-found: warn
 
   report:
-    if: always() && needs.authz.result == 'success' && needs.reconcile.result != 'skipped'
+    if: >-
+      !cancelled() && needs.authz.result == 'success' && needs.reconcile.result != 'skipped'
     needs: [authz, reconcile]
     uses: ./.github/workflows/release-report.yml
     permissions:

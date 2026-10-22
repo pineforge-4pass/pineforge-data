@@ -13,11 +13,9 @@ permissions:
 # whose run authorizes publication) gets its own run_id group and is never cancelled.
 # Every job runs on GitHub-hosted ubuntu-24.04 (owner decision CI-2 = A, 10-21 04:01, and #1050:
 # this repository is public and no job here holds a secret); dependabot counts as ours.
-# Fork PRs fail authz. Docs-only PRs skip the four runtime jobs (docker, database-e2e,
-# contract, distribution); the Python matrix always runs because tests/test_documentation.py
-# checks the links in README.md, CONTRIBUTING.md and docs/. release/ready then accepts
-# those four as skipped and writes no release evidence; release PRs change code, so the
-# publication gates still read complete evidence from their pre-merge and main runs.
+# Fork PRs fail authz. Documentation/workflow-only PRs run the light checks and skip
+# the heavy suites and release/ready evidence. The required check independently proves
+# cheap skips; code PRs and every push run the full suites and produce release evidence.
 concurrency:
   group: ci-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -86,34 +84,158 @@ jobs:
           echo "authz: allowed ($EVENT${PR_AUTHOR:+ by $PR_AUTHOR})" >> "$GITHUB_STEP_SUMMARY"
 
   changes:
-    needs: authz
-    if: github.event_name == 'pull_request'
+    name: changes
+    needs: [authz]
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     outputs:
-      code: ${{ steps.paths.outputs.code }}
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+      workflows_only: ${{ steps.classify.outputs.workflows_only }}
+      code: ${{ steps.classify.outputs.code }}
     steps:
-      - uses: actions/checkout@v7
+      - name: "Check out the exact head with full history"
+        if: "${{ needs.authz.result == 'success' }}"
+        uses: "actions/checkout@v7"
         with:
+          ref: "${{ github.event.pull_request.head.sha || github.sha }}"
           fetch-depth: 0
           persist-credentials: false
-      - name: Classify the tested merge against the PR base
-        id: paths
+      - name: "Classify the PR diff (canonical; copy as is)"
+        id: "classify"
+        if: "${{ needs.authz.result == 'success' }}"
+        shell: "bash"
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT: "${{ github.event_name }}"
+          PR_BASE: "${{ github.event.pull_request.base.sha }}"
+          PR_HEAD: "${{ github.event.pull_request.head.sha }}"
         run: |
-          git diff --no-renames --name-only -z "$BASE_SHA" HEAD > "$RUNNER_TEMP/pr-changed-paths"
-          code=false
+          set -euo pipefail
+          docs_only=false
+          workflows_only=false
+          code=true
+          if [[ "$EVENT" == pull_request ]]; then
+            [[ "$PR_BASE" =~ ^[0-9a-f]{40}$ && "$PR_HEAD" =~ ^[0-9a-f]{40}$ ]]
+            [[ "$(git rev-parse --verify HEAD)" == "$PR_HEAD" ]]
+            git rev-parse --verify "$PR_BASE^{commit}" > /dev/null
+            git rev-parse --verify "$PR_HEAD^{commit}" > /dev/null
+            diff_paths=$(mktemp "$RUNNER_TEMP/ci-changes.XXXXXXXX")
+            git diff --no-ext-diff --no-textconv --no-renames --ignore-submodules=none --raw --no-abbrev -z "$PR_BASE...$PR_HEAD" -- > "$diff_paths"
+            has_docs=false
+            has_workflows=false
+            has_code=false
+            while IFS= read -r -d '' change; do
+              if ! IFS= read -r -d '' path; then
+                echo "::error::incomplete Git raw diff record"
+                exit 1
+              fi
+              if [[ ! "$change" =~ ^:([0-7]{6})[[:space:]]([0-7]{6})[[:space:]] ]]; then
+                echo "::error::invalid Git raw diff modes"
+                exit 1
+              fi
+              old_mode=${BASH_REMATCH[1]}
+              new_mode=${BASH_REMATCH[2]}
+              if [[ ! "$change" =~ ^:[0-7]{6}\ [0-7]{6}\ [0-9a-f]{40}\ [0-9a-f]{40}\ [ACDMRTUXB][0-9]*$ ]]; then
+                has_code=true
+                continue
+              fi
+              if [[ "$old_mode" == 160000 || "$new_mode" == 160000 ]]; then
+                has_code=true
+                continue
+              fi
+              if [[ "$old_mode" != 000000 && "$old_mode" != 100644 ]] ||
+                 [[ "$new_mode" != 000000 && "$new_mode" != 100644 ]]; then
+                has_code=true
+                continue
+              fi
+              case "$path" in
+                docs/*.md|docs/*.rst|docs/*.txt|README.md|CONTRIBUTING.md|CHANGELOG.md|CODE_OF_CONDUCT.md|SECURITY.md|LICENSE|LICENSE.md|LICENSE.txt)
+                  has_docs=true ;;
+                .github/workflows/*)
+                  workflow_name=${path#.github/workflows/}
+                  if [[ "$workflow_name" != */* && ( "$workflow_name" == *.yml || "$workflow_name" == *.yaml ) ]]; then
+                    has_workflows=true
+                  else
+                    has_code=true
+                  fi ;;
+                *)
+                  has_code=true ;;
+              esac
+            done < "$diff_paths"
+            if [[ -n "${change-}" ]]; then
+              has_code=true
+            fi
+            if [[ "$has_code" == false && "$has_workflows" == true ]]; then
+              workflows_only=true
+              code=false
+            elif [[ "$has_code" == false && "$has_docs" == true ]]; then
+              docs_only=true
+              code=false
+            fi
+          fi
+          printf 'docs_only=%s\nworkflows_only=%s\ncode=%s\n' "$docs_only" "$workflows_only" "$code" >> "$GITHUB_OUTPUT"
+
+  workflow-lint:
+    name: workflow-lint
+    needs: [authz]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: "Check out the exact head with full history"
+        if: "${{ needs.authz.result == 'success' }}"
+        uses: "actions/checkout@v7"
+        with:
+          ref: "${{ github.event.pull_request.head.sha || github.sha }}"
+          fetch-depth: 0
+          persist-credentials: false
+      - name: "Lint all workflow definitions with pinned actionlint v1.7.12"
+        if: "${{ needs.authz.result == 'success' }}"
+        shell: "bash"
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64)
+              archive=actionlint_1.7.12_linux_amd64.tar.gz
+              sha256=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8 ;;
+            aarch64|arm64)
+              archive=actionlint_1.7.12_linux_arm64.tar.gz
+              sha256=325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6 ;;
+            *)
+              echo "::error::workflow-lint requires a supported Linux architecture"
+              exit 1 ;;
+          esac
+          lint_dir=$(mktemp -d "$RUNNER_TEMP/workflow-lint.XXXXXXXX")
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 120 \
+            --output "$lint_dir/$archive" "https://github.com/rhysd/actionlint/releases/download/v1.7.12/$archive"
+          if ! printf '%s  %s\n' "$sha256" "$lint_dir/$archive" | sha256sum --check --strict --status; then
+            echo "::error::actionlint archive checksum did not match the published pin"
+            exit 1
+          fi
+          tar -xzf "$lint_dir/$archive" -C "$lint_dir" actionlint
+          "$lint_dir/actionlint" -version
+          printf '%s\n' '{"self-hosted-runner":{"labels":["pf-gcp-pr","pf-gcp-main","pf-gcp-post"]}}' > "$lint_dir/actionlint.yaml"
+          git ls-files -z -- .github/workflows > "$lint_dir/workflows"
+          workflows=()
           while IFS= read -r -d '' path; do
             case "$path" in
-              docs/*|mkdocs.yml|README.md|CONTRIBUTING.md|LICENSE) ;;
-              *) code=true ;;
+              *.yml|*.yaml) workflows+=("$path") ;;
             esac
-          done < "$RUNNER_TEMP/pr-changed-paths"
-          echo "code=$code" >> "$GITHUB_OUTPUT"
+          done < "$lint_dir/workflows"
+          if [[ -n "${path-}" ]]; then
+            echo "::error::unterminated Git workflow path"
+            exit 1
+          fi
+          if [[ "${#workflows[@]}" -eq 0 ]]; then
+            echo "::error::no workflow YAML files were found"
+            exit 1
+          fi
+          "$lint_dir/actionlint" -config-file "$lint_dir/actionlint.yaml" -shellcheck= -pyflakes= "${workflows[@]}"
 
   test:
     name: Python ${{ matrix.python-version }}
-    needs: authz
+    needs: [authz, changes]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     env:
       PF_CI_LABELS: '["ubuntu-24.04"]'
@@ -147,11 +269,7 @@ jobs:
   docker:
     name: Docker runtime
     needs: [authz, changes]
-    if: >-
-      !cancelled() &&
-      needs.authz.result == 'success' &&
-      (github.event_name != 'pull_request' ||
-       (needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     env:
       PF_CI_LABELS: '["ubuntu-24.04"]'
@@ -178,11 +296,7 @@ jobs:
   database-e2e:
     name: Database E2E
     needs: [authz, changes]
-    if: >-
-      !cancelled() &&
-      needs.authz.result == 'success' &&
-      (github.event_name != 'pull_request' ||
-       (needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     services:
       mysql:
@@ -245,11 +359,7 @@ jobs:
   contract:
     name: Release contract
     needs: [authz, changes]
-    if: >-
-      !cancelled() &&
-      needs.authz.result == 'success' &&
-      (github.event_name != 'pull_request' ||
-       (needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     env:
       PF_CI_LABELS: '["ubuntu-24.04"]'
@@ -273,11 +383,7 @@ jobs:
   distribution:
     name: Distribution
     needs: [authz, changes]
-    if: >-
-      !cancelled() &&
-      needs.authz.result == 'success' &&
-      (github.event_name != 'pull_request' ||
-       (needs.changes.result == 'success' && needs.changes.outputs.code == 'true'))
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     env:
       PF_CI_LABELS: '["ubuntu-24.04"]'
@@ -342,81 +448,53 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  docs-tests:
+    name: Documentation
+    needs: [authz]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      PF_CI_LABELS: '["ubuntu-24.04"]'
+    steps:
+      - uses: actions/checkout@v7
+        if: needs.authz.result == 'success'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        if: needs.authz.result == 'success'
+        with:
+          python-version: '3.13'
+      - name: Install pytest only; the documentation test reads files
+        if: needs.authz.result == 'success'
+        run: python -m pip install pytest
+      - name: Check every relative documentation link
+        if: needs.authz.result == 'success'
+        run: pytest tests/test_documentation.py
+
   ready:
     name: release/ready
-    if: always()
+    if: needs.changes.outputs.code == 'true'
     needs: [authz, changes, test, contract, docker, database-e2e, distribution]
     runs-on: ubuntu-24.04
     env:
       PF_CI_LABELS: '["ubuntu-24.04"]'
     steps:
-      - name: authz must have passed
-        if: needs.authz.result != 'success'
-        run: exit 1
-      - name: Require the path decision and every expected job result
-        id: gate
-        if: needs.authz.result == 'success'
-        env:
-          AUTHZ_RESULT: ${{ needs.authz.result }}
-          EVENT_NAME: ${{ github.event_name }}
-          CHANGES_RESULT: ${{ needs.changes.result }}
-          CODE_CHANGED: ${{ needs.changes.outputs.code }}
-          UNIT_RESULT: ${{ needs.test.result }}
-          RUNTIME_RESULTS: >-
-            ${{ needs.contract.result }} ${{ needs.docker.result }}
-            ${{ needs.database-e2e.result }} ${{ needs.distribution.result }}
-        run: |
-          if [ "$AUTHZ_RESULT" != "success" ]; then echo "authz: $AUTHZ_RESULT"; exit 1; fi
-          evidence=true
-          if [ "$EVENT_NAME" = pull_request ]; then
-            if [ "$CHANGES_RESULT" != success ]; then
-              echo "::error::The PR path decision did not succeed: $CHANGES_RESULT"
-              exit 1
-            fi
-            case "$CODE_CHANGED" in
-              true) ;;
-              false) evidence=false ;;
-              *) echo "::error::Missing or invalid PR path decision: '$CODE_CHANGED'"; exit 1 ;;
-            esac
-          fi
-          if [ "$UNIT_RESULT" != success ]; then
-            echo "::error::Expected the Python matrix to succeed, observed $UNIT_RESULT"
-            exit 1
-          fi
-          expected=success
-          if [ "$evidence" = false ]; then
-            expected=skipped
-          fi
-          set -- $RUNTIME_RESULTS
-          if [ "$#" -ne 4 ]; then
-            echo "::error::Expected four runtime job results, observed $#"
-            exit 1
-          fi
-          for result in "$@"; do
-            if [ "$result" != "$expected" ]; then
-              echo "::error::Expected $expected runtime jobs, observed $result"
-              exit 1
-            fi
-          done
-          if [ "$evidence" = false ]; then
-            echo "Docs-only PR: runtime jobs skipped; no release evidence is produced."
-          fi
-          echo "evidence=$evidence" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v7
-        if: needs.authz.result == 'success' && steps.gate.outputs.evidence == 'true'
+        if: needs.authz.result == 'success'
         with:
           persist-credentials: false
       - uses: actions/setup-python@v6
-        if: needs.authz.result == 'success' && steps.gate.outputs.evidence == 'true'
+        if: needs.authz.result == 'success'
         with:
           python-version: '3.13'
       - uses: actions/download-artifact@v6
-        if: needs.authz.result == 'success' && steps.gate.outputs.evidence == 'true'
+        if: needs.authz.result == 'success'
         with:
           name: python-package-distributions-${{ github.run_attempt }}
           path: dist/
       - name: Require the complete job inventory and bind evidence to this head/base/tree
-        if: needs.authz.result == 'success' && steps.gate.outputs.evidence == 'true'
+        if: needs.authz.result == 'success'
         env:
           PYTHONPATH: scripts
           NEEDS_JSON: >-
@@ -426,8 +504,136 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python -m release_chain.evidence aggregate --path dist
       - uses: actions/upload-artifact@v5
-        if: steps.gate.outputs.evidence == 'true'
+        if: needs.authz.result == 'success'
         with:
           name: release-evidence-${{ github.run_attempt }}
           path: evidence.json
           if-no-files-found: error
+
+  check:
+    needs: [authz, changes, workflow-lint, test, docker, database-e2e, contract, distribution, docs-tests, ready]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: "Refuse an unauthorised run before anything else"
+        if: "${{ needs.authz.result != 'success' }}"
+        run: |
+          echo "::error::authz did not pass; nothing of this run's code is checked out or run"
+          exit 1
+      - name: "Check out the exact head with full history"
+        if: "${{ needs.authz.result == 'success' }}"
+        uses: "actions/checkout@v7"
+        with:
+          ref: "${{ github.event.pull_request.head.sha || github.sha }}"
+          fetch-depth: 0
+          persist-credentials: false
+      - name: "Classify the PR diff (canonical; copy as is)"
+        id: "classify"
+        if: "${{ needs.authz.result == 'success' }}"
+        shell: "bash"
+        env:
+          EVENT: "${{ github.event_name }}"
+          PR_BASE: "${{ github.event.pull_request.base.sha }}"
+          PR_HEAD: "${{ github.event.pull_request.head.sha }}"
+        run: |
+          set -euo pipefail
+          docs_only=false
+          workflows_only=false
+          code=true
+          if [[ "$EVENT" == pull_request ]]; then
+            [[ "$PR_BASE" =~ ^[0-9a-f]{40}$ && "$PR_HEAD" =~ ^[0-9a-f]{40}$ ]]
+            [[ "$(git rev-parse --verify HEAD)" == "$PR_HEAD" ]]
+            git rev-parse --verify "$PR_BASE^{commit}" > /dev/null
+            git rev-parse --verify "$PR_HEAD^{commit}" > /dev/null
+            diff_paths=$(mktemp "$RUNNER_TEMP/ci-changes.XXXXXXXX")
+            git diff --no-ext-diff --no-textconv --no-renames --ignore-submodules=none --raw --no-abbrev -z "$PR_BASE...$PR_HEAD" -- > "$diff_paths"
+            has_docs=false
+            has_workflows=false
+            has_code=false
+            while IFS= read -r -d '' change; do
+              if ! IFS= read -r -d '' path; then
+                echo "::error::incomplete Git raw diff record"
+                exit 1
+              fi
+              if [[ ! "$change" =~ ^:([0-7]{6})[[:space:]]([0-7]{6})[[:space:]] ]]; then
+                echo "::error::invalid Git raw diff modes"
+                exit 1
+              fi
+              old_mode=${BASH_REMATCH[1]}
+              new_mode=${BASH_REMATCH[2]}
+              if [[ ! "$change" =~ ^:[0-7]{6}\ [0-7]{6}\ [0-9a-f]{40}\ [0-9a-f]{40}\ [ACDMRTUXB][0-9]*$ ]]; then
+                has_code=true
+                continue
+              fi
+              if [[ "$old_mode" == 160000 || "$new_mode" == 160000 ]]; then
+                has_code=true
+                continue
+              fi
+              if [[ "$old_mode" != 000000 && "$old_mode" != 100644 ]] ||
+                 [[ "$new_mode" != 000000 && "$new_mode" != 100644 ]]; then
+                has_code=true
+                continue
+              fi
+              case "$path" in
+                docs/*.md|docs/*.rst|docs/*.txt|README.md|CONTRIBUTING.md|CHANGELOG.md|CODE_OF_CONDUCT.md|SECURITY.md|LICENSE|LICENSE.md|LICENSE.txt)
+                  has_docs=true ;;
+                .github/workflows/*)
+                  workflow_name=${path#.github/workflows/}
+                  if [[ "$workflow_name" != */* && ( "$workflow_name" == *.yml || "$workflow_name" == *.yaml ) ]]; then
+                    has_workflows=true
+                  else
+                    has_code=true
+                  fi ;;
+                *)
+                  has_code=true ;;
+              esac
+            done < "$diff_paths"
+            if [[ -n "${change-}" ]]; then
+              has_code=true
+            fi
+            if [[ "$has_code" == false && "$has_workflows" == true ]]; then
+              workflows_only=true
+              code=false
+            elif [[ "$has_code" == false && "$has_docs" == true ]]; then
+              docs_only=true
+              code=false
+            fi
+          fi
+          printf 'docs_only=%s\nworkflows_only=%s\ncode=%s\n' "$docs_only" "$workflows_only" "$code" >> "$GITHUB_OUTPUT"
+      - name: "Require success or independently proven cheap skips"
+        if: "${{ needs.authz.result == 'success' }}"
+        shell: "bash"
+        env:
+          NEEDS: "${{ toJSON(needs) }}"
+          HEAVY_JOBS: "[\"contract\",\"database-e2e\",\"distribution\",\"docker\",\"ready\",\"test\"]"
+          DOCS_ONLY: "${{ steps.classify.outputs.docs_only }}"
+          WORKFLOWS_ONLY: "${{ steps.classify.outputs.workflows_only }}"
+        run: |
+          set -euo pipefail
+          cd -- "$RUNNER_TEMP"
+          python3 -I -c '
+          import json
+          import os
+          import sys
+          
+          needs = json.loads(os.environ["NEEDS"])
+          heavy = json.loads(os.environ["HEAVY_JOBS"])
+          cheap = (os.environ["DOCS_ONLY"], os.environ["WORKFLOWS_ONLY"]) in {
+              ("true", "false"), ("false", "true"),
+          }
+          valid = (isinstance(needs, dict) and isinstance(heavy, list) and bool(heavy)
+                   and all(isinstance(name, str) and name in needs for name in heavy)
+                   and all(isinstance(value, dict) for value in needs.values()))
+          if valid:
+              valid = all(needs.get(name, {}).get("result") == "success"
+                          for name in ("authz", "changes", "workflow-lint"))
+          if valid:
+              valid = all(value.get("result") == "success"
+                          or (name in heavy and value.get("result") == "skipped" and cheap)
+                          for name, value in needs.items())
+          if not valid:
+              print("::error::a needed job did not succeed or was skipped without PR diff proof")
+              sys.exit(1)
+          '

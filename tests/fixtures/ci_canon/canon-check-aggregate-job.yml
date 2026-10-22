@@ -52,6 +52,10 @@ jobs:
               fi
               old_mode=${BASH_REMATCH[1]}
               new_mode=${BASH_REMATCH[2]}
+              if [[ ! "$change" =~ ^:[0-7]{6}\ [0-7]{6}\ [0-9a-f]{40}\ [0-9a-f]{40}\ [ACDMRTUXB][0-9]*$ ]]; then
+                has_code=true
+                continue
+              fi
               if [[ "$old_mode" == 160000 || "$new_mode" == 160000 ]]; then
                 has_code=true
                 continue
@@ -75,6 +79,9 @@ jobs:
                   has_code=true ;;
               esac
             done < "$diff_paths"
+            if [[ -n "${change-}" ]]; then
+              has_code=true
+            fi
             if [[ "$has_code" == false && "$has_workflows" == true ]]; then
               workflows_only=true
               code=false

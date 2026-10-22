@@ -1,9 +1,9 @@
-Source: laneboss ci-labels.6307dc3d.md, LB-535 + LB-540 + LB-545 (2026-10-22).
-Canon sha256: 6307dc3d29ebd83de0167f8412280595abb4a63186a955f9251746e88a722362
-Copied verbatim from vp139-canon-6307dc3d-20261022; do not edit the YAML fixtures.
+Source: laneboss ci-labels.0447b739.md, LB-535 + LB-540 + LB-545 + LB-548 (2026-10-22).
+Canon sha256: 0447b739667377770dc6bd8b2b6cc0be3e02fb781ad307855e8c7ac2490f3f0f
+Copied verbatim from vp139-canon-0447b739-20261022; do not edit the YAML fixtures.
 
 0b3dfa990404d60c8617bc30eba9bde21344cdec2097e25e104083e262d072f8  canon-authz-job.yml
-e240940ca1ee61359853f7ef8ba075101af91bc03edde4caa183d0f0c33db299  canon-changes-job.yml
-828333a43ab8dd641b4a01a882f8b296dec063dba57df0e240e6125746bd180d  canon-workflow-lint-job.yml
-fcaabfddda81d3e0238ab56a98f58e3379a4c8289667cd6340a45209b1f8f4a7  canon-check-aggregate-job.yml
+7210cda0fc18ce8023e9c4f6882f91515c9b70d5bcc6ffd393926d1495b2ab76  canon-changes-job.yml
+aa8b7ec65b969ba554ce53a18eee46bebec5766a9369a01ab55e4a7b01707a55  canon-workflow-lint-job.yml
+f6d6d27a50a402915fa4bb91b6678b586a193bd4826e3096abfd6da9e34759ec  canon-check-aggregate-job.yml
 a73613ac8c86886d53f1ec7d354b4bf2f3407789348c5a8f39ec44d461bee398  canon-heavy-job-example.yml

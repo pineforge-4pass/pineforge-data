@@ -212,6 +212,9 @@ def assert_permission_policy(workflow: dict[str, Any], name: str) -> None:
         elif name == "ci.yml" and job_id in ("changes", "workflow-lint", "check"):
             canonical_permissions = canon_job("canon-changes-job.yml", "changes")["permissions"]
             assert job["permissions"] == canonical_permissions
+        elif name == "ci.yml" and job_id == "docs-tests":
+            # The light documentation job may read the repository and nothing else.
+            assert job["permissions"] == {"contents": "read"}
         else:
             # old (for authz): assert job.get("permissions") == {"contents": "read"}
             assert "permissions" not in job
@@ -485,6 +488,21 @@ def test_secret_and_permission_policy_rejects_unauthorized_scope(
     assert workflow != original
     with pytest.raises(AssertionError):
         assert_permission_policy(workflow, name)
+
+
+def test_documentation_permission_policy_rejects_wider_scopes() -> None:
+    original = load("ci.yml")
+    assert_permission_policy(original, "ci.yml")
+    for job_id, permissions in (
+        ("docs-tests", {"contents": "write"}),
+        ("docs-tests", {"contents": "read", "pull-requests": "write"}),
+        ("docker", {"contents": "read"}),
+    ):
+        workflow = copy.deepcopy(original)
+        workflow["jobs"][job_id]["permissions"] = permissions
+        assert workflow != original
+        with pytest.raises(AssertionError):
+            assert_permission_policy(workflow, "ci.yml")
 
 
 @pytest.mark.parametrize("name", PR_TIER_WORKFLOWS)
@@ -1274,6 +1292,7 @@ def test_cheap_pr_policy_rejects_missing_authz_and_extra_dependencies(
         "always-outside-check",
         "conditional-lint",
         "missing-lint",
+        "missing-docs-tests-dependency",
         "duplicate-dependency",
         "workflow-env",
         "workflow-defaults",
@@ -1300,6 +1319,8 @@ def test_cheap_pr_structure_rejects_unsafe_mutations(fault: str) -> None:
         jobs["workflow-lint"]["if"] = "github.event_name == 'push'"
     elif fault == "missing-lint":
         del jobs["workflow-lint"]
+    elif fault == "missing-docs-tests-dependency":
+        jobs["check"]["needs"].remove("docs-tests")
     elif fault == "duplicate-dependency":
         jobs["check"]["needs"].append("authz")
     elif fault == "workflow-env":
@@ -1803,7 +1824,10 @@ def test_light_jobs_must_succeed_even_when_all_heavy_jobs_are_skipped(
     assert result.returncode != 0
 
 
-@pytest.mark.parametrize("job_id", load("ci.yml")["jobs"]["check"]["needs"])
+@pytest.mark.parametrize(
+    "job_id",
+    ["authz", "changes", "workflow-lint", *heavy_job_ids(load("ci.yml")["jobs"])],
+)
 def test_gate_rejects_a_missing_needed_job(tmp_path: Path, job_id: str) -> None:
     inputs = gate_inputs()
     outcomes = json.loads(inputs["NEEDS"])

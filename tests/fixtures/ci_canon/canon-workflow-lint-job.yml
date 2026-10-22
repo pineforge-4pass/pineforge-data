@@ -46,6 +46,10 @@ jobs:
               *.yml|*.yaml) workflows+=("$path") ;;
             esac
           done < "$lint_dir/workflows"
+          if [[ -n "${path-}" ]]; then
+            echo "::error::unterminated Git workflow path"
+            exit 1
+          fi
           if [[ "${#workflows[@]}" -eq 0 ]]; then
             echo "::error::no workflow YAML files were found"
             exit 1

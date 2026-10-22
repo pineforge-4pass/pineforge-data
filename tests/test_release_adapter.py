@@ -1056,13 +1056,14 @@ def test_workflows_keep_every_gate_ahead_of_oidc_publication() -> None:
     ready_job = ci["jobs"]["ready"]
     # old: assert set(ci["jobs"]["ready"]["needs"]) == evidence.NEEDS | {"changes"}
     assert_ready_dependencies(ready_job)
-    # old: #830 temporarily required "${{ !cancelled() }}"; the frozen canon reverts it.
-    assert ready_job["if"] == "always()"
+    # The canon gates `ready` on the code class; the authz refusal step is gone
+    # because a skipped dependency is refused by `check`'s aggregate instead.
+    assert ready_job["if"] == "needs.changes.outputs.code == 'true'"
     assert ready_job["name"] == "release/ready"
     assert ready_job["steps"][0] == {
-        "name": "authz must have passed",
-        "if": "needs.authz.result != 'success'",
-        "run": "exit 1",
+        "uses": "actions/checkout@v7",
+        "if": "needs.authz.result == 'success'",
+        "with": {"persist-credentials": "false"},
     }
     for job, suite, enabled in (
         ("docker", "docker", "PINEFORGE_DOCKER_TEST=1"),

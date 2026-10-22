@@ -67,7 +67,7 @@ CANON_SCRIPT = (
 )
 
 VERIFY_CONDITION = (
-    f"always() && {AUTHZ_PASSED} && needs.prepare.outputs.eligible == 'true' && "
+    f"!cancelled() && {AUTHZ_PASSED} && needs.prepare.outputs.eligible == 'true' && "
     "needs.github-release.result == 'success' && "
     "(needs.publish.result == 'success' || needs.prepare.outputs.published == 'true') && "
     "!inputs.claim_placeholder"
@@ -151,7 +151,9 @@ def assert_workflow_authz(workflow: dict[str, Any]) -> None:
         else "!inputs.claim_placeholder"
     )
     report = jobs["report"]
-    assert report["if"] == f"always() && {AUTHZ_PASSED} && {report_tail}", "report: authz condition"
+    assert report["if"] == (
+        f"!cancelled() && {AUTHZ_PASSED} && {report_tail}"
+    ), "report: authz condition"
     assert report["uses"] == "./.github/workflows/release-report.yml"
     assert report["secrets"] == "inherit"
 
@@ -188,8 +190,8 @@ def test_structure_checker_rejects_unsafe_mutations(name: str, mutation: str) ->
         before, after = "    needs: authz\n", ""
         finding = "needs authz"
     elif mutation == "unguarded-report":
-        before = f"  report:\n    if: always() && {AUTHZ_PASSED} && "
-        after = "  report:\n    if: always() && "
+        before = f"  report:\n    if: >-\n      !cancelled() && {AUTHZ_PASSED} && "
+        after = "  report:\n    if: >-\n      !cancelled() && "
         finding = "report: authz condition"
     else:
         before = f'ALLOWED_BOTS: "{ALLOWED_BOTS}"'
@@ -207,8 +209,8 @@ def test_structure_checker_rejects_unguarded_verify(mutation: str) -> None:
     original = (WORKFLOWS / "release.yml").read_text()
     assert_workflow_authz(load_text(original))
     if mutation == "condition":
-        before = f"always() && {AUTHZ_PASSED} && needs.prepare.outputs.eligible"
-        after = "always() && needs.prepare.outputs.eligible"
+        before = f"!cancelled() && {AUTHZ_PASSED} && needs.prepare.outputs.eligible"
+        after = "!cancelled() && needs.prepare.outputs.eligible"
         finding = "verify: authz condition"
     elif mutation == "refuse-first":
         before = (

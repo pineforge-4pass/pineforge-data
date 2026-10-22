@@ -1,0 +1,121 @@
+jobs:
+  check:
+    needs: [authz, changes, workflow-lint, shard-a, shard-b]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: "Refuse an unauthorised run before anything else"
+        if: "${{ needs.authz.result != 'success' }}"
+        run: |
+          echo "::error::authz did not pass; nothing of this run's code is checked out or run"
+          exit 1
+      - name: "Check out the exact head with full history"
+        if: "${{ needs.authz.result == 'success' }}"
+        uses: "actions/checkout@v7"
+        with:
+          ref: "${{ github.event.pull_request.head.sha || github.sha }}"
+          fetch-depth: 0
+          persist-credentials: false
+      - name: "Classify the PR diff (canonical; copy as is)"
+        id: "classify"
+        if: "${{ needs.authz.result == 'success' }}"
+        shell: "bash"
+        env:
+          EVENT: "${{ github.event_name }}"
+          PR_BASE: "${{ github.event.pull_request.base.sha }}"
+          PR_HEAD: "${{ github.event.pull_request.head.sha }}"
+        run: |
+          set -euo pipefail
+          docs_only=false
+          workflows_only=false
+          code=true
+          if [[ "$EVENT" == pull_request ]]; then
+            [[ "$PR_BASE" =~ ^[0-9a-f]{40}$ && "$PR_HEAD" =~ ^[0-9a-f]{40}$ ]]
+            [[ "$(git rev-parse --verify HEAD)" == "$PR_HEAD" ]]
+            git rev-parse --verify "$PR_BASE^{commit}" > /dev/null
+            git rev-parse --verify "$PR_HEAD^{commit}" > /dev/null
+            diff_paths=$(mktemp "$RUNNER_TEMP/ci-changes.XXXXXXXX")
+            git diff --no-ext-diff --no-textconv --no-renames --ignore-submodules=none --raw --no-abbrev -z "$PR_BASE...$PR_HEAD" -- > "$diff_paths"
+            has_docs=false
+            has_workflows=false
+            has_code=false
+            while IFS= read -r -d '' change; do
+              if ! IFS= read -r -d '' path; then
+                echo "::error::incomplete Git raw diff record"
+                exit 1
+              fi
+              if [[ ! "$change" =~ ^:([0-7]{6})[[:space:]]([0-7]{6})[[:space:]] ]]; then
+                echo "::error::invalid Git raw diff modes"
+                exit 1
+              fi
+              old_mode=${BASH_REMATCH[1]}
+              new_mode=${BASH_REMATCH[2]}
+              if [[ "$old_mode" == 160000 || "$new_mode" == 160000 ]]; then
+                has_code=true
+                continue
+              fi
+              if [[ "$old_mode" != 000000 && "$old_mode" != 100644 ]] ||
+                 [[ "$new_mode" != 000000 && "$new_mode" != 100644 ]]; then
+                has_code=true
+                continue
+              fi
+              case "$path" in
+                docs/*.md|docs/*.rst|docs/*.txt|README.md|CONTRIBUTING.md|CHANGELOG.md|CODE_OF_CONDUCT.md|SECURITY.md|LICENSE|LICENSE.md|LICENSE.txt)
+                  has_docs=true ;;
+                .github/workflows/*)
+                  workflow_name=${path#.github/workflows/}
+                  if [[ "$workflow_name" != */* && ( "$workflow_name" == *.yml || "$workflow_name" == *.yaml ) ]]; then
+                    has_workflows=true
+                  else
+                    has_code=true
+                  fi ;;
+                *)
+                  has_code=true ;;
+              esac
+            done < "$diff_paths"
+            if [[ "$has_code" == false && "$has_workflows" == true ]]; then
+              workflows_only=true
+              code=false
+            elif [[ "$has_code" == false && "$has_docs" == true ]]; then
+              docs_only=true
+              code=false
+            fi
+          fi
+          printf 'docs_only=%s\nworkflows_only=%s\ncode=%s\n' "$docs_only" "$workflows_only" "$code" >> "$GITHUB_OUTPUT"
+      - name: "Require success or independently proven cheap skips"
+        if: "${{ needs.authz.result == 'success' }}"
+        shell: "bash"
+        env:
+          NEEDS: "${{ toJSON(needs) }}"
+          HEAVY_JOBS: "[\"shard-a\",\"shard-b\"]"
+          DOCS_ONLY: "${{ steps.classify.outputs.docs_only }}"
+          WORKFLOWS_ONLY: "${{ steps.classify.outputs.workflows_only }}"
+        run: |
+          set -euo pipefail
+          cd -- "$RUNNER_TEMP"
+          python3 -I -c '
+          import json
+          import os
+          import sys
+          
+          needs = json.loads(os.environ["NEEDS"])
+          heavy = json.loads(os.environ["HEAVY_JOBS"])
+          cheap = (os.environ["DOCS_ONLY"], os.environ["WORKFLOWS_ONLY"]) in {
+              ("true", "false"), ("false", "true"),
+          }
+          valid = (isinstance(needs, dict) and isinstance(heavy, list) and bool(heavy)
+                   and all(isinstance(name, str) and name in needs for name in heavy)
+                   and all(isinstance(value, dict) for value in needs.values()))
+          if valid:
+              valid = all(needs.get(name, {}).get("result") == "success"
+                          for name in ("authz", "changes", "workflow-lint"))
+          if valid:
+              valid = all(value.get("result") == "success"
+                          or (name in heavy and value.get("result") == "skipped" and cheap)
+                          for name, value in needs.items())
+          if not valid:
+              print("::error::a needed job did not succeed or was skipped without PR diff proof")
+              sys.exit(1)
+          '

@@ -1,0 +1,9 @@
+Source: laneboss ci-labels.6307dc3d.md, LB-535 + LB-540 + LB-545 (2026-10-22).
+Canon sha256: 6307dc3d29ebd83de0167f8412280595abb4a63186a955f9251746e88a722362
+Copied verbatim from vp139-canon-6307dc3d-20261022; do not edit the YAML fixtures.
+
+0b3dfa990404d60c8617bc30eba9bde21344cdec2097e25e104083e262d072f8  canon-authz-job.yml
+e240940ca1ee61359853f7ef8ba075101af91bc03edde4caa183d0f0c33db299  canon-changes-job.yml
+828333a43ab8dd641b4a01a882f8b296dec063dba57df0e240e6125746bd180d  canon-workflow-lint-job.yml
+fcaabfddda81d3e0238ab56a98f58e3379a4c8289667cd6340a45209b1f8f4a7  canon-check-aggregate-job.yml
+a73613ac8c86886d53f1ec7d354b4bf2f3407789348c5a8f39ec44d461bee398  canon-heavy-job-example.yml

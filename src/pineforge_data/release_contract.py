@@ -13,8 +13,8 @@ from .backtest import BacktestOptions, JsonValue
 from .models import Bar, Instrument
 
 DEFAULT_RELEASE_IMAGE = (
-    "ghcr.io/pineforge-4pass/pineforge-release:1.6.0@"
-    "sha256:3f739e20d35612140b69de41cd12fcf959f381d9b56e18b5c7c8806a612ca022"
+    "ghcr.io/pineforge-4pass/pineforge-release:1.6.3@"
+    "sha256:d13d9b785438b56151544f37cb1493449749d7cd4dcd56f8a210d7a0f1caceaf"
 )
 RELEASE_ENTRYPOINT = "/opt/pineforge/bin/entrypoint.sh"
 RESPONSE_SCHEMA_VERSION = 1

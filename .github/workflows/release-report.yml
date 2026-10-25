@@ -21,6 +21,7 @@ permissions:
 jobs:
   report:
     runs-on: ubuntu-24.04
+    environment: release-bot
     steps:
       - uses: actions/checkout@v7
         with:

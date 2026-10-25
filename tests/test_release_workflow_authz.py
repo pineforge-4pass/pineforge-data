@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
+import warnings
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -92,9 +95,89 @@ printf '%s\\n' "$GH_PERMISSION"
 """
 
 
+PRIVATE_KEY = re.compile(r"private[-_\s]*key", re.IGNORECASE)
+SECRET_REFERENCE = re.compile(
+    r"""\bsecrets\s*(?:\.\s*([\w-]+)|\[\s*(['"])(.*?)\2\s*\])""", re.IGNORECASE
+)
+DYNAMIC_SECRET = re.compile(r"""\bsecrets\s*\[(?!\s*['"])""", re.IGNORECASE)
+SCRIPT_MINT = re.compile(
+    r"/(?:app/)?installations/[^\n]+/(?:access_tokens|tokens)\b"
+    r"|\b(?:createInstallationAccessToken|getInstallationAccessToken|createAppAuth"
+    r"|create_installation_access_token|get_installation_access_token|get_installation)\b"
+    r"|\bjwt\b|\bopenssl\b[^\n]*\s-sign\b",
+    re.IGNORECASE,
+)
+
+
+def app_token_scalars(
+    value: Any, key: str = "", seen: set[int] | None = None
+) -> Iterator[tuple[str, str]]:
+    if isinstance(value, str):
+        yield key, value
+    elif isinstance(value, (dict, list)):
+        if seen is None:
+            seen = set()
+        if id(value) in seen:
+            return
+        seen.add(id(value))
+        if isinstance(value, dict):
+            for name, child in value.items():
+                yield from app_token_scalars(child, str(name), seen)
+        else:
+            for child in value:
+                yield from app_token_scalars(child, key, seen)
+
+
+def assert_app_token_environments(workflow: dict[str, Any]) -> None:
+    jobs = workflow.get("jobs", {})
+    assert isinstance(jobs, dict), "workflow jobs must be a mapping"
+    for job_id, job in jobs.items():
+        assert isinstance(job, dict), f"{job_id}: workflow job must be a mapping"
+        steps = job.get("steps", [])
+        assert isinstance(steps, list), f"{job_id}: workflow steps must be a list"
+        known_action = any(
+            isinstance(step, dict)
+            and isinstance(step.get("uses"), str)
+            and step["uses"].strip().partition("@")[0].casefold()
+            == "actions/create-github-app-token"
+            for step in steps
+        )
+        scalars = list(app_token_scalars([workflow.get("env", {}), job]))
+        private_key = any(
+            DYNAMIC_SECRET.search(value)
+            or any(
+                PRIVATE_KEY.search(match.group(1) or match.group(3))
+                or PRIVATE_KEY.search(key)
+                for match in SECRET_REFERENCE.finditer(value)
+            )
+            for key, value in scalars
+        )
+        script_mint = any(SCRIPT_MINT.search(value) for _key, value in scalars)
+        if not (known_action or private_key or script_mint):
+            continue
+        environment = job.get("environment")
+        if isinstance(environment, dict):
+            environment = environment.get("name")
+        assert (
+            isinstance(environment, str)
+            and environment.strip()
+            and "${{" not in environment
+        ), f"{job_id}: App-token mint requires a literal non-empty environment"
+        if script_mint or (private_key and not known_action):
+            warnings.warn(
+                f"{job_id}: possible App-token mint; "
+                "human review of private-key/script use required",
+                UserWarning,
+                stacklevel=2,
+            )
+
+
 def load_text(text: str) -> dict[str, Any]:
     loaded = yaml.load(text, Loader=yaml.BaseLoader)
     assert isinstance(loaded, dict)
+    # SafeLoader preserves null/bool/number types for the environment check;
+    # BaseLoader keeps the existing canon comparisons (including "on") unchanged.
+    assert_app_token_environments(yaml.safe_load(text))
     return loaded
 
 
@@ -641,3 +724,223 @@ def test_pages_deploy_is_main_only_and_never_a_pull_request() -> None:
     deploy = load("docs.yml")["jobs"]["deploy"]
     assert deploy["if"] == "github.event_name != 'pull_request' && github.ref == 'refs/heads/main'"
     assert deploy["runs-on"] == HOSTED_RELEASE_RUNNER
+
+
+# CR-304: these refusals exercise the existing load_text preflight, which on
+# b8180f9 returns the parsed mapping without checking App-token environments.
+APP_ENV_FINDING = "mint: App-token mint requires a literal non-empty environment"
+APP_ENV_INVENTORY = (
+    ("pineforge-release.yml", "reconcile", "release-bot"),
+    ("release-report.yml", "report", "release-bot"),
+    ("release.yml", "manual-pr", "release"),
+    ("release.yml", "prepare", "release-bot"),
+)
+
+
+def app_token_workflow(
+    environment: str = "",
+    step: str = "uses: actions/create-github-app-token@v2",
+) -> str:
+    return (
+        "jobs:\n  mint:\n    runs-on: ubuntu-24.04\n"
+        + "".join(f"    {line}\n" for line in environment.splitlines())
+        + "    steps:\n      - "
+        + "\n        ".join(step.splitlines())
+        + "\n"
+    )
+
+
+def assert_app_environment_refusal(text: str, job_id: str = "mint") -> None:
+    with pytest.raises(AssertionError) as refused:
+        load_text(text)
+    assert str(refused.value) == (
+        f"{job_id}: App-token mint requires a literal non-empty environment"
+    )
+
+
+def check_workflow_files(directory: Path) -> None:
+    # Refuse sensitive names and symlinks before enumerating or opening inputs.
+    def safe_input(path: Path) -> None:
+        parts = tuple(part.casefold() for part in path.expanduser().absolute().parts)
+        forbidden = {".ssh", ".aws", ".codex"}
+        assert not forbidden.intersection(parts), f"refused workflow input: {path}"
+        named = "/".join(parts)
+        assert "/.config/zsh/keys" not in named, f"refused workflow input: {path}"
+        assert "/.config/pineforge" not in named, f"refused workflow input: {path}"
+        assert not any(part.endswith(".env") for part in parts), (
+            f"refused workflow input: {path}"
+        )
+        assert ".." not in path.parts, f"refused workflow input: {path}"
+        assert not any(item.is_symlink() for item in (*reversed(path.parents), path)), (
+            f"refused workflow symlink: {path}"
+        )
+
+    safe_input(directory)
+    files = sorted(path for path in directory.iterdir() if path.suffix in {".yml", ".yaml"})
+    assert files, "no workflow YAML files found"
+    for path in files:
+        safe_input(path)
+    print("Workflow preflight inputs:\n" + "\n".join(str(path) for path in files))
+    for path in files:
+        try:
+            load_text(path.read_text(encoding="utf-8"))
+        except AssertionError as error:
+            raise AssertionError(f"{path.name}:{error}") from error
+
+
+@pytest.mark.parametrize("ref", ("v1", "v2", "v99", "a" * 40))
+def test_app_token_any_ref_without_environment_is_refused(ref: str) -> None:
+    step = f"uses: actions/create-github-app-token@{ref}"
+    assert_app_environment_refusal(app_token_workflow(step=step))
+    load_text(app_token_workflow("environment: release-bot", step))
+
+
+@pytest.mark.parametrize(
+    "environment",
+    (
+        "environment: release-bot",
+        'environment: "release"',
+        "environment:\n  name: release-bot\n  url: https://example.com/release",
+        "environment: {name: release-bot}",
+    ),
+)
+def test_app_token_literal_environment_controls(environment: str) -> None:
+    assert_app_environment_refusal(app_token_workflow())
+    load_text(app_token_workflow(environment))
+
+
+@pytest.mark.parametrize(
+    "environment",
+    (
+        "environment:",
+        'environment: ""',
+        "environment: '   '",
+        "environment: null",
+        "environment: false",
+        "environment: 42",
+        "environment: []",
+        "environment: ${{ inputs.environment }}",
+        "environment: release-${{ github.ref_name }}",
+        "environment:\n  url: https://example.com/release",
+        "environment:\n  name:",
+        "environment:\n  name: ${{ matrix.environment }}",
+        'environment: {name: "${{ inputs.environment }}"}',
+    ),
+)
+def test_app_token_empty_or_dynamic_environment_is_refused(environment: str) -> None:
+    assert_app_environment_refusal(app_token_workflow(environment))
+    load_text(app_token_workflow("environment:\n  name: release-bot"))
+
+
+@pytest.mark.parametrize(
+    "refused,accepted",
+    (
+        (
+            'jobs: {mint: {steps: [{uses: "actions/create-github-app-token@v3"}]}}',
+            'jobs: {mint: {environment: release-bot, '
+            'steps: [{uses: "actions/create-github-app-token@v3"}]}}',
+        ),
+        (
+            '"jobs": {"mint": {"environment": "", '
+            '"steps": [{"uses": "actions/create-github-app-token@v3"}]}}',
+            '"jobs": {"mint": {"environment": {"name": "release"}, '
+            '"steps": [{"uses": "actions/create-github-app-token@v3"}]}}',
+        ),
+        (
+            'jobs: {mint: {"envir\\u006fnment": "", '
+            'steps: [{"us\\u0065s": "actions/create-github-app-token@v3"}]}}',
+            'jobs: {mint: {"envir\\u006fnment": {name: release-bot}, '
+            'steps: [{"us\\u0065s": "actions/create-github-app-token@v3"}]}}',
+        ),
+    ),
+)
+def test_app_token_quoted_keys_and_flow_mappings_are_checked(
+    refused: str, accepted: str
+) -> None:
+    assert_app_environment_refusal(refused)
+    load_text(accepted)
+
+
+@pytest.mark.parametrize(
+    "step",
+    (
+        "uses: vendor/mint@v1\nwith:\n  private-key: ${{ secrets.DEPLOY_CREDENTIAL }}",
+        "uses: vendor/other@v1\nwith:\n  credential: ${{ secrets.BUILD_PRIVATE_KEY }}",
+        "run: ./mint.sh\nenv:\n  APP_KEY: ${{ secrets['BUILD_PRIVATE_KEY'] }}",
+        "run: ./mint.sh\nenv:\n  APP_KEY: ${{ secrets[vars.KEY_SECRET] }}",
+        "uses: actions/github-script@v8\nwith:\n  script: |\n"
+        "    github.rest.apps.createInstallationAccessToken({installation_id: 7})",
+        "run: gh api --method POST /app/installations/7/access_tokens",
+        "run: curl -X POST https://api.github.com/app/installations/7/access_tokens",
+        "run: python -c 'jwt.encode(payload, key, algorithm=\"RS256\")'",
+        "run: openssl dgst -sha256 -sign app.pem",
+    ),
+)
+def test_alternative_mints_and_private_key_transfers_are_flagged(step: str) -> None:
+    assert_app_environment_refusal(app_token_workflow(step=step))
+    with pytest.warns(UserWarning, match="possible App-token mint; human review"):
+        load_text(app_token_workflow("environment: release-bot", step))
+
+
+@pytest.mark.parametrize("scope", ("workflow", "job"))
+def test_inherited_private_key_secret_is_checked(scope: str) -> None:
+    workflow = yaml.safe_load(app_token_workflow(step="run: ./mint.sh"))
+    target = workflow if scope == "workflow" else workflow["jobs"]["mint"]
+    target["env"] = {"APP_KEY": "${{ secrets.RELEASE_APP_PRIVATE_KEY }}"}
+    assert_app_environment_refusal(yaml.safe_dump(workflow))
+    workflow["jobs"]["mint"]["environment"] = "release-bot"
+    with pytest.warns(UserWarning, match="possible App-token mint; human review"):
+        load_text(yaml.safe_dump(workflow))
+
+
+def test_mint_in_a_second_workflow_file_is_refused(tmp_path: Path) -> None:
+    first = tmp_path / "a.yml"
+    second = tmp_path / "z.yaml"
+    first.write_text("jobs: {docs: {steps: [{run: 'echo docs'}]}}\n", encoding="utf-8")
+    second.write_text(app_token_workflow(), encoding="utf-8")
+    with pytest.raises(AssertionError) as refused:
+        check_workflow_files(tmp_path)
+    assert str(refused.value) == f"z.yaml:{APP_ENV_FINDING}"
+    second.write_text(app_token_workflow("environment: release-bot"), encoding="utf-8")
+    check_workflow_files(tmp_path)
+
+
+def test_a_sibling_jobs_environment_does_not_cover_a_mint() -> None:
+    workflow = yaml.safe_load(app_token_workflow())
+    workflow["jobs"]["docs"] = {
+        "environment": "release-bot",
+        "steps": [{"run": "echo docs"}],
+    }
+    assert_app_environment_refusal(yaml.safe_dump(workflow))
+    workflow["jobs"]["mint"]["environment"] = "release-bot"
+    load_text(yaml.safe_dump(workflow))
+
+
+def test_non_minting_jobs_do_not_need_an_environment() -> None:
+    assert_app_environment_refusal(app_token_workflow())
+    load_text(
+        "jobs: {docs: {steps: [{run: 'echo docs'}]}, "
+        "read: {steps: [{run: 'gh api repos/org/repo', "
+        "env: {GH_TOKEN: '${{ github.token }}'}}]}}"
+    )
+    # The existing mapping-style deployment environment is also accepted.
+    load_text(
+        "jobs: {publish: {environment: {name: pypi, url: 'https://pypi.org'}, "
+        "steps: [{uses: 'pypa/gh-action-pypi-publish@release/v1'}]}}"
+    )
+
+
+@pytest.mark.parametrize("name,job_id,environment", APP_ENV_INVENTORY)
+def test_environment_removal_mutation_is_refused(
+    name: str, job_id: str, environment: str
+) -> None:
+    workflow = load(name)
+    assert workflow["jobs"][job_id].get("environment") == environment
+    workflow["jobs"][job_id].pop("environment")
+    assert_app_environment_refusal(yaml.safe_dump(workflow), job_id)
+
+
+def test_every_workflow_file_has_app_token_environment_preflight() -> None:
+    check_workflow_files(WORKFLOWS)
+    for name, job_id, environment in APP_ENV_INVENTORY:
+        assert load(name)["jobs"][job_id].get("environment") == environment

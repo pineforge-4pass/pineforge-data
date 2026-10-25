@@ -210,6 +210,7 @@ jobs:
     needs: authz
     if: github.event_name == 'workflow_dispatch' && inputs.ci_run == '' && !inputs.claim_placeholder
     runs-on: ubuntu-24.04
+    environment: release
     concurrency:
       group: data-release-adapter
       cancel-in-progress: false
@@ -258,6 +259,7 @@ jobs:
       ((github.event_name == 'workflow_run' && github.event.workflow_run.event == 'push') ||
       (github.event_name == 'workflow_dispatch' && inputs.ci_run != '')) && !inputs.claim_placeholder
     runs-on: ubuntu-24.04
+    environment: release-bot
     outputs:
       eligible: ${{ steps.release.outputs.eligible }}
       has_target: ${{ steps.release.outputs.has_target }}

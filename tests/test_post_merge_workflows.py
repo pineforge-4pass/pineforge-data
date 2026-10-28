@@ -181,7 +181,7 @@ def test_post_ci_control_rejects_reverting_a_proof(fault: str) -> None:
     elif fault == "gate":
         jobs["check"]["if"] = "${{ !cancelled() }}"
     else:
-        jobs["distribution"]["runs-on"] = "ubuntu-24.04"
+        jobs["ready"]["runs-on"] = "ubuntu-24.04"
     with pytest.raises(AssertionError):
         assert_post_ci(changed)
 

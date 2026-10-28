@@ -381,6 +381,54 @@ def test_gate_accepts_only_the_complete_current_attempt() -> None:
     evidence.validate_gate(gate, run, jobs, head="a" * 40, base="b" * 40, pr=7)
 
 
+def test_landed_evidence_requires_the_post_workflow() -> None:
+    gate, run, jobs = green_gate()
+    gate.update(event="push", pr=None, base=None)
+    run.update(event="push", path=".github/workflows/ci-post.yml")
+    evidence.validate_gate(gate, run, jobs, head="a" * 40, base=None, pr=None)
+    run["path"] = ".github/workflows/ci.yml"
+    with pytest.raises(ValueError, match="unexpected CI workflow"):
+        evidence.validate_gate(gate, run, jobs, head="a" * 40, base=None, pr=None)
+
+
+def test_pr_evidence_cannot_use_the_post_workflow() -> None:
+    gate, run, jobs = green_gate()
+    run["path"] = ".github/workflows/ci-post.yml"
+    with pytest.raises(ValueError, match="unexpected CI workflow"):
+        evidence.validate_gate(gate, run, jobs, head="a" * 40, base="b" * 40, pr=7)
+
+
+def test_recovery_queries_the_landed_post_workflow(baseline, monkeypatch) -> None:
+    pr = {
+        "number": 7,
+        "merged_at": "2026-10-01T00:00:00Z",
+        "merge_commit_sha": "a" * 40,
+        "head": {"sha": "b" * 40},
+        "base": {"ref": "main", "sha": "c" * 40},
+        "body": automation.body({"version": "0.3.0", "base": "c" * 40}),
+    }
+    monkeypatch.setattr(publishing, "stored_receipt", lambda *args: None)
+
+    def inventory(repo, endpoint):
+        assert repo == "owner/data"
+        assert endpoint == "pulls?state=closed&base=main&sort=updated&direction=desc"
+        return [pr]
+
+    def api(repo, endpoint):
+        assert repo == "owner/data"
+        assert endpoint == (
+            "actions/workflows/ci-post.yml/runs?event=push&per_page=100&head_sha=" + "a" * 40
+        )
+        return {"workflow_runs": []}
+
+    monkeypatch.setattr(publishing, "inventory", inventory)
+    monkeypatch.setattr(publishing, "api", api)
+    report = {"pr": None, "state": "queued"}
+    publishing.recover_applied("owner/data", baseline, report)
+    assert report["state"] == "testing"
+    assert report["pr"]["merge"] == "a" * 40
+
+
 @pytest.mark.parametrize("job_name", [*evidence.JOBS, "release/ready"])
 @pytest.mark.parametrize("result", ["failure", "cancelled", "skipped", "missing"])
 def test_green_workflow_cannot_hide_a_missing_or_failed_gate(job_name, result) -> None:
@@ -399,6 +447,9 @@ def evidence_inputs(tmp_path: Path, monkeypatch):
     workflow = root / ".github" / "workflows" / "ci.yml"
     workflow.parent.mkdir(parents=True)
     workflow.write_bytes((ROOT / ".github" / "workflows" / "ci.yml").read_bytes())
+    (workflow.parent / "ci-post.yml").write_bytes(
+        (ROOT / ".github/workflows/ci-post.yml").read_bytes()
+    )
     hooks = tmp_path / "empty-hooks"
     hooks.mkdir()
     subprocess.run(
@@ -524,12 +575,19 @@ def test_create_evidence_rejects_continue_on_error(evidence_inputs, workflow) ->
         evidence.create_evidence(root, directory, needs)
 
 
-def test_reviewed_ci_workflow_pin_matches_the_file() -> None:
+@pytest.mark.parametrize(
+    "filename,pin",
+    [
+        ("ci.yml", "REVIEWED_CI_WORKFLOW_SHA256"),
+        ("ci-post.yml", "REVIEWED_CI_POST_WORKFLOW_SHA256"),
+    ],
+)
+def test_reviewed_ci_workflow_pin_matches_the_file(filename: str, pin: str) -> None:
     assert (
-        evidence.sha256((ROOT / ".github" / "workflows" / "ci.yml").read_bytes())
-        == evidence.REVIEWED_CI_WORKFLOW_SHA256
+        evidence.sha256((ROOT / ".github/workflows" / filename).read_bytes())
+        == getattr(evidence, pin)
     ), (
-        "ci.yml changed: update REVIEWED_CI_WORKFLOW_SHA256 after reviewing that "
+        f"{filename} changed: update {pin} after reviewing that "
         'needs.<job>.result == "success" still proves every matrix leg succeeded'
     )
 
@@ -1118,6 +1176,7 @@ def assert_pull_request_filter_policy(workflow: dict[str, Any], name: str) -> No
         assert pull_request.get("paths") == [
             "native/feed/**",
             ".github/workflows/native-feed.yml",
+            ".github/workflows/native-feed-post.yml",
         ]
     else:
         assert name in {"ci.yml", "docs.yml"}

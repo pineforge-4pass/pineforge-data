@@ -1,20 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 name: Native feed
 on:
-  push:
-    branches: [main]
-    paths: ['native/feed/**', '.github/workflows/native-feed.yml']
   pull_request:
-    paths: ['native/feed/**', '.github/workflows/native-feed.yml']
-  workflow_dispatch:
+    paths: ['native/feed/**', '.github/workflows/native-feed.yml', '.github/workflows/native-feed-post.yml']
 
 permissions:
   contents: read
 
-# Only a superseded pull_request run is cancelled; push and dispatch are never cancelled.
-# authz, asan-ubsan, tsan and the release legs run on GitHub-hosted runners (owner decision
-# CI-2 = A, 10-21: ubuntu-24.04, ubuntu-24.04-arm, macos-14; no secret in any).
-# Fork PRs fail authz.
+# Pull request builds keep their existing hosted platform runners.
+# Main-branch builds run in native-feed-post.yml; macOS remains hosted.
 concurrency:
   group: native-feed-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}

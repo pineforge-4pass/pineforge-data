@@ -83,7 +83,7 @@ static checks, for example Ruff, mypy, Python compilation, actionlint and
 ## Publication, completion and repair
 
 Successful PR CI wakes the reconciler through `workflow_run`. The App's merge
-triggers ordinary main CI. `Release` wakes on completion of that main CI, and
+triggers `ci-post.yml` on main. `Release` wakes on completion of that main CI, and
 accepts only a landed App-created release/version/rollback PR. Ordinary main
 pushes are not publication requests. Failed main CI cannot authorize upload.
 
@@ -112,7 +112,7 @@ produce no receipt; ordinary manual package publication still uses the existing
 landed CI evidence and gates, without requiring a product receipt artifact. CI/PR-head code never builds the hub artifact.
 
 CI and E2E both reference the complete successful **pre-merge** `ci.yml` run,
-including `release/ready`. The landed main CI still authorizes the exact
+including `release/ready`. The landed `ci-post.yml` run authorizes the exact
 wheel/sdist bytes used by the existing publisher. Preview records the candidate
 head/image/facts and a SHA-256 of its tested distribution identity. After the
 `Release` run finishes, the coordinator rechecks the actual PR, tested base and

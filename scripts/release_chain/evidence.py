@@ -13,10 +13,13 @@ from xml.etree import ElementTree
 
 from .contract import gh_bytes, json_bytes, object_json, require, sha256
 
-# SHA256 of reviewed .github/workflows/ci.yml bytes: no continue-on-error, matrix leg names = JOBS.
+# SHA256 of both reviewed CI definitions: no continue-on-error, matrix leg names = JOBS.
 # Edits must update the pin in the same PR after re-review: needs.<job>.result == "success" proves
 # every leg succeeded (2026-10-23, VP-145 review P0: a lexical test alone misses escaped YAML keys).
-REVIEWED_CI_WORKFLOW_SHA256 = "de94f322b372305ccb4e5550e248c9727137f263f17dc3d6c4649a5d09ef64c5"
+REVIEWED_CI_WORKFLOW_SHA256 = "d62bd2fa2c574d336654df1a18988eb8692396cf75d21dc9f6df0d59735f3225"
+REVIEWED_CI_POST_WORKFLOW_SHA256 = (
+    "0d482244dd46ed3e4ec7ac6e5297521c81106922a93c24fde01ed1e87d2fdd5d"
+)
 
 JOBS = (
     "Python 3.11",
@@ -102,15 +105,19 @@ def validate_inventory(jobs: list[dict[str, Any]]) -> None:
 
 
 def require_no_continue_on_error(root: Path) -> None:
-    try:
-        raw = (root / ".github" / "workflows" / "ci.yml").read_bytes()
-        text = raw.decode("utf-8")
-    except (OSError, UnicodeError) as exc:
-        require(False, f"cannot read ci.yml: {exc}")
-    require(
-        sha256(raw) == REVIEWED_CI_WORKFLOW_SHA256 and "continue-on-error" not in text,
-        "ci.yml changed or uses continue-on-error: needs results require workflow review",
-    )
+    for filename, reviewed in (
+        ("ci.yml", REVIEWED_CI_WORKFLOW_SHA256),
+        ("ci-post.yml", REVIEWED_CI_POST_WORKFLOW_SHA256),
+    ):
+        try:
+            raw = (root / ".github/workflows" / filename).read_bytes()
+            text = raw.decode("utf-8")
+        except (OSError, UnicodeError) as exc:
+            require(False, f"cannot read {filename}: {exc}")
+        require(
+            sha256(raw) == reviewed and "continue-on-error" not in text,
+            f"{filename} changed or uses continue-on-error: needs results require workflow review",
+        )
 
 
 def create_evidence(root: Path, directory: Path, needs: dict[str, Any]) -> dict[str, Any]:
@@ -161,7 +168,8 @@ def validate_gate(
         run["status"] == "completed" and run["conclusion"] == "success",
         "CI has not completed successfully",
     )
-    require(run["path"] == ".github/workflows/ci.yml", "unexpected CI workflow")
+    workflow = "ci.yml" if pr else "ci-post.yml"
+    require(run["path"] == f".github/workflows/{workflow}", "unexpected CI workflow")
     require(run["head_sha"] == head and evidence["head"] == head, "stale CI head")
     require(evidence["base"] == base and evidence["pr"] == pr, "stale CI base or PR")
     require(

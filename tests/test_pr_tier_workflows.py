@@ -1219,7 +1219,7 @@ def assert_cheap_pr_policy(workflow: dict[str, Any]) -> None:
     assert isinstance(pull_request, dict)
     assert not {"paths", "paths-ignore", "branches", "branches-ignore"} & set(pull_request)
     assert jobs["changes"] == canon_job("canon-changes-job.yml", "changes")
-    assert jobs["workflow-lint"] == canon_job("canon-workflow-lint-job.yml", "workflow-lint")
+    assert jobs["workflow-lint"] == canon_job("canon-workflow-lint-gke-job.yml", "workflow-lint")
     example = canon_job("canon-heavy-job-example.yml", "shard-a")
     for job_id in ("test", *RUNTIME_JOBS):
         assert jobs[job_id]["needs"] == example["needs"]

@@ -1,21 +1,14 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
 
 permissions:
   contents: read
   actions: read
 
-# Only a superseded pull_request run is cancelled: every other event (push to main,
-# whose run authorizes publication) gets its own run_id group and is never cancelled.
-# Every job runs on GitHub-hosted ubuntu-24.04 (owner decision CI-2 = A, 10-21 04:01, and #1050:
-# this repository is public and no job here holds a secret); dependabot counts as ours.
-# Fork PRs fail authz. Documentation/workflow-only PRs run the light checks and skip
-# the heavy suites and release/ready evidence. The required check independently proves
-# cheap skips; code PRs and every push run the full suites and produce release evidence.
+# Pull requests keep hosted runners and the independently verified cheap checks.
+# Main-branch proofs and release evidence run in ci-post.yml.
 concurrency:
   group: ci-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -236,7 +229,7 @@ jobs:
           fi
           tar -xzf "$lint_dir/$archive" -C "$lint_dir" actionlint
           "$lint_dir/actionlint" -version
-          printf '%s\n' '{"self-hosted-runner":{"labels":["pf-gcp-pr","pf-gcp-main","pf-gcp-post"]}}' > "$lint_dir/actionlint.yaml"
+          printf '%s\n' '{"self-hosted-runner":{"labels":["pf-gcp-pr","pf-gcp-main","pf-gcp-post","gke-2cpu-4gb-amd64","gke-2cpu-4gb-arm64","gke-4cpu-8gb-amd64","gke-4cpu-8gb-arm64","gke-8cpu-16gb-amd64","gke-8cpu-16gb-arm64","gke-16cpu-32gb-amd64","gke-16cpu-32gb-arm64","gke-32cpu-64gb-amd64","gke-32cpu-64gb-arm64","gkp-2cpu-4gb-amd64","gkp-2cpu-4gb-arm64","gkp-4cpu-8gb-amd64","gkp-4cpu-8gb-arm64","gkp-8cpu-16gb-amd64","gkp-8cpu-16gb-arm64","gkp-16cpu-32gb-amd64","gkp-16cpu-32gb-arm64","gkp-32cpu-64gb-amd64","gkp-32cpu-64gb-arm64"]}}' > "$lint_dir/actionlint.yaml"
           git ls-files -z -- .github/workflows > "$lint_dir/workflows"
           workflows=()
           while IFS= read -r -d '' path; do

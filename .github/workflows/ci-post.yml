@@ -1,0 +1,450 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+# Keep this workflow name for the existing release completion listener.
+# Every post-merge run completes; only main may request workload runners.
+concurrency:
+  group: ci-post-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  authz:
+    name: authz
+    # Standard GitHub-hosted label (owner #1050); never a larger-runner label.
+    runs-on: ubuntu-24.04
+    permissions: {}
+    # No timeout-minutes: the owner's no-time-limits rule (check-no-time-limits refuses new ones).
+    steps:
+      - name: Only our own pull requests and our own events run CI
+        env:
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+          ASSOCIATION: ${{ github.event.pull_request.author_association }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          WR_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          WR_ACTOR: ${{ github.event.workflow_run.triggering_actor.login }}
+          GH_TOKEN: ${{ github.token }}   # read-only use: one permission lookup for workflow_run
+          # Bot logins whose same-repository pull requests count as ours: dependabot[bot] (CI-DEPBOT A)
+          # and the org's own GitHub App bot logins by name (space-separated), nothing else.
+          ALLOWED_BOTS: "dependabot[bot] pineforge-app[bot]"
+        run: |
+          set -eu
+          fail() { echo "::error title=authz::$1"; echo "authz: REFUSED: $1" >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          case "$EVENT" in
+            push|workflow_dispatch|schedule|merge_group|release|workflow_call|repository_dispatch)
+              # Only someone with write access to this repository (or our App's token) can cause these
+              # events; none of them runs pull-request code.
+              ;;
+            workflow_run)
+              # LB-437: bind identity to the triggering run and its re-runner.
+              # These two App bots are fixed canon policy; ALLOWED_BOTS is PR-only.
+              [ -n "${WR_HEAD_REPO:-}" ] || fail "workflow_run head repository is missing"
+              [ -n "${WR_ACTOR:-}" ] || fail "workflow_run triggering actor is missing"
+              [ "$WR_HEAD_REPO" = "$REPO" ] || fail "workflow_run head repository does not match this repository"
+              case "$WR_ACTOR" in
+                "pineforge-app[bot]"|"pineforge-ci-dispatcher[bot]") ;;
+                *"[bot]") fail "workflow_run bot is not on the canon allowlist" ;;
+                *)
+                  perm=$(gh api "repos/$REPO/collaborators/$WR_ACTOR/permission" --jq .permission 2>/dev/null) || fail "workflow_run permission lookup failed"
+                  case "$perm" in admin|maintain|write) ;; *) fail "workflow_run triggering actor does not have write permission" ;; esac ;;
+              esac ;;
+            pull_request)
+              [ "$HEAD_REPO" = "$REPO" ] || fail "pull request from another repository (${HEAD_REPO:-unknown})"
+              [ "$HEAD_IS_FORK" = "false" ] || fail "pull request from a fork"
+              case "$ASSOCIATION" in
+                OWNER|MEMBER|COLLABORATOR) ;;
+                *)
+                  case " $ALLOWED_BOTS " in
+                    *" $PR_AUTHOR "*) ;;
+                    *)
+                      # A member whose org membership is private shows as CONTRIBUTOR: ask GitHub for the
+                      # author's permission on this repository; anything but admin/maintain/write (or a
+                      # failed call) refuses.
+                      perm=$(gh api "repos/$REPO/collaborators/$PR_AUTHOR/permission" --jq .permission 2>/dev/null || echo none)
+                      case "$perm" in admin|maintain|write) ;; *) fail "author ${PR_AUTHOR:-unknown} (${ASSOCIATION:-NONE}) has permission '$perm', not write, and is not an allowlisted bot" ;; esac ;;
+                  esac ;;
+              esac ;;
+            *) fail "event $EVENT does not run CI (pull_request_target and other events are not allowed)" ;;
+          esac
+          echo "authz: allowed ($EVENT${PR_AUTHOR:+ by $PR_AUTHOR})" >> "$GITHUB_STEP_SUMMARY"
+
+  main-ref:
+    needs: [authz]
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - name: Require the main branch before requesting runners
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          set -eu
+          [ "$REF" = refs/heads/main ]
+
+  workflow-lint:
+    name: workflow-lint
+    needs: [authz, main-ref]
+    runs-on: gke-2cpu-4gb-amd64
+    permissions:
+      contents: read
+    steps:
+      - name: "Check out the exact head with full history"
+        if: "${{ needs.authz.result == 'success' }}"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: "${{ github.event.pull_request.head.sha || github.sha }}"
+          fetch-depth: 0
+          persist-credentials: false
+      - name: "Lint all workflow definitions with pinned actionlint v1.7.12"
+        if: "${{ needs.authz.result == 'success' }}"
+        shell: "bash"
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64)
+              archive=actionlint_1.7.12_linux_amd64.tar.gz
+              sha256=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8 ;;
+            aarch64|arm64)
+              archive=actionlint_1.7.12_linux_arm64.tar.gz
+              sha256=325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6 ;;
+            *)
+              echo "::error::workflow-lint requires a supported Linux architecture"
+              exit 1 ;;
+          esac
+          lint_dir=$(mktemp -d "$RUNNER_TEMP/workflow-lint.XXXXXXXX")
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --retry 3 --retry-all-errors \
+            --output "$lint_dir/$archive" "https://github.com/rhysd/actionlint/releases/download/v1.7.12/$archive"
+          if ! printf '%s  %s\n' "$sha256" "$lint_dir/$archive" | sha256sum --check --strict --status; then
+            echo "::error::actionlint archive checksum did not match the published pin"
+            exit 1
+          fi
+          tar -xzf "$lint_dir/$archive" -C "$lint_dir" actionlint
+          "$lint_dir/actionlint" -version
+          printf '%s\n' '{"self-hosted-runner":{"labels":["pf-gcp-pr","pf-gcp-main","pf-gcp-post","gke-2cpu-4gb-amd64","gke-2cpu-4gb-arm64","gke-4cpu-8gb-amd64","gke-4cpu-8gb-arm64","gke-8cpu-16gb-amd64","gke-8cpu-16gb-arm64","gke-16cpu-32gb-amd64","gke-16cpu-32gb-arm64","gke-32cpu-64gb-amd64","gke-32cpu-64gb-arm64","gkp-2cpu-4gb-amd64","gkp-2cpu-4gb-arm64","gkp-4cpu-8gb-amd64","gkp-4cpu-8gb-arm64","gkp-8cpu-16gb-amd64","gkp-8cpu-16gb-arm64","gkp-16cpu-32gb-amd64","gkp-16cpu-32gb-arm64","gkp-32cpu-64gb-amd64","gkp-32cpu-64gb-arm64"]}}' > "$lint_dir/actionlint.yaml"
+          git ls-files -z -- .github/workflows > "$lint_dir/workflows"
+          workflows=()
+          while IFS= read -r -d '' path; do
+            case "$path" in
+              *.yml|*.yaml) workflows+=("$path") ;;
+            esac
+          done < "$lint_dir/workflows"
+          if [[ -n "${path-}" ]]; then
+            echo "::error::unterminated Git workflow path"
+            exit 1
+          fi
+          if [[ "${#workflows[@]}" -eq 0 ]]; then
+            echo "::error::no workflow YAML files were found"
+            exit 1
+          fi
+          "$lint_dir/actionlint" -config-file "$lint_dir/actionlint.yaml" -shellcheck= -pyflakes= "${workflows[@]}"
+
+  test:
+    name: Python ${{ matrix.python-version }}
+    needs: [authz, main-ref]
+    runs-on: gke-4cpu-8gb-amd64
+    env:
+      PF_CI_LABELS: '["gke-4cpu-8gb-amd64"]'
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e '.[dev,ccxt,release]'
+      - run: ruff check .
+      - run: mypy src
+      - run: pytest
+      - if: matrix.python-version == '3.13'
+        run: python -m build
+      - if: matrix.python-version == '3.13'
+        name: The sdist does not ship the native feed
+        run: |
+          if tar -tzf dist/*.tar.gz | grep -E '^[^/]+/native/'; then
+            echo "native/ must stay out of the Python sdist" >&2
+            exit 1
+          fi
+      - if: matrix.python-version == '3.13'
+        run: python -m twine check --strict dist/*
+
+  docker:
+    name: Docker runtime
+    needs: [authz, main-ref]
+    runs-on: gke-4cpu-8gb-amd64
+    env:
+      PF_CI_LABELS: '["gke-4cpu-8gb-amd64"]'
+    steps:
+      - name: authz must have passed
+        if: needs.authz.result != 'success'
+        run: exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.authz.result == 'success'
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: python -m pip install -e '.[dev]'
+        if: needs.authz.result == 'success'
+      - name: Verify the Docker sidecar is available
+        if: needs.authz.result == 'success'
+        run: |
+          docker info
+      - run: PINEFORGE_DOCKER_TEST=1 pytest tests/test_docker_integration.py --junitxml=docker.xml
+        if: needs.authz.result == 'success'
+      - name: Require every real runtime test with zero skips
+        if: needs.authz.result == 'success'
+        env:
+          PYTHONPATH: scripts
+        run: python -m release_chain.evidence junit --suite docker --path docker.xml
+
+  database-e2e:
+    name: Database E2E
+    needs: [authz, main-ref]
+    runs-on: ubuntu-24.04
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: pineforge
+          MYSQL_USER: pineforge
+          MYSQL_PASSWORD: pineforge
+          MYSQL_ROOT_PASSWORD: pineforge-root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping --host=127.0.0.1 --user=pineforge --password=pineforge --silent"
+          --health-interval=2s
+          --health-timeout=5s
+          --health-retries=30
+          --health-start-period=15s
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: pineforge
+          POSTGRES_USER: pineforge
+          POSTGRES_PASSWORD: pineforge
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready --username=pineforge --dbname=pineforge"
+          --health-interval=2s
+          --health-timeout=5s
+          --health-retries=30
+          --health-start-period=10s
+    env:
+      PF_CI_LABELS: '["ubuntu-24.04"]'
+      PINEFORGE_DATABASE_E2E: "1"
+      PINEFORGE_CORPUS_OHLCV: tests/fixtures/corpus_ohlcv_ETH-USDT-USDT_1m_sample.csv
+      PINEFORGE_MYSQL_URL: mysql+pymysql://pineforge:pineforge@127.0.0.1:3306/pineforge
+      PINEFORGE_POSTGRES_URL: postgresql+psycopg://pineforge:pineforge@127.0.0.1:5432/pineforge
+    steps:
+      - name: authz must have passed
+        if: needs.authz.result != 'success'
+        run: exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.authz.result == 'success'
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+        if: needs.authz.result == 'success'
+      - run: python -m pip install -e '.[dev,database-e2e]'
+        if: needs.authz.result == 'success'
+      - run: pytest tests/test_database_e2e.py --junitxml=database.xml
+        if: needs.authz.result == 'success'
+      - name: Require the disposable database E2E inventory with zero skips
+        if: needs.authz.result == 'success'
+        env:
+          PYTHONPATH: scripts
+        run: python -m release_chain.evidence junit --suite database --path database.xml
+
+  contract:
+    name: Release contract
+    needs: [authz, main-ref]
+    runs-on: gke-2cpu-4gb-amd64
+    env:
+      PF_CI_LABELS: '["gke-2cpu-4gb-amd64"]'
+    steps:
+      - name: authz must have passed
+        if: needs.authz.result != 'success'
+        run: exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.authz.result == 'success'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.13'
+      - name: Verify synchronized defaults, immutable manifest, source, facts and both OCI children
+        if: needs.authz.result == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/release_adapter.py local
+
+  distribution:
+    name: Distribution
+    needs: [authz, main-ref]
+    runs-on: gke-4cpu-8gb-amd64
+    env:
+      PF_CI_LABELS: '["gke-4cpu-8gb-amd64"]'
+    steps:
+      - name: authz must have passed
+        if: needs.authz.result != 'success'
+        run: exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.authz.result == 'success'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.13'
+          cache: pip
+      - run: python -m pip install -e '.[release]'
+        if: needs.authz.result == 'success'
+      - name: Set reproducible archive timestamps
+        if: needs.authz.result == 'success'
+        run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+      - name: Verify the Docker sidecar is available
+        if: needs.authz.result == 'success'
+        run: |
+          docker info
+      - run: python -m build
+        if: needs.authz.result == 'success'
+      - run: python -m twine check --strict dist/*
+        if: needs.authz.result == 'success'
+      - name: The canonical sdist does not ship the native feed
+        if: needs.authz.result == 'success'
+        run: |
+          if tar -tzf dist/*.tar.gz | grep -E '^[^/]+/native/'; then
+            echo "native/ must stay out of the Python sdist" >&2
+            exit 1
+          fi
+      - name: Install and backtest both built distributions without importing checkout source
+        if: needs.authz.result == 'success'
+        env:
+          PYTHONPATH: scripts
+        run: |
+          set -euo pipefail
+          version="$(python scripts/bump_version.py current)"
+          image="$(python -c 'from pathlib import Path; from release_chain.contract import runtime_pin; print(runtime_pin(Path.cwd()))')"
+          for artifact in "$GITHUB_WORKSPACE"/dist/*; do
+            case "$artifact" in
+              *.whl) kind=wheel ;;
+              *.tar.gz) kind=sdist ;;
+              *) exit 1 ;;
+            esac
+            environment="$RUNNER_TEMP/distribution-$kind"
+            python -m venv "$environment"
+            "$environment/bin/python" -m pip install "$artifact"
+            "$environment/bin/python" -I scripts/exercise_distribution.py \
+              --version "$version" --image "$image" --source "$GITHUB_WORKSPACE/src" \
+              --fixtures "$GITHUB_WORKSPACE/tests/fixtures" \
+              --output "$RUNNER_TEMP/exercise-$kind.json"
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: distribution-runtime-evidence-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/exercise-*.json
+          if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-package-distributions-${{ github.run_attempt }}
+          path: dist/
+          if-no-files-found: error
+
+  docs-tests:
+    name: Documentation
+    needs: [authz, main-ref]
+    runs-on: gke-2cpu-4gb-amd64
+    permissions:
+      contents: read
+    env:
+      PF_CI_LABELS: '["gke-2cpu-4gb-amd64"]'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.authz.result == 'success'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        if: needs.authz.result == 'success'
+        with:
+          python-version: '3.13'
+      - name: Install pytest only; the documentation test reads files
+        if: needs.authz.result == 'success'
+        run: python -m pip install pytest
+      - name: Check every relative documentation link
+        if: needs.authz.result == 'success'
+        run: pytest tests/test_documentation.py
+
+  ready:
+    name: release/ready
+    needs: [authz, main-ref, test, contract, docker, database-e2e, distribution]
+    runs-on: gke-2cpu-4gb-amd64
+    env:
+      PF_CI_LABELS: '["gke-2cpu-4gb-amd64"]'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.authz.result == 'success'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        if: needs.authz.result == 'success'
+        with:
+          python-version: '3.13'
+      - name: Download this attempt's tested distributions
+        if: needs.authz.result == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          ATTEMPT: ${{ github.run_attempt }}
+        run: gh run download "$RUN_ID" --name "python-package-distributions-$ATTEMPT" --dir dist
+      - name: Require the complete job inventory and bind evidence to this head/base/tree
+        if: needs.authz.result == 'success'
+        env:
+          PYTHONPATH: scripts
+          NEEDS_JSON: >-
+            {"test":${{ toJSON(needs.test) }},"contract":${{ toJSON(needs.contract) }},
+            "docker":${{ toJSON(needs.docker) }},"database-e2e":${{ toJSON(needs.database-e2e) }},
+            "distribution":${{ toJSON(needs.distribution) }}}
+          GH_TOKEN: ${{ github.token }}
+        run: python -m release_chain.evidence aggregate --path dist
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: needs.authz.result == 'success'
+        with:
+          name: release-evidence-${{ github.run_attempt }}
+          path: evidence.json
+          if-no-files-found: error
+
+  check:
+    needs: [authz, main-ref, workflow-lint, test, docker, database-e2e, contract, distribution, docs-tests, ready]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: "Refuse an unauthorised run before anything else"
+        if: "${{ needs.authz.result != 'success' }}"
+        run: |
+          echo "::error::authz did not pass; nothing of this run's code is checked out or run"
+          exit 1
+      - name: Every needed job succeeded
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          echo "$RESULTS"
+          [ "$(echo "$RESULTS" | tr -d '[] \n"' | tr ',' '\n' | grep -vc '^success$')" = "0" ] || { echo "::error::a needed job did not succeed"; exit 1; }

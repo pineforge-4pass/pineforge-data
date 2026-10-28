@@ -298,7 +298,8 @@ def recover_applied(repo: str, source: Path, report: dict[str, Any]) -> None:
     report["pr"]["base_sha"] = marker(pr)["base"]
     runs = api(
         repo,
-        "actions/workflows/ci.yml/runs?event=push&per_page=100&head_sha=" + pr["merge_commit_sha"],
+        "actions/workflows/ci-post.yml/runs?event=push&per_page=100&head_sha="
+        + pr["merge_commit_sha"],
     )["workflow_runs"]
     runs = [run for run in runs if run["head_sha"] == pr["merge_commit_sha"]]
     if not runs or max(runs, key=lambda run: run["id"])["status"] != "completed":

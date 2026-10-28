@@ -183,9 +183,9 @@ jobs:
   docker:
     name: Docker runtime
     needs: [authz, main-ref]
-    runs-on: gke-4cpu-8gb-amd64
+    runs-on: ubuntu-24.04
     env:
-      PF_CI_LABELS: '["gke-4cpu-8gb-amd64"]'
+      PF_CI_LABELS: '["ubuntu-24.04"]'
     steps:
       - name: authz must have passed
         if: needs.authz.result != 'success'
@@ -298,9 +298,9 @@ jobs:
   distribution:
     name: Distribution
     needs: [authz, main-ref]
-    runs-on: gke-4cpu-8gb-amd64
+    runs-on: ubuntu-24.04
     env:
-      PF_CI_LABELS: '["gke-4cpu-8gb-amd64"]'
+      PF_CI_LABELS: '["ubuntu-24.04"]'
     steps:
       - name: authz must have passed
         if: needs.authz.result != 'success'

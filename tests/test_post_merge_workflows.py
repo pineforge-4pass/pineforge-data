@@ -21,10 +21,10 @@ PAIRS = ("ci", "native-feed")
 ROUTES = {
     "workflow-lint": "gke-2cpu-4gb-amd64",
     "test": "gke-4cpu-8gb-amd64",
-    "docker": "gke-4cpu-8gb-amd64",
+    "docker": "ubuntu-24.04",
     "database-e2e": "ubuntu-24.04",
     "contract": "gke-2cpu-4gb-amd64",
-    "distribution": "gke-4cpu-8gb-amd64",
+    "distribution": "ubuntu-24.04",
     "docs-tests": "gke-2cpu-4gb-amd64",
     "ready": "gke-2cpu-4gb-amd64",
 }

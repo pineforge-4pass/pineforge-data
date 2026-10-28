@@ -18,7 +18,7 @@ from .contract import gh_bytes, json_bytes, object_json, require, sha256
 # every leg succeeded (2026-10-23, VP-145 review P0: a lexical test alone misses escaped YAML keys).
 REVIEWED_CI_WORKFLOW_SHA256 = "d62bd2fa2c574d336654df1a18988eb8692396cf75d21dc9f6df0d59735f3225"
 REVIEWED_CI_POST_WORKFLOW_SHA256 = (
-    "8f2ef289f3c0ee51c5dce20461575694cbd919f4995236c99d871f8708421339"
+    "0d482244dd46ed3e4ec7ac6e5297521c81106922a93c24fde01ed1e87d2fdd5d"
 )
 
 JOBS = (

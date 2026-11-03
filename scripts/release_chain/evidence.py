@@ -16,9 +16,9 @@ from .contract import gh_bytes, json_bytes, object_json, require, sha256
 # SHA256 of both reviewed CI definitions: no continue-on-error, matrix leg names = JOBS.
 # Edits must update the pin in the same PR after re-review: needs.<job>.result == "success" proves
 # every leg succeeded (2026-10-23, VP-145 review P0: a lexical test alone misses escaped YAML keys).
-REVIEWED_CI_WORKFLOW_SHA256 = "d62bd2fa2c574d336654df1a18988eb8692396cf75d21dc9f6df0d59735f3225"
+REVIEWED_CI_WORKFLOW_SHA256 = "a1b78d16b3c463fa82dca3d7aca880b766e276607d55f61c09506c8467aff691"
 REVIEWED_CI_POST_WORKFLOW_SHA256 = (
-    "0d482244dd46ed3e4ec7ac6e5297521c81106922a93c24fde01ed1e87d2fdd5d"
+    "259bc8e49f6bf25618d32b2faddb56047a485e32e60e697a315f9fd23adbb4c4"
 )
 
 JOBS = (

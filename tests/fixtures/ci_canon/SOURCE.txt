@@ -7,3 +7,7 @@ Copied verbatim from vp143-classifier-paper-20261022 and lb558-paper-20261023 (c
 beeec2c3da80e589633b9ac13fd40824d6abba5cbce8725c5fcb0cea441dfe85  canon-workflow-lint-job.yml
 943ef644bd57676a29857a5f61578c996db025f7db6e74be237aa9ae33fb128a  canon-check-aggregate-job.yml
 a73613ac8c86886d53f1ec7d354b4bf2f3407789348c5a8f39ec44d461bee398  canon-heavy-job-example.yml
+
+Updated 11-03 (owner order via L6, pf-gcp fleet retired): canon-workflow-lint-gke-job.yml, canon-workflow-lint-job.yml
+and canon-authz-job.yml now carry the new canonical lint label list and the standard hosted authz runner lines, so
+their hashes listed above predate that change.

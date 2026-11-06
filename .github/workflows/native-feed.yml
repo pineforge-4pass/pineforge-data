@@ -82,15 +82,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
         include:
           - os: ubuntu-24.04
             runner: ubuntu-24.04
           - os: ubuntu-24.04-arm
             runner: ubuntu-24.04-arm
           # macOS has no dedicated hardware; every leg here is GitHub-hosted (CI-2 = A).
-          - os: macos-14
-            runner: macos-14
+          - os: macos-15
+            runner: macos-15
     runs-on: ${{ matrix.runner }}
     env:
       PF_CI_LABELS: '["ubuntu-24.04"]'

@@ -90,7 +90,7 @@ jobs:
               has_code=true
             fi
             if [[ "$has_code" == false && "$has_workflows" == true ]]; then
-              # LB-570: only tracked head files outside .github may opt in.
+              # Only tracked head files outside .github may opt in.
               if inside_worktree=$(git rev-parse --is-inside-work-tree) &&
                  [[ "$inside_worktree" == true ]] &&
                  workflow_tests=$(git ls-tree -r --name-only "$PR_HEAD" -- ':(top,literal)ci/workflow-tests'); then

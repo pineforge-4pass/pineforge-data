@@ -179,7 +179,8 @@ def test_post_ci_control_rejects_reverting_a_proof(fault: str) -> None:
     elif fault == "gate":
         jobs["check"]["if"] = "${{ !cancelled() }}"
     else:
-        jobs["ready"]["runs-on"] = "ubuntu-24.04"
+        # A hosted runner is the canonical route; the mutation must use a retired label.
+        jobs["ready"]["runs-on"] = "ubuntu-latest"
     with pytest.raises(AssertionError):
         assert_post_ci(changed)
 

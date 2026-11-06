@@ -2,11 +2,11 @@ Source: laneboss ci-labels.d5125e09.md, LB-535 + LB-540 + LB-545 + LB-548 + LB-5
 Canon sha256: d5125e0977706353a26f0e31133eedcf3a2c6a67bf53d05cdbc7876930a3b3a4
 Canonical hosted workflow-lint fixture for .github/workflows/ci.yml; keep it in sync with that workflow job.
 
-0b3dfa990404d60c8617bc30eba9bde21344cdec2097e25e104083e262d072f8  canon-authz-job.yml
+d5b8a62b1bad88a9dbcdbe2d90e91dcaa5fe31646556fe4717c0f8dcfac5fdb6  canon-authz-job.yml
 5f0aeca0450803954619ed3a4e13842c854641c00031e64b17c1981fd1d47f07  canon-changes-job.yml
 b8e86b1772006899d22faf3772660509cd4849d700935e6ccdb9acf17d95a857  canon-workflow-lint-job.yml
 943ef644bd57676a29857a5f61578c996db025f7db6e74be237aa9ae33fb128a  canon-check-aggregate-job.yml
 a73613ac8c86886d53f1ec7d354b4bf2f3407789348c5a8f39ec44d461bee398  canon-heavy-job-example.yml
 
-Updated 11-06 (CR-865): canon-workflow-lint-job.yml now mirrors the hosted ubuntu-24.04 workflow-lint job in
+Updated 11-06: canon-workflow-lint-job.yml now mirrors the hosted ubuntu-24.04 workflow-lint job in
 .github/workflows/ci.yml; canon-workflow-lint-gke-job.yml remains the retained retired-label negative fixture.

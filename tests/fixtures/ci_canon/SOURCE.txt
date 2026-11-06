@@ -1,4 +1,4 @@
-Source: laneboss ci-labels.d5125e09.md, LB-535 + LB-540 + LB-545 + LB-548 + LB-570 + LB-558 (2026-10-23).
+Source: PineForge canonical workflow fixture metadata (2026-10-23).
 Canon sha256: d5125e0977706353a26f0e31133eedcf3a2c6a67bf53d05cdbc7876930a3b3a4
 Canonical hosted workflow-lint fixture for .github/workflows/ci.yml; keep it in sync with that workflow job.
 

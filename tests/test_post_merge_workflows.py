@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import copy
-import itertools
 import json
 import os
 import subprocess
-from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -19,21 +17,21 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github/workflows"
 PAIRS = ("ci", "native-feed")
 ROUTES = {
-    "workflow-lint": "gke-2cpu-4gb-amd64",
-    "test": "gke-4cpu-8gb-amd64",
+    "workflow-lint": "ubuntu-24.04",
+    "test": "ubuntu-24.04",
     "docker": "ubuntu-24.04",
     "database-e2e": "ubuntu-24.04",
-    "contract": "gke-2cpu-4gb-amd64",
+    "contract": "ubuntu-24.04",
     "distribution": "ubuntu-24.04",
-    "docs-tests": "gke-2cpu-4gb-amd64",
-    "ready": "gke-2cpu-4gb-amd64",
+    "docs-tests": "ubuntu-24.04",
+    "ready": "ubuntu-24.04",
 }
 NATIVE_ROUTES = {
-    "release-amd64": ("Release (ubuntu-24.04)", "gke-4cpu-8gb-amd64"),
-    "release-arm64": ("Release (ubuntu-24.04-arm)", "gke-4cpu-8gb-arm64"),
+    "release-amd64": ("Release (ubuntu-24.04)", "ubuntu-24.04"),
+    "release-arm64": ("Release (ubuntu-24.04-arm)", "ubuntu-24.04-arm"),
     "release-macos": ("Release (macos-14)", "macos-14"),
-    "asan-ubsan": ("ASan + UBSan", "gke-4cpu-8gb-amd64"),
-    "tsan": ("TSan", "gke-4cpu-8gb-amd64"),
+    "asan-ubsan": ("ASan + UBSan", "ubuntu-24.04"),
+    "tsan": ("TSan", "ubuntu-24.04"),
 }
 PINS = {
     "actions/checkout@v7": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
@@ -181,7 +179,8 @@ def test_post_ci_control_rejects_reverting_a_proof(fault: str) -> None:
     elif fault == "gate":
         jobs["check"]["if"] = "${{ !cancelled() }}"
     else:
-        jobs["ready"]["runs-on"] = "ubuntu-24.04"
+        # A hosted runner is the canonical route; the mutation must use a retired label.
+        jobs["ready"]["runs-on"] = "ubuntu-latest"
     with pytest.raises(AssertionError):
         assert_post_ci(changed)
 
@@ -272,17 +271,12 @@ def test_post_authz_stays_canonical_and_pods_hold_no_credentials(stem: str) -> N
 
 @pytest.mark.parametrize("stem", PAIRS)
 def test_post_workflow_caps_each_label_at_eight_pods(stem: str) -> None:
-    counts: Counter[str] = Counter()
+    hosted = {"ubuntu-24.04", "ubuntu-24.04-arm", "macos-14"}
     for job in load(stem, post=True)["jobs"].values():
         route = job["runs-on"]
-        if not isinstance(route, str) or not route.startswith("gke-"):
+        if not isinstance(route, str):
             continue
-        matrix = job.get("strategy", {}).get("matrix", {})
-        axes = [values for key, values in matrix.items() if key not in {"include", "exclude"}]
-        legs = len(list(itertools.product(*axes))) if axes else 1
-        counts[route] += legs
-    assert counts
-    assert max(counts.values()) <= 8
+        assert route in hosted, route
 
 
 @pytest.mark.parametrize("job_id", ["docker", "distribution"])

@@ -93,7 +93,8 @@ jobs:
   workflow-lint:
     name: workflow-lint
     needs: [authz, main-ref]
-    runs-on: gke-2cpu-4gb-amd64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -129,7 +130,7 @@ jobs:
           fi
           tar -xzf "$lint_dir/$archive" -C "$lint_dir" actionlint
           "$lint_dir/actionlint" -version
-          printf '%s\n' '{"self-hosted-runner":{"labels":["gke-2cpu-4gb-amd64","gke-2cpu-4gb-arm64","gke-4cpu-8gb-amd64","gke-4cpu-8gb-arm64","gke-8cpu-16gb-amd64","gke-8cpu-16gb-arm64","gke-16cpu-32gb-amd64","gke-16cpu-32gb-arm64","gke-32cpu-64gb-amd64","gke-32cpu-64gb-arm64","gkp-2cpu-4gb-amd64","gkp-2cpu-4gb-arm64","gkp-4cpu-8gb-amd64","gkp-4cpu-8gb-arm64","gkp-8cpu-16gb-amd64","gkp-8cpu-16gb-arm64","gkp-16cpu-32gb-amd64","gkp-16cpu-32gb-arm64","gkp-32cpu-64gb-amd64","gkp-32cpu-64gb-arm64","gke-2cpu-4gb-amd64-64gb","gke-2cpu-4gb-arm64-64gb","gke-4cpu-8gb-amd64-64gb","gke-4cpu-8gb-arm64-64gb","gke-8cpu-16gb-amd64-64gb","gke-8cpu-16gb-arm64-64gb","gke-16cpu-32gb-amd64-64gb","gke-16cpu-32gb-arm64-64gb","gke-32cpu-64gb-amd64-64gb","gke-32cpu-64gb-arm64-64gb","gkp-2cpu-4gb-amd64-64gb","gkp-2cpu-4gb-arm64-64gb","gkp-4cpu-8gb-amd64-64gb","gkp-4cpu-8gb-arm64-64gb","gkp-8cpu-16gb-amd64-64gb","gkp-8cpu-16gb-arm64-64gb","gkp-16cpu-32gb-amd64-64gb","gkp-16cpu-32gb-arm64-64gb","gkp-32cpu-64gb-amd64-64gb","gkp-32cpu-64gb-arm64-64gb","gke-16cpu-32gb-amd64-128gb","gke-16cpu-32gb-amd64-256gb","gke-16cpu-32gb-arm64-128gb","gke-32cpu-64gb-amd64-256gb","gkp-16cpu-32gb-amd64-128gb"]}}' > "$lint_dir/actionlint.yaml"
+          printf '%s\n' '{}' > "$lint_dir/actionlint.yaml"
           git ls-files -z -- .github/workflows > "$lint_dir/workflows"
           workflows=()
           while IFS= read -r -d '' path; do
@@ -150,9 +151,10 @@ jobs:
   test:
     name: Python ${{ matrix.python-version }}
     needs: [authz, main-ref]
-    runs-on: gke-4cpu-8gb-amd64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     env:
-      PF_CI_LABELS: '["gke-4cpu-8gb-amd64"]'
+      PF_CI_LABELS: '["ubuntu-24.04"]'
     strategy:
       fail-fast: false
       matrix:
@@ -184,6 +186,7 @@ jobs:
     name: Docker runtime
     needs: [authz, main-ref]
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     env:
       PF_CI_LABELS: '["ubuntu-24.04"]'
     steps:
@@ -214,6 +217,7 @@ jobs:
     name: Database E2E
     needs: [authz, main-ref]
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     services:
       mysql:
         image: mysql:8.4
@@ -275,9 +279,10 @@ jobs:
   contract:
     name: Release contract
     needs: [authz, main-ref]
-    runs-on: gke-2cpu-4gb-amd64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     env:
-      PF_CI_LABELS: '["gke-2cpu-4gb-amd64"]'
+      PF_CI_LABELS: '["ubuntu-24.04"]'
     steps:
       - name: authz must have passed
         if: needs.authz.result != 'success'
@@ -299,6 +304,7 @@ jobs:
     name: Distribution
     needs: [authz, main-ref]
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     env:
       PF_CI_LABELS: '["ubuntu-24.04"]'
     steps:
@@ -369,11 +375,12 @@ jobs:
   docs-tests:
     name: Documentation
     needs: [authz, main-ref]
-    runs-on: gke-2cpu-4gb-amd64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: read
     env:
-      PF_CI_LABELS: '["gke-2cpu-4gb-amd64"]'
+      PF_CI_LABELS: '["ubuntu-24.04"]'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.authz.result == 'success'
@@ -393,9 +400,10 @@ jobs:
   ready:
     name: release/ready
     needs: [authz, main-ref, test, contract, docker, database-e2e, distribution]
-    runs-on: gke-2cpu-4gb-amd64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     env:
-      PF_CI_LABELS: '["gke-2cpu-4gb-amd64"]'
+      PF_CI_LABELS: '["ubuntu-24.04"]'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.authz.result == 'success'
@@ -434,6 +442,7 @@ jobs:
     needs: [authz, main-ref, workflow-lint, test, docker, database-e2e, contract, distribution, docs-tests, ready]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:

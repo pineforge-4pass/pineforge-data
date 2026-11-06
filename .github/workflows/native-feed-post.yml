@@ -147,12 +147,12 @@ jobs:
           ctest --test-dir build-feed --output-on-failure
 
   release-macos:
-    name: Release (macos-14)
+    name: Release (macos-15)
     needs: [authz, main-ref]
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     env:
-      PF_CI_LABELS: '["macos-14"]'
+      PF_CI_LABELS: '["macos-15"]'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Linux prerequisites

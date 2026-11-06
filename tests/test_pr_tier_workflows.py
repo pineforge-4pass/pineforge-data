@@ -39,7 +39,7 @@ MATRIX_RUNNERS = {
     "ubuntu-24.04": "ubuntu-24.04",
     # old: "ubuntu-24.04-arm": "${{ fromJSON('[\"self-hosted\",\"pf-ci\",\"pf-ci-arm64\"]') }}",
     "ubuntu-24.04-arm": "ubuntu-24.04-arm",
-    "macos-14": "macos-14",
+    "macos-15": "macos-15",
 }
 # These expressions are rejection fixtures for the superseded hosted-fallback policy.
 OLD_ROUTE = (
@@ -149,7 +149,7 @@ def step_script(workflow: str, job: str, step_id: str) -> str:
 
 
 def assert_native_release_matrix(matrix: dict[str, Any]) -> None:
-    assert matrix["os"] == ["ubuntu-24.04", "ubuntu-24.04-arm", "macos-14"]
+    assert matrix["os"] == ["ubuntu-24.04", "ubuntu-24.04-arm", "macos-15"]
     includes = matrix["include"]
     by_os = {entry["os"]: entry for entry in includes}
     assert len(by_os) == len(includes), "matrix includes must not override the same OS twice"
@@ -157,7 +157,7 @@ def assert_native_release_matrix(matrix: dict[str, Any]) -> None:
     assert set(by_os) == set(matrix["os"])
     for os_name in matrix["os"]:
         # old: entry = by_os.get(os_name, {})
-        # old: if os_name == "macos-14": assert "runner" not in entry
+        # macOS is hosted and must keep its explicit current runner label.
         # old: else: assert entry.get("runner") == MATRIX_RUNNERS[os_name]
         assert by_os[os_name].get("runner") == MATRIX_RUNNERS[os_name]
 
@@ -360,19 +360,19 @@ def test_native_release_matrix_pins_every_runner_and_the_macos_exception() -> No
         ("ubuntu-24.04", GUARDED_ROUTE),
         # CI-2 = A: the self-hosted pool must not come back as a leg's runner.
         ("ubuntu-24.04", POOL_LABELS),
-        ("ubuntu-24.04", "macos-14"),
+        ("ubuntu-24.04", "macos-15"),
         ("ubuntu-24.04", MATRIX_RUNNERS["ubuntu-24.04-arm"]),
         ("ubuntu-24.04", "${{ " + POOL + " }}"),
         ("ubuntu-24.04-arm", ARM_POOL_LABELS),
-        ("ubuntu-24.04-arm", "macos-14"),
+        ("ubuntu-24.04-arm", "macos-15"),
         ("ubuntu-24.04-arm", MATRIX_RUNNERS["ubuntu-24.04"]),
         (
             "ubuntu-24.04-arm",
             "${{ fromJSON('[\"self-hosted\",\"pf-ci\",\"pf-ci-arm64\"]') }}",
         ),
-        ("macos-14", MATRIX_RUNNERS["ubuntu-24.04"]),
-        ("macos-14", MATRIX_RUNNERS["ubuntu-24.04-arm"]),
-        ("macos-14", "ubuntu-24.04"),
+        ("macos-15", MATRIX_RUNNERS["ubuntu-24.04"]),
+        ("macos-15", MATRIX_RUNNERS["ubuntu-24.04-arm"]),
+        ("macos-15", "ubuntu-24.04"),
     ],
 )
 def test_native_release_matrix_rejects_fallbacks_and_wrong_pools(
@@ -381,7 +381,7 @@ def test_native_release_matrix_rejects_fallbacks_and_wrong_pools(
     original = load("native-feed.yml")["jobs"]["release"]["strategy"]["matrix"]
     assert_native_release_matrix(original)
     matrix = copy.deepcopy(original)
-    # old: matrix["include"].append({"os": os_name, "runner": runner}) for macos-14.
+    # Mutate the existing matrix leg in place so the negative row remains real.
     entry = next(entry for entry in matrix["include"] if entry["os"] == os_name)
     entry["runner"] = runner
     assert matrix != original
@@ -397,7 +397,7 @@ def test_native_release_matrix_rejects_missing_or_extra_legs(fault: str) -> None
     matrix = copy.deepcopy(load("native-feed.yml")["jobs"]["release"]["strategy"]["matrix"])
     assert_native_release_matrix(matrix)
     if fault == "missing-os":
-        matrix["os"].remove("macos-14")
+        matrix["os"].remove("macos-15")
     elif fault == "extra-os":
         matrix["os"].append("windows-latest")
     elif fault == "missing-linux-runner":

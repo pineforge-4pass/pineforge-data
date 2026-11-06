@@ -88,7 +88,7 @@ jobs:
             runner: ubuntu-24.04
           - os: ubuntu-24.04-arm
             runner: ubuntu-24.04-arm
-          # macOS has no self-hosted hardware; every leg here is GitHub-hosted (CI-2 = A).
+          # macOS has no dedicated hardware; every leg here is GitHub-hosted (CI-2 = A).
           - os: macos-14
             runner: macos-14
     runs-on: ${{ matrix.runner }}

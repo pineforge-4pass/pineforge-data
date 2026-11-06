@@ -29,7 +29,7 @@ ROUTES = {
 NATIVE_ROUTES = {
     "release-amd64": ("Release (ubuntu-24.04)", "ubuntu-24.04"),
     "release-arm64": ("Release (ubuntu-24.04-arm)", "ubuntu-24.04-arm"),
-    "release-macos": ("Release (macos-14)", "macos-14"),
+    "release-macos": ("Release (macos-15)", "macos-15"),
     "asan-ubsan": ("ASan + UBSan", "ubuntu-24.04"),
     "tsan": ("TSan", "ubuntu-24.04"),
 }
@@ -271,7 +271,7 @@ def test_post_authz_stays_canonical_and_pods_hold_no_credentials(stem: str) -> N
 
 @pytest.mark.parametrize("stem", PAIRS)
 def test_post_workflow_caps_each_label_at_eight_pods(stem: str) -> None:
-    hosted = {"ubuntu-24.04", "ubuntu-24.04-arm", "macos-14"}
+    hosted = {"ubuntu-24.04", "ubuntu-24.04-arm", "macos-15"}
     for job in load(stem, post=True)["jobs"].values():
         route = job["runs-on"]
         if not isinstance(route, str):

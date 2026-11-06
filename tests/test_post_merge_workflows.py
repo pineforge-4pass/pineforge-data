@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import copy
-import itertools
 import json
 import os
 import subprocess
-from collections import Counter
 from pathlib import Path
 from typing import Any
 

@@ -31,7 +31,7 @@ ARM_POOL_LABELS = ["self-hosted", "pf-ci", "pf-ci-arm64"]
 # CI-2 = A (owner 10-21 04:01): every secret-free PR/CI job in this public repository runs on
 # a GitHub-hosted runner. HOSTED is the only accepted route for those jobs.
 # old: HOSTED = "ubuntu-latest"
-# #1050 / laneboss map #1051: the one standard hosted label is ubuntu-24.04
+# The one standard hosted label is ubuntu-24.04
 # (ubuntu-latest is rejected).
 HOSTED = "ubuntu-24.04"
 MATRIX_RUNNERS = {
@@ -85,7 +85,7 @@ CANONICAL_AUTHZ_SCRIPT = (
     "    # events; none of them runs pull-request code.\n"
     "    ;;\n"
     "  workflow_run)\n"
-    "    # LB-437: bind identity to the triggering run and its re-runner.\n"
+    "    # Bind identity to the triggering run and its re-runner.\n"
     "    # These two App bots are fixed canon policy; ALLOWED_BOTS is PR-only.\n"
     '    [ -n "${WR_HEAD_REPO:-}" ] || fail "workflow_run head repository is missing"\n'
     '    [ -n "${WR_ACTOR:-}" ] || fail "workflow_run triggering actor is missing"\n'

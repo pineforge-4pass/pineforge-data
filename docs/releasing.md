@@ -240,6 +240,17 @@ Create or expose these names to this repository; never put their values in code:
 | `RELEASE_APP_PRIVATE_KEY` | Repository secret (or selected org secret) | Mint short-lived, single-target installation tokens |
 | `RELEASE_ALERT_OWNER` | Repository variable | Assignable GitHub login for incident/failure and verified-publication notices |
 
+App-token minting jobs use main-only environments: `release` requires the owner
+as reviewer for human-dispatched jobs (`release.yml`'s `manual-pr`), while
+`release-bot` has no reviewer for automatic or mixed-trigger jobs (`reconcile`,
+`prepare`, and the called workflow's `report`). The workflow preflight requires
+a literal, non-empty environment on every detected minting job. Keep this change
+in draft until the owner confirms both environments and their
+`RELEASE_APP_PRIVATE_KEY` copies are ready. Rollback reverts this change,
+removing the affected `environment:` lines and their preflight pin together;
+repository-level secret copies remain until the owner deletes them after dry
+runs, and workflows keep the same `secrets` references.
+
 Install the App on this consumer and the hub. Its consumer permissions need
 Contents write, Pull requests write and Actions write; the reconciliation token
 is restricted to this repository. Publisher preparation requests only read

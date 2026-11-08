@@ -4,7 +4,6 @@ name: Native feed
 on:
   push:
     branches: [main]
-    paths: ['native/feed/**', '.github/workflows/native-feed.yml', '.github/workflows/native-feed-post.yml']
   workflow_dispatch:
 
 permissions:
@@ -111,12 +110,30 @@ jobs:
         run: bash native/feed/tests/build_ci_curl.sh "$RUNNER_TEMP/curl"
       - name: Configure, build and test
         run: |
+          set -euo pipefail
           export LD_LIBRARY_PATH="$RUNNER_TEMP/curl/lib:${LD_LIBRARY_PATH:-}"
           export DYLD_LIBRARY_PATH="$RUNNER_TEMP/curl/lib:${DYLD_LIBRARY_PATH:-}"
           cmake -S native/feed -B build-feed -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCURL_DIR="$RUNNER_TEMP/curl/lib/cmake/CURL"
           cmake --build build-feed -j4
-          ctest --test-dir build-feed --output-on-failure
+          ctest --test-dir build-feed --show-only=json-v1 > native-registration.json
+          ctest --test-dir build-feed --output-on-failure --output-junit "$GITHUB_WORKSPACE/native-junit.xml"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.13'
+      - name: Bind the actual registration and JUnit to this leg
+        env:
+          PYTHONPATH: scripts
+        run: python -m release_chain.main_proofs native-leg --leg release-amd64 --directory . --output native-leg.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: native-leg-release-amd64-${{ github.run_attempt }}
+          path: |
+            native-registration.json
+            native-junit.xml
+            native-leg.json
+          if-no-files-found: error
 
   release-arm64:
     name: Release (ubuntu-24.04-arm)
@@ -139,12 +156,30 @@ jobs:
         run: bash native/feed/tests/build_ci_curl.sh "$RUNNER_TEMP/curl"
       - name: Configure, build and test
         run: |
+          set -euo pipefail
           export LD_LIBRARY_PATH="$RUNNER_TEMP/curl/lib:${LD_LIBRARY_PATH:-}"
           export DYLD_LIBRARY_PATH="$RUNNER_TEMP/curl/lib:${DYLD_LIBRARY_PATH:-}"
           cmake -S native/feed -B build-feed -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCURL_DIR="$RUNNER_TEMP/curl/lib/cmake/CURL"
           cmake --build build-feed -j4
-          ctest --test-dir build-feed --output-on-failure
+          ctest --test-dir build-feed --show-only=json-v1 > native-registration.json
+          ctest --test-dir build-feed --output-on-failure --output-junit "$GITHUB_WORKSPACE/native-junit.xml"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.13'
+      - name: Bind the actual registration and JUnit to this leg
+        env:
+          PYTHONPATH: scripts
+        run: python -m release_chain.main_proofs native-leg --leg release-arm64 --directory . --output native-leg.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: native-leg-release-arm64-${{ github.run_attempt }}
+          path: |
+            native-registration.json
+            native-junit.xml
+            native-leg.json
+          if-no-files-found: error
 
   release-macos:
     name: Release (macos-15)
@@ -167,12 +202,30 @@ jobs:
         run: bash native/feed/tests/build_ci_curl.sh "$RUNNER_TEMP/curl"
       - name: Configure, build and test
         run: |
+          set -euo pipefail
           export LD_LIBRARY_PATH="$RUNNER_TEMP/curl/lib:${LD_LIBRARY_PATH:-}"
           export DYLD_LIBRARY_PATH="$RUNNER_TEMP/curl/lib:${DYLD_LIBRARY_PATH:-}"
           cmake -S native/feed -B build-feed -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCURL_DIR="$RUNNER_TEMP/curl/lib/cmake/CURL"
           cmake --build build-feed -j4
-          ctest --test-dir build-feed --output-on-failure
+          ctest --test-dir build-feed --show-only=json-v1 > native-registration.json
+          ctest --test-dir build-feed --output-on-failure --output-junit "$GITHUB_WORKSPACE/native-junit.xml"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.13'
+      - name: Bind the actual registration and JUnit to this leg
+        env:
+          PYTHONPATH: scripts
+        run: python -m release_chain.main_proofs native-leg --leg release-macos --directory . --output native-leg.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: native-leg-release-macos-${{ github.run_attempt }}
+          path: |
+            native-registration.json
+            native-junit.xml
+            native-leg.json
+          if-no-files-found: error
 
   asan-ubsan:
     name: ASan + UBSan
@@ -190,12 +243,30 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: |
+          set -euo pipefail
           export LD_LIBRARY_PATH="$RUNNER_TEMP/curl/lib:${LD_LIBRARY_PATH:-}"
           cmake -S native/feed -B build-feed -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_CXX_COMPILER=clang++-18 -DCMAKE_C_COMPILER=clang-18 -DCURL_DIR="$RUNNER_TEMP/curl/lib/cmake/CURL" \
             -DPINEFORGE_FEED_SANITIZER=address,undefined
           cmake --build build-feed -j4
-          ctest --test-dir build-feed --output-on-failure
+          ctest --test-dir build-feed --show-only=json-v1 > native-registration.json
+          ctest --test-dir build-feed --output-on-failure --output-junit "$GITHUB_WORKSPACE/native-junit.xml"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.13'
+      - name: Bind the actual registration and JUnit to this leg
+        env:
+          PYTHONPATH: scripts
+        run: python -m release_chain.main_proofs native-leg --leg asan-ubsan --directory . --output native-leg.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: native-leg-asan-ubsan-${{ github.run_attempt }}
+          path: |
+            native-registration.json
+            native-junit.xml
+            native-leg.json
+          if-no-files-found: error
 
   tsan:
     name: TSan
@@ -220,10 +291,70 @@ jobs:
         env:
           TSAN_OPTIONS: halt_on_error=1
         run: |
+          set -euo pipefail
           export LD_LIBRARY_PATH="$RUNNER_TEMP/curl/lib:${LD_LIBRARY_PATH:-}"
           cmake -S native/feed -B build-feed -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_CXX_COMPILER=clang++-18 -DCMAKE_C_COMPILER=clang-18 -DCURL_DIR="$RUNNER_TEMP/curl/lib/cmake/CURL" \
             -DPINEFORGE_FEED_SANITIZER=thread \
             -DPINEFORGE_FEED_TSAN_OPTIONS_EXTRA=external_symbolizer_path=/usr/lib/llvm-18/bin/llvm-symbolizer
           cmake --build build-feed -j4
-          ctest --test-dir build-feed --output-on-failure
+          ctest --test-dir build-feed --show-only=json-v1 > native-registration.json
+          ctest --test-dir build-feed --output-on-failure --output-junit "$GITHUB_WORKSPACE/native-junit.xml"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.13'
+      - name: Bind the actual registration and JUnit to this leg
+        env:
+          PYTHONPATH: scripts
+        run: python -m release_chain.main_proofs native-leg --leg tsan --directory . --output native-leg.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: native-leg-tsan-${{ github.run_attempt }}
+          path: |
+            native-registration.json
+            native-junit.xml
+            native-leg.json
+          if-no-files-found: error
+
+  native-proof:
+    name: Native proof
+    needs: [authz, main-ref, release-amd64, release-arm64, release-macos, asan-ubsan, tsan]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: native-leg-release-amd64-${{ github.run_attempt }}
+          path: native-reports/release-amd64
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: native-leg-release-arm64-${{ github.run_attempt }}
+          path: native-reports/release-arm64
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: native-leg-release-macos-${{ github.run_attempt }}
+          path: native-reports/release-macos
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: native-leg-asan-ubsan-${{ github.run_attempt }}
+          path: native-reports/asan-ubsan
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: native-leg-tsan-${{ github.run_attempt }}
+          path: native-reports/tsan
+      - name: Require authoritative leg results and reparse their actual reports
+        env:
+          PYTHONPATH: scripts
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python -m release_chain.main_proofs native-aggregate --directory native-reports --output native-evidence.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-evidence-${{ github.run_attempt }}
+          path: native-evidence.json
+          if-no-files-found: error

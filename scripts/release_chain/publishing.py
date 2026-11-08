@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
 
-from .automation import api, finish, git, inventory, marker, pr_identity, receipt, snapshot
+from .automation import api, finish, git, inventory, marker, pr_identity, snapshot
 from .contract import (
     LOCK,
     MANIFEST,
@@ -31,9 +31,16 @@ from .contract import (
     verify_artifacts,
     verify_local,
 )
-from .evidence import distribution_hashes, gate_for_run
+from .evidence import (
+    ProofPending,
+    distribution_hashes,
+    gate_for_run,
+    latest_main_run,
+    matching_main_runs,
+)
+from .main_proofs import NATIVE_WORKFLOW
 from .receipts import candidate as record_candidate
-from .receipts import canonical, served, timestamp
+from .receipts import canonical, receipt, served, timestamp
 
 # TEMPORARY first-adopter exemption (TX-DATA-BASELINE2, L6 10-19):
 # remove the data exemption and the hub form together, only after 0.3.1 is verified AND
@@ -125,6 +132,7 @@ def candidate_gate(repo: str, pr: dict[str, Any]) -> dict[str, Any]:
     meta = marker(pr)
     head = (pr.get("head") or {}).get("sha")
     require(head, "pre-merge CI evidence missing")
+    assert head is not None
     runs = inventory(
         repo,
         "actions/workflows/ci.yml/runs?event=pull_request&head_sha=" + head,
@@ -133,6 +141,8 @@ def candidate_gate(repo: str, pr: dict[str, Any]) -> dict[str, Any]:
     runs = [run for run in runs if run_belongs_to_pr(run, pr)]
     require(runs, "pre-merge CI evidence missing")
     run = max(runs, key=lambda row: row["id"])
+    require(meta is not None, "pre-merge release marker missing")
+    assert meta is not None
     evidence = gate_for_run(
         repo, run["id"], head=pr["head"]["sha"], base=meta["base"], pr=pr["number"]
     )
@@ -161,6 +171,7 @@ def verified_package(
         and sum(name.endswith(".tar.gz") for name in files) == 1,
         "previous publication needs a wheel and sdist",
     )
+    assert files is not None
     metadata = object_json(fetch(f"https://pypi.org/pypi/pineforge-data/{version}/json"))
     require(
         {entry["filename"]: entry["digests"]["sha256"] for entry in metadata["urls"]} == files,
@@ -235,6 +246,7 @@ def verified_package(
             "previous distribution lacks manifest/facts provenance; "
             "establish a baseline before enablement",
         )
+        assert lock is not None
         wheel = next(data for name, data in downloads.items() if name.endswith(".whl"))
         with zipfile.ZipFile(io.BytesIO(wheel)) as zipped:
             for name in (LOCK, MANIFEST, RUNTIME):
@@ -281,32 +293,52 @@ def recover_applied(repo: str, source: Path, report: dict[str, Any]) -> None:
             saved["state"] == "verified" and saved["event_id"] == report["event_id"],
             "stored publication identity differs",
         )
+        image_digest = verified_package(repo, version, saved)["image_digest"]
+        lock = verify_local(source)
+        require(lock is not None, "stored publication source lock missing")
+        assert lock is not None
         require(
-            verified_package(repo, version, saved)["image_digest"]
-            == verify_local(source)["event"]["image"]["digest"],
+            image_digest == lock["event"]["image"]["digest"],
             "stored publication does not match installed defaults",
         )
         report.update(saved)
         return
     prs = inventory(repo, "pulls?state=closed&base=main&sort=updated&direction=desc")
     candidates = [
-        pr for pr in prs if pr.get("merged_at") and marker(pr) and marker(pr)["version"] == version
+        pr
+        for pr in prs
+        if pr.get("merged_at") and (meta := marker(pr)) and meta["version"] == version
     ]
     require(len(candidates) == 1, "applied release has no unique merged update PR")
     pr = candidates[0]
+    meta = marker(pr)
+    assert meta is not None
     report["pr"] = pr_identity({**pr, "merged": True})
-    report["pr"]["base_sha"] = marker(pr)["base"]
-    runs = api(
-        repo,
-        "actions/workflows/ci-post.yml/runs?event=push&per_page=100&head_sha="
-        + pr["merge_commit_sha"],
-    )["workflow_runs"]
-    runs = [run for run in runs if run["head_sha"] == pr["merge_commit_sha"]]
-    if not runs or max(runs, key=lambda run: run["id"])["status"] != "completed":
+    report["pr"]["base_sha"] = meta["base"]
+    runs = []
+    page = 1
+    while True:
+        suffix = "" if page == 1 else f"&page={page}"
+        response = api(
+            repo,
+            "actions/workflows/ci-post.yml/runs?event=push&per_page=100&head_sha="
+            + pr["merge_commit_sha"] + suffix,
+        )
+        require(isinstance(response, dict), "missing workflow run observations")
+        observed = response.get("workflow_runs")
+        runs.extend(matching_main_runs(observed, "ci-post.yml", head=pr["merge_commit_sha"]))
+        if len(observed) < 100:
+            break
+        page += 1
+    if not runs:
         report["state"] = "testing"
         return
     run = max(runs, key=lambda run: run["id"])
-    gate_for_run(repo, run["id"], head=pr["merge_commit_sha"])
+    try:
+        gate_for_run(repo, run["id"], head=pr["merge_commit_sha"])
+    except ProofPending:
+        report["state"] = "testing"
+        return
     lock = verify_local(source)
     if lock:
         record_candidate(report, lock["event"], candidate_gate(repo, pr), version)
@@ -399,6 +431,14 @@ def prepare(
     run = api(repo, f"actions/runs/{run_id}")
     require(run["event"] == "push" and run["head_branch"] == "main", "not landed main CI")
     source = run["head_sha"]
+    resolve_pair = (
+        os.environ.get("GITHUB_EVENT_NAME") == "workflow_run" or run.get("path") == NATIVE_WORKFLOW
+    )
+    if resolve_pair:
+        require(
+            run.get("path") in {".github/workflows/ci-post.yml", NATIVE_WORKFLOW},
+            "unexpected main proof callback workflow",
+        )
     # Check the associated PR before executing or checking out any candidate code.
     prs = api(repo, f"commits/{source}/pulls?per_page=100")
     matches = [
@@ -415,7 +455,26 @@ def prepare(
     pr = api(repo, f"pulls/{matches[0]['number']}")
     meta = marker(pr)
     require(pr["user"]["login"] == os.environ["RELEASE_BOT_LOGIN"], "unexpected release PR owner")
+    require(meta is not None, "release PR marker missing")
+    assert meta is not None
     require(pr["head"]["sha"] == meta["generated_head"], "release PR head changed")
+    try:
+        if resolve_pair:
+            # Either completion re-resolves the newest pair, including current attempts.
+            selected = latest_main_run(repo, "ci-post.yml", head=source)
+            run_id = selected["id"]
+            run = api(repo, f"actions/runs/{run_id}")
+            require(
+                run.get("id") == run_id
+                and run.get("event") == "push"
+                and run.get("head_branch") == "main"
+                and run.get("head_sha") == source
+                and run.get("path") == ".github/workflows/ci-post.yml",
+                "counterpart is not exact-head main CI",
+            )
+        evidence = gate_for_run(repo, run_id, head=source)
+    except ProofPending:
+        return {"eligible": "false", "waiting": "main-proofs-pending"}
     git("fetch", "origin", source)
     # Keep this process and scripts at the trusted default branch. Read source as data.
     candidate = output / "source"
@@ -426,7 +485,6 @@ def prepare(
     report.update(receipt(event, "prepare-publication"))
     report["pr"] = pr_identity(pr)
     report["pr"]["base_sha"] = meta["base"]
-    evidence = gate_for_run(repo, run_id, head=source)
     require(
         git("rev-parse", f"{source}^{{tree}}") == evidence["tree"]
         and evidence["tested_sha"] == source,
@@ -435,6 +493,7 @@ def prepare(
     # Retain the independent pre-merge candidate gates, as required by the hub.
     # Main CI still authorizes the exact distributions we publish.
     if event:
+        assert lock is not None
         record_candidate(report, event, candidate_gate(repo, pr), meta["version"])
         previous_version = lock["previous"]["package_version"]
         report["previous"] = verified_package(repo, previous_version, adopter_lock=lock)

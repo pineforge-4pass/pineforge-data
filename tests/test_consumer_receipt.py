@@ -7,15 +7,1698 @@ import json
 import os
 import zipfile
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+from xml.etree import ElementTree
 
 import hub_receipt_validator as hub
 import pytest
 import yaml
-from release_chain import automation, contract, publishing, receipts, reporting
+from release_chain import automation, contract, evidence, publishing, receipts, reporting
 
 FIXTURES = Path(__file__).parent / "fixtures/release_chain"
 REPO = "owner/data"
 HEAD, BASE, MERGE = "a" * 40, "b" * 40, "c" * 40
+
+
+@pytest.fixture(params=[("transport-one", 480, 2), ("transport-two", 580, 5)])
+def main_proof_transport(monkeypatch, request):
+    """Offline GitHub observations; only the bytes transport is replaced."""
+    label, python_id, attempt = request.param
+    head = contract.sha256(label.encode())[:40]
+    tree = contract.sha256(f"{label}:tree".encode())[:40]
+    node = "tests/test_consumer_receipt.py::test_bootstrap_recorded_hashes_match_live_pypi"
+    native_names = {
+        "release-amd64": "Release (ubuntu-24.04)",
+        "release-arm64": "Release (ubuntu-24.04-arm)",
+        "release-macos": "Release (macos-15)",
+        "asan-ubsan": "ASan + UBSan",
+        "tsan": "TSan",
+    }
+    python_run = {
+        "id": python_id, "run_attempt": attempt, "head_sha": head, "head_branch": "main",
+        "status": "completed", "conclusion": "success", "event": "push",
+        "path": ".github/workflows/ci-post.yml",
+    }
+    native_run = {
+        **python_run, "id": python_id + 20, "run_attempt": attempt + 1,
+        "path": ".github/workflows/native-feed-post.yml",
+    }
+    legs = {}
+    for leg in native_names:
+        names = ["feed-unit", "feed-export-unit", "feed-mock-export", "feed-mock"]
+        if leg == "tsan":
+            names.append("feed-tsan-seeded-race")
+        junit = ElementTree.Element("testsuite", name=f"{label}:{leg}")
+        for name in names:
+            ElementTree.SubElement(junit, "testcase", name=name)
+        legs[leg] = {
+            "registered": names, "executed": list(names), "skipped": [],
+            "failures": [], "errors": [],
+            "junit_sha256": contract.sha256(ElementTree.tostring(junit)),
+        }
+    network_junit = ElementTree.Element("testsuite", name=f"{label}:network")
+    ElementTree.SubElement(network_junit, "testcase", name=node)
+    network = {
+        "run_id": python_id, "attempt": attempt, "head": head, "tested_sha": head,
+        "tree": tree, "node_id": node, "registered": [node], "executed": [node],
+        "skipped": [], "failures": [], "errors": [],
+        "junit_sha256": contract.sha256(ElementTree.tostring(network_junit)),
+    }
+    python_evidence = {
+        "run_id": python_id, "attempt": attempt, "head": head, "tested_sha": head,
+        "tree": tree, "base": None, "pr": None, "event": "push",
+        "jobs": dict.fromkeys(evidence.JOBS, "success"),
+        "e2e": {key: sorted(value) for key, value in evidence.TESTS.items()},
+        # Native proof must be discovered independently, never supplied by this artifact.
+        "main_proofs": {"network": network},
+    }
+    workflow = yaml.load(
+        (Path(__file__).parents[1] / ".github/workflows/ci-post.yml").read_text(),
+        Loader=yaml.BaseLoader,
+    )
+    network_names = [
+        job.get("name", job_id)
+        for job_id, job in workflow["jobs"].items()
+        if any(node in step.get("run", "") for step in job.get("steps", []))
+    ]
+    network_name = network_names[0] if len(network_names) == 1 else "Live PyPI hashes"
+    python_jobs = [
+        {"name": name, "status": "completed", "conclusion": "success"}
+        for name in (*evidence.JOBS, "release/ready")
+    ]
+    if not any(job["name"] == network_name for job in python_jobs):
+        python_jobs.append(
+            {"name": network_name, "status": "completed", "conclusion": "success"}
+        )
+    native_jobs = [
+        {"name": name, "status": "completed", "conclusion": "success"}
+        for name in (*native_names.values(), "Native proof")
+    ]
+    attestation = {
+        "run_id": native_run["id"], "attempt": native_run["run_attempt"],
+        "head": head, "tested_sha": head, "tree": tree, "legs": legs,
+    }
+    state = {
+        "python_run": python_run, "python_evidence": python_evidence,
+        "python_jobs": python_jobs, "network_name": network_name,
+        "native_run": native_run, "native_jobs": native_jobs,
+        "native_runs": [native_run], "attestation": attestation,
+        "other_native_jobs": copy.deepcopy(native_jobs),
+        "other_attestation": copy.deepcopy(attestation),
+        "native_artifact_missing": False, "calls": [],
+        "native_artifact_attempt_delta": 0,
+        "python_runs": [python_run],
+        "other_python_jobs": copy.deepcopy(python_jobs),
+        "other_python_evidence": copy.deepcopy(python_evidence),
+        "python_artifact_missing": False, "python_artifact_attempt_delta": 0,
+        "artifact_observations": [],
+        "artifact_raw": {},
+    }
+
+    def gh_bytes(route, **kwargs):
+        state["calls"].append(route)
+        assert set(kwargs) <= {"accept"}, "the gate transport must remain read-only"
+        parsed = urlsplit(route)
+        path = parsed.path.removeprefix(f"repos/{REPO}/")
+        if path == "actions/workflows/native-feed-post.yml/runs":
+            query = parse_qs(parsed.query)
+            assert query.get("event") == ["push"]
+            assert query.get("head_sha") == [head]
+            return contract.json_bytes({"workflow_runs": state["native_runs"]})
+        if path == "actions/workflows/ci-post.yml/runs":
+            query = parse_qs(parsed.query)
+            assert query.get("event") == ["push"]
+            assert query.get("head_sha") == [head]
+            return contract.json_bytes({"workflow_runs": state["python_runs"]})
+        observed_python = {row["id"]: row for row in state["python_runs"]}
+        # A list observation may predate a rerun. Detail reads expose the current attempt.
+        observed_python[python_id] = python_run
+        selected_python = None
+        for observed in observed_python.values():
+            observed_id, observed_attempt = observed["id"], observed["run_attempt"]
+            if path == f"actions/runs/{observed_id}":
+                return contract.json_bytes(observed)
+            if path == f"actions/runs/{observed_id}/attempts/{observed_attempt}/jobs":
+                observed_jobs = (
+                    python_jobs if observed_id == python_id else state["other_python_jobs"]
+                )
+                return contract.json_bytes({"jobs": observed_jobs})
+            if path == f"actions/runs/{observed_id}/artifacts":
+                artifact_attempt = observed_attempt + state["python_artifact_attempt_delta"]
+                name = f"release-evidence-{artifact_attempt}"
+                state["artifact_observations"].append((observed_id, observed_attempt, name))
+                missing = observed_id == python_id and state["python_artifact_missing"]
+                return contract.json_bytes({"artifacts": [] if missing else [{
+                    "id": observed_id * 100, "name": name, "expired": False,
+                }]})
+            if path == f"actions/artifacts/{observed_id * 100}/zip":
+                selected_python = observed
+                break
+        if selected_python is not None:
+            filename = "evidence.json"
+            payload = copy.deepcopy(
+                python_evidence if selected_python["id"] == python_id
+                else state["other_python_evidence"]
+            )
+            if selected_python["id"] != python_id:
+                payload.update(
+                    run_id=selected_python["id"], attempt=selected_python["run_attempt"],
+                    head=selected_python["head_sha"], tested_sha=selected_python["head_sha"],
+                )
+                network = payload.get("main_proofs", {}).get("network")
+                if network is not None:
+                    network.update(
+                        run_id=selected_python["id"], attempt=selected_python["run_attempt"],
+                        head=selected_python["head_sha"], tested_sha=selected_python["head_sha"],
+                    )
+        else:
+            # Serve a fully usable older green proof too: an erroneous fallback
+            # must be caught by the verdict/call assertions, not by absent mock setup.
+            observed_runs = {row["id"]: row for row in state["native_runs"]}
+            observed_runs[native_run["id"]] = native_run
+            selected = None
+            for observed in observed_runs.values():
+                native_id = observed["id"]
+                native_attempt = observed["run_attempt"]
+                if path == f"actions/runs/{native_id}":
+                    return contract.json_bytes(observed)
+                if path == f"actions/runs/{native_id}/attempts/{native_attempt}/jobs":
+                    observed_jobs = (
+                        native_jobs if native_id == native_run["id"]
+                        else state["other_native_jobs"]
+                    )
+                    return contract.json_bytes({"jobs": observed_jobs})
+                if path == f"actions/runs/{native_id}/artifacts":
+                    missing = (
+                        native_id == native_run["id"] and state["native_artifact_missing"]
+                    )
+                    artifacts = [] if missing else [{
+                        "id": native_id * 100,
+                        "name": (
+                            "native-evidence-"
+                            f"{native_attempt + state['native_artifact_attempt_delta']}"
+                        ),
+                        "expired": False,
+                    }]
+                    state["artifact_observations"].append((
+                        native_id, native_attempt,
+                        "native-evidence-"
+                        f"{native_attempt + state['native_artifact_attempt_delta']}",
+                    ))
+                    return contract.json_bytes({"artifacts": artifacts})
+                if path == f"actions/artifacts/{native_id * 100}/zip":
+                    selected = observed
+                    break
+            if selected is None:
+                raise AssertionError(f"unexpected gate transport read: {route}")
+            payload = copy.deepcopy(
+                attestation if selected["id"] == native_run["id"]
+                else state["other_attestation"]
+            )
+            if selected["id"] != native_run["id"]:
+                payload.update(
+                    run_id=selected["id"], attempt=selected["run_attempt"],
+                    head=selected["head_sha"], tested_sha=selected["head_sha"],
+                )
+            filename = "native-evidence.json"
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as zipped:
+            raw = state["artifact_raw"].get(filename, contract.json_bytes(payload))
+            zipped.writestr(filename, raw)
+        return archive.getvalue()
+
+    monkeypatch.setattr(evidence, "gh_bytes", gh_bytes)
+    return state
+
+
+def assert_native_discovery(state):
+    assert any(
+        "/actions/workflows/native-feed-post.yml/runs?" in route
+        for route in state["calls"]
+    ), "the real gate never requested native workflow observations"
+
+
+@pytest.fixture
+def observed_main_parser(main_proof_transport, monkeypatch):
+    """Record inputs while executing the original JSON and proof validators."""
+    state = main_proof_transport
+    state.update(
+        parsed_bytes=[], parsed_objects=[], gate_inputs=[], main_inputs=[], main_validations=[],
+        waiting_inputs=[], waiting_validations=[],
+    )
+    real_object_json = evidence.object_json
+    real_validate_gate = evidence.validate_gate
+    real_validate_main = evidence.validate_main
+    real_validate_waiting_python = evidence._validate_waiting_python
+
+    def parse(raw):
+        state["parsed_bytes"].append(raw)
+        result = real_object_json(raw)
+        state["parsed_objects"].append(copy.deepcopy(result))
+        return result
+
+    def validate_gate(proof, run, jobs, **kwargs):
+        state["gate_inputs"].append(copy.deepcopy((proof, run, jobs, kwargs)))
+        return real_validate_gate(proof, run, jobs, **kwargs)
+
+    def validate_main(proof, run, jobs):
+        state["main_inputs"].append(copy.deepcopy((proof, run, jobs)))
+        result = real_validate_main(proof, run, jobs)
+        state["main_validations"].append(copy.deepcopy(proof))
+        return result
+
+    def validate_waiting_python(proof, run, jobs, **kwargs):
+        state["waiting_inputs"].append(copy.deepcopy((proof, run, jobs, kwargs)))
+        result = real_validate_waiting_python(proof, run, jobs, **kwargs)
+        state["waiting_validations"].append(copy.deepcopy(proof))
+        return result
+
+    monkeypatch.setattr(evidence, "object_json", parse)
+    monkeypatch.setattr(evidence, "validate_gate", validate_gate)
+    monkeypatch.setattr(evidence, "validate_main", validate_main)
+    monkeypatch.setattr(evidence, "_validate_waiting_python", validate_waiting_python)
+    return state
+
+
+@pytest.fixture
+def incident_transport(monkeypatch):
+    """Real incident/inventory logic, with mutable issue observations at the API."""
+    state = {"issues": [], "reads": [], "writes": [], "comments": []}
+    monkeypatch.setenv("GITHUB_RUN_ID", "930")
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
+
+    def api(repo, endpoint, method="GET", data=None):
+        assert repo == REPO
+        if method == "GET":
+            state["reads"].append(endpoint)
+            assert data is None
+            assert endpoint == (
+                "issues?state=all&sort=updated&direction=desc&per_page=100&page=1"
+            )
+            return copy.deepcopy(state["issues"])
+        state["writes"].append((endpoint, method, copy.deepcopy(data)))
+        if endpoint == "issues" and method == "POST":
+            issue = {"number": 41, "state": "open", **copy.deepcopy(data)}
+            state["issues"].append(issue)
+            return copy.deepcopy(issue)
+        assert len(state["issues"]) == 1
+        issue = state["issues"][0]
+        if endpoint == f"issues/{issue['number']}/comments" and method == "POST":
+            state["comments"].append(copy.deepcopy(data))
+            return {"id": len(state["comments"]), **data}
+        assert endpoint == f"issues/{issue['number']}" and method == "PATCH"
+        issue.update(copy.deepcopy(data))
+        return copy.deepcopy(issue)
+
+    # inventory's original implementation resolves automation.api at call time.
+    monkeypatch.setattr(automation, "api", api)
+    monkeypatch.setattr(reporting, "api", api)
+    return state
+
+
+def collect_callback_without_incident(state, incidents):
+    directory = state["callback_root"] / "downloaded-stages"
+    assert list(directory.glob("release-stage-*/release-receipt.json")) == []
+    report = reporting.collect(directory, failed=False, stage="prepare-publication")
+    assert report["state"] == "pending" and report["event_id"] is None
+    assert report["pr"] is report["ci"] is report["deployed"] is None
+    reporting.incident(REPO, report, "release-owner", "prepare-publication")
+    assert incidents["reads"] == incidents["writes"] == []
+    return report
+
+
+def test_main_gate_consumes_matching_native_transport_positive_twin(main_proof_transport):
+    state = main_proof_transport
+    run = state["python_run"]
+    native = state["native_run"]
+    # An older green match and higher-id unrelated runs cannot replace the selected pair.
+    older = {**native, "id": native["id"] - 1, "run_attempt": 1}
+    unrelated = [
+        {**native, "id": native["id"] + 1, "head_sha": "e" * 40},
+        {**native, "id": native["id"] + 2, "head_branch": "topic"},
+        {**native, "id": native["id"] + 3, "event": "pull_request"},
+        {**native, "id": native["id"] + 4, "path": ".github/workflows/native-feed.yml"},
+    ]
+    state["native_runs"] = [older, *unrelated, native]
+    if run["run_attempt"] % 2 == 0:
+        state["native_runs"].reverse()
+    result = publishing.gate_for_run(REPO, run["id"], head=run["head_sha"])
+    assert_native_discovery(state)
+    prefix = f"repos/{REPO}/actions"
+    assert f"{prefix}/runs/{run['id']}" in state["calls"]
+    assert (
+        f"{prefix}/runs/{run['id']}/attempts/{run['run_attempt']}/jobs?per_page=100"
+        in state["calls"]
+    )
+    assert f"{prefix}/runs/{run['id']}/artifacts?per_page=100" in state["calls"]
+    assert f"{prefix}/artifacts/{run['id'] * 100}/zip" in state["calls"]
+    assert (
+        f"{prefix}/runs/{native['id']}/attempts/{native['run_attempt']}/jobs?per_page=100"
+        in state["calls"]
+    )
+    assert f"{prefix}/runs/{native['id']}/artifacts?per_page=100" in state["calls"]
+    assert f"{prefix}/artifacts/{native['id'] * 100}/zip" in state["calls"]
+    assert not any(f"/runs/{older['id']}/" in route for route in state["calls"])
+    assert set(result.get("main_proofs", {})) == {"native", "network"}
+    assert result["main_proofs"]["native"] == {
+        "workflow_path": native["path"], "run": native,
+        "jobs": state["native_jobs"], "attestation": state["attestation"],
+    }
+    assert result["main_proofs"]["network"] == state["python_evidence"]["main_proofs"]["network"]
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing-run", "wrong-head", "failed-run", "missing-artifact", "wrong-tree",
+        "wrong-attempt", "old-attempt-artifact", "native-job-red", "aggregate-red",
+        "network-disabled", "network-skipped", "network-job-red", "network-job-missing",
+        "network-job-duplicate",
+    ],
+)
+def test_main_gate_refuses_incomplete_observed_proofs(main_proof_transport, fault):
+    state = main_proof_transport
+    run = state["python_run"]
+    if fault == "missing-run":
+        state["native_runs"] = []
+    elif fault == "wrong-head":
+        state["native_run"]["head_sha"] = "e" * 40
+    elif fault == "failed-run":
+        state["native_run"]["conclusion"] = "failure"
+    elif fault == "missing-artifact":
+        state["native_artifact_missing"] = True
+    elif fault == "wrong-tree":
+        state["attestation"]["tree"] = "e" * 40
+    elif fault == "wrong-attempt":
+        state["attestation"]["attempt"] -= 1
+    elif fault == "old-attempt-artifact":
+        state["native_artifact_attempt_delta"] = -1
+    elif fault in {"native-job-red", "aggregate-red"}:
+        name = "TSan" if fault == "native-job-red" else "Native proof"
+        next(job for job in state["native_jobs"] if job["name"] == name)["conclusion"] = "failure"
+    elif fault in {"network-job-red", "network-job-missing", "network-job-duplicate"}:
+        job = next(
+            job for job in state["python_jobs"] if job["name"] == state["network_name"]
+        )
+        if fault == "network-job-missing":
+            state["python_jobs"].remove(job)
+        elif fault == "network-job-duplicate":
+            state["python_jobs"].append(copy.deepcopy(job))
+        else:
+            job["conclusion"] = "skipped"
+    else:
+        network = state["python_evidence"]["main_proofs"]["network"]
+        network["executed"] = []
+        if fault == "network-skipped":
+            network["skipped"] = [network["node_id"]]
+    with pytest.raises(evidence.GateRejected):
+        publishing.gate_for_run(REPO, run["id"], head=run["head_sha"])
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["in_progress", "failure", "cancelled", "missing-artifact", "job-failure", "wrong-tree"],
+)
+def test_main_gate_never_falls_back_from_newer_bad_native_proof(main_proof_transport, fault):
+    state = main_proof_transport
+    run, native = state["python_run"], state["native_run"]
+    older = {**native, "id": native["id"] - 1, "run_attempt": 1}
+    state["native_runs"] = [older, native]
+    if fault == "in_progress":
+        native.update(status="in_progress", conclusion=None)
+    elif fault == "missing-artifact":
+        state["native_artifact_missing"] = True
+    elif fault == "job-failure":
+        next(job for job in state["native_jobs"] if job["name"] == "TSan")[
+            "conclusion"
+        ] = "failure"
+    elif fault == "wrong-tree":
+        state["attestation"]["tree"] = "e" * 40
+    else:
+        native["conclusion"] = fault
+    with pytest.raises(evidence.GateRejected):
+        publishing.gate_for_run(REPO, run["id"], head=run["head_sha"])
+    assert_native_discovery(state)
+    assert not any(
+        f"/runs/{older['id']}/" in route or f"/artifacts/{older['id'] * 100}/" in route
+        for route in state["calls"]
+    ), "an older successful native run must never substitute for the newest matching run"
+
+
+def test_pr_gate_keeps_its_existing_contract_without_main_discovery(main_proof_transport):
+    state = main_proof_transport
+    gate, run = state["python_evidence"], state["python_run"]
+    gate.update(event="pull_request", pr=7, base=BASE)
+    gate.pop("main_proofs")
+    gate["jobs"].pop(state["network_name"], None)
+    state["python_jobs"][:] = [
+        job for job in state["python_jobs"] if job["name"] != state["network_name"]
+    ]
+    run.update(event="pull_request", path=".github/workflows/ci.yml")
+    result = publishing.gate_for_run(
+        REPO, run["id"], head=run["head_sha"], base=BASE, pr=7
+    )
+    assert result == gate
+    assert not any("native-feed-post.yml" in route for route in state["calls"])
+
+
+@pytest.fixture
+def candidate_marker_transport(main_proof_transport, monkeypatch):
+    state = main_proof_transport
+    gate, run = state["python_evidence"], state["python_run"]
+    gate.update(event="pull_request", pr=7, base=BASE)
+    gate.pop("main_proofs")
+    state["python_jobs"][:] = [
+        job for job in state["python_jobs"] if job["name"] != state["network_name"]
+    ]
+    for job in state["python_jobs"]:
+        job["completed_at"] = "2026-11-07T11:59:00Z"
+    run.update(
+        event="pull_request", path=".github/workflows/ci.yml",
+        pull_requests=[{"number": 7}],
+    )
+    pr = {
+        "number": 7, "merged_at": "2026-11-07T12:00:00Z",
+        "head": {"sha": run["head_sha"], "repo": {"full_name": REPO}},
+        "body": automation.body({
+            "kind": "release", "version": "0.3.1", "base": BASE,
+            "generated_head": run["head_sha"],
+        }),
+    }
+    state.update(candidate_pr=pr, candidate_reads=[])
+
+    def api(repo, endpoint, method="GET", data=None):
+        assert repo == REPO and method == "GET" and data is None
+        state["candidate_reads"].append(endpoint)
+        if endpoint == (
+            "actions/workflows/ci.yml/runs?event=pull_request&head_sha="
+            + run["head_sha"] + "&per_page=100&page=1"
+        ):
+            return {"workflow_runs": copy.deepcopy(state["python_runs"])}
+        assert endpoint == (
+            f"actions/runs/{run['id']}/attempts/{run['run_attempt']}/jobs"
+            "?per_page=100&page=1"
+        )
+        return contract.object_json(evidence.gh_bytes(f"repos/{repo}/{endpoint}"))
+
+    monkeypatch.setattr(automation, "api", api)
+    return state
+
+
+@pytest.mark.parametrize("body", [None, "", "Release notes without machine metadata"])
+def test_candidate_gate_refuses_missing_release_marker(candidate_marker_transport, body):
+    state = candidate_marker_transport
+    pr = state["candidate_pr"]
+    pr["body"] = body
+    assert automation.marker(pr) is None
+    with pytest.raises(ValueError, match=r"^pre-merge release marker missing$"):
+        publishing.candidate_gate(REPO, pr)
+    assert len(state["candidate_reads"]) == 1
+    assert state["calls"] == state["artifact_observations"] == []
+
+
+def test_candidate_gate_accepts_release_marker_with_real_gate(candidate_marker_transport):
+    state = candidate_marker_transport
+    result = publishing.candidate_gate(REPO, state["candidate_pr"])
+    assert result == state["python_evidence"]
+    assert len(state["candidate_reads"]) == 2
+    run = state["python_run"]
+    assert f"repos/{REPO}/actions/artifacts/{run['id'] * 100}/zip" in state["calls"]
+    assert not any("native-feed-post.yml" in route for route in state["calls"])
+
+
+@pytest.mark.parametrize("missing", ["head", "run"])
+def test_candidate_gate_keeps_ci_priority_before_missing_marker(
+    candidate_marker_transport, missing
+):
+    state = candidate_marker_transport
+    pr = state["candidate_pr"]
+    pr["body"] = None
+    if missing == "head":
+        pr["head"]["sha"] = None
+    else:
+        state["python_runs"] = []
+    with pytest.raises(ValueError, match=r"^pre-merge CI evidence missing$"):
+        publishing.candidate_gate(REPO, pr)
+    assert len(state["candidate_reads"]) == int(missing == "run")
+    assert state["calls"] == []
+
+
+class PublicationFetchBoundary(RuntimeError):
+    """Stop immediately before prepare's first external git fetch."""
+
+
+@pytest.fixture
+def main_callback_transport(main_proof_transport, tmp_path, monkeypatch):
+    """Real prepare/gate/validators; only observed API bytes and I/O boundaries vary."""
+    state = main_proof_transport
+    source = state["python_run"]["head_sha"]
+    generated = contract.sha256(f"{source}:release-pr".encode())[:40]
+    event = contract.object_json((FIXTURES / "ready-event.json").read_bytes())
+    pr = {
+        "number": 7, "merged": True, "merged_at": "2026-11-07T12:00:00Z",
+        "merge_commit_sha": source, "base": {"ref": "main", "sha": BASE},
+        "head": {"sha": generated, "repo": {"full_name": REPO}},
+        "user": {"login": "release[bot]"},
+        "body": automation.body({
+            "kind": "release", "version": "0.3.1",
+            "generated_head": generated, "base": BASE, "event_id": event["event_id"],
+        }),
+    }
+    state.update(
+        callback_pr=pr, api_calls=[], gate_attempts=[], validated_pairs=[], effects=[],
+        callback_root=tmp_path, output=tmp_path / "publication",
+        callback_report=receipts.receipt(None),
+    )
+    state["report_before"] = copy.deepcopy(state["callback_report"])
+
+    def api(repo, endpoint, method="GET", data=None):
+        assert repo == REPO and method == "GET" and data is None
+        state["api_calls"].append(endpoint)
+        if endpoint.startswith("actions/runs/"):
+            return contract.object_json(evidence.gh_bytes(f"repos/{repo}/{endpoint}"))
+        if endpoint == f"commits/{source}/pulls?per_page=100":
+            return [copy.deepcopy(pr)]
+        if endpoint == "pulls/7":
+            return copy.deepcopy(pr)
+        raise AssertionError(f"unexpected callback API read: {endpoint}")
+
+    real_gate = publishing.gate_for_run
+
+    def observe_real_gate(repo, run_id, **kwargs):
+        state["gate_attempts"].append((repo, run_id, kwargs))
+        result = real_gate(repo, run_id, **kwargs)
+        state["validated_pairs"].append(copy.deepcopy(result))
+        return result
+
+    def before_git_fetch(*args, **kwargs):
+        state["effects"].append(("git", args))
+        assert not kwargs
+        assert args == ("fetch", "origin", source)
+        # This sentinel is after the actual gate, before the fetch is executed.
+        raise PublicationFetchBoundary("before git fetch origin exact main head")
+
+    def reject_snapshot(*args, **kwargs):
+        state["effects"].append(("snapshot", args))
+        raise AssertionError("prepare must not snapshot before complete proof")
+
+    def reject_process(command, **kwargs):
+        state["effects"].append(("process", command))
+        raise AssertionError("prepare must not download or publish before complete proof")
+
+    def reject_publication_transport(*args, **kwargs):
+        state["effects"].append(("publication-transport", args))
+        raise AssertionError("publication byte transport reached before the fetch boundary")
+
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_run")
+    monkeypatch.setenv("RELEASE_BOT_LOGIN", "release[bot]")
+    monkeypatch.setattr(publishing, "api", api)
+    monkeypatch.setattr(publishing, "gate_for_run", observe_real_gate)
+    monkeypatch.setattr(publishing, "git", before_git_fetch)
+    monkeypatch.setattr(publishing, "snapshot", reject_snapshot)
+    monkeypatch.setattr(publishing.subprocess, "run", reject_process)
+    monkeypatch.setattr(publishing, "fetch", reject_publication_transport)
+    monkeypatch.setattr(publishing, "gh_bytes", reject_publication_transport)
+    return state
+
+
+def prepare_main_callback(state, source, *, run_id=None):
+    if run_id is None:
+        run_id = state["python_run" if source == "CI" else "native_run"]["id"]
+    return publishing.prepare(
+        state["callback_root"], REPO, run_id, state["output"], state["callback_report"]
+    )
+
+
+def assert_callback_created_nothing(state):
+    assert state["effects"] == []
+    assert not state["output"].exists()
+    assert state["callback_report"] == state["report_before"]
+    assert state["validated_pairs"] == []
+
+
+def assert_callback_validated_current_pair(state, *, since=0):
+    python, native = state["python_run"], state["native_run"]
+    calls = state["calls"][since:]
+    result = state["validated_pairs"][-1]
+    assert result["run_id"] == python["id"] and result["attempt"] == python["run_attempt"]
+    assert result["main_proofs"]["network"] == state["python_evidence"]["main_proofs"]["network"]
+    assert result["main_proofs"]["native"] == {
+        "workflow_path": native["path"], "run": native, "jobs": state["native_jobs"],
+        "attestation": state["attestation"],
+    }
+    assert state["gate_attempts"][-1] == (REPO, python["id"], {"head": python["head_sha"]})
+    assert "pulls/7" in state["api_calls"]
+    assert any("/actions/workflows/native-feed-post.yml/runs?" in route for route in calls)
+    prefix = f"repos/{REPO}/actions"
+    for run, artifact in ((python, "release-evidence"), (native, "native-evidence")):
+        assert (
+            f"{prefix}/runs/{run['id']}/attempts/{run['run_attempt']}/jobs?per_page=100"
+            in calls
+        )
+        assert f"{prefix}/artifacts/{run['id'] * 100}/zip" in calls
+        assert (
+            run["id"], run["run_attempt"], f"{artifact}-{run['run_attempt']}"
+        ) in state["artifact_observations"]
+    assert not state["output"].exists()
+    assert state["callback_report"] == state["report_before"]
+
+
+@pytest.fixture
+def refreshed_release_pr(main_callback_transport, monkeypatch):
+    state = main_callback_transport
+    refreshed = copy.deepcopy(state["callback_pr"])
+    real_api = publishing.api
+
+    def api(repo, endpoint, method="GET", data=None):
+        observed = real_api(repo, endpoint, method, data)
+        return copy.deepcopy(refreshed) if endpoint == "pulls/7" else observed
+
+    monkeypatch.setattr(publishing, "api", api)
+    return state, refreshed
+
+
+def test_prepare_refuses_missing_refreshed_release_marker(refreshed_release_pr):
+    state, refreshed = refreshed_release_pr
+    refreshed["body"] = None
+    assert automation.marker(state["callback_pr"]) is not None
+    assert automation.marker(refreshed) is None
+    with pytest.raises(ValueError, match=r"^release PR marker missing$"):
+        prepare_main_callback(state, "CI")
+    source = state["python_run"]["head_sha"]
+    assert state["api_calls"] == [
+        f"actions/runs/{state['python_run']['id']}",
+        f"commits/{source}/pulls?per_page=100", "pulls/7",
+    ]
+    assert state["calls"] == [f"repos/{REPO}/actions/runs/{state['python_run']['id']}"]
+    assert state["gate_attempts"] == []
+    assert_callback_created_nothing(state)
+
+
+def test_prepare_keeps_owner_priority_before_missing_marker(refreshed_release_pr):
+    state, refreshed = refreshed_release_pr
+    refreshed.update(body=None, user={"login": "other-owner"})
+    with pytest.raises(ValueError, match=r"^unexpected release PR owner$"):
+        prepare_main_callback(state, "CI")
+    assert state["gate_attempts"] == []
+    assert_callback_created_nothing(state)
+
+
+def test_prepare_accepts_refreshed_release_marker(refreshed_release_pr):
+    state, _refreshed = refreshed_release_pr
+    with pytest.raises(
+        PublicationFetchBoundary, match=r"^before git fetch origin exact main head$"
+    ):
+        prepare_main_callback(state, "CI")
+    assert_callback_validated_current_pair(state)
+    assert state["effects"] == [("git", ("fetch", "origin", state["python_run"]["head_sha"]))]
+
+
+@pytest.mark.parametrize("first_source", ["CI", "Native feed"])
+def test_main_callbacks_validate_the_same_pair_before_fetch(main_callback_transport, first_source):
+    state = main_callback_transport
+    second_source = "Native feed" if first_source == "CI" else "CI"
+    for source in (first_source, second_source):
+        since = len(state["calls"])
+        with pytest.raises(PublicationFetchBoundary, match="before git fetch"):
+            prepare_main_callback(state, source)
+        assert_callback_validated_current_pair(state, since=since)
+    assert len(state["gate_attempts"]) == len(state["validated_pairs"]) == 2
+    assert state["validated_pairs"][0] == state["validated_pairs"][1]
+    assert state["effects"] == [
+        ("git", ("fetch", "origin", state["python_run"]["head_sha"]))
+    ] * 2
+    # Two unit callbacks reach one validated pair. Publication/idempotency is not run.
+
+
+@pytest.mark.parametrize("first_source", ["CI", "Native feed"])
+@pytest.mark.parametrize("counterpart_state", ["missing", "pending", "failure"])
+def test_main_callback_completion_order_waits_for_counterpart(
+    main_callback_transport, incident_transport, first_source, counterpart_state
+):
+    state = main_callback_transport
+    counterpart = "native" if first_source == "CI" else "python"
+    run = state[f"{counterpart}_run"]
+    if counterpart_state == "missing":
+        state[f"{counterpart}_runs"] = []
+        workflow = "native-feed-post.yml" if counterpart == "native" else "ci-post.yml"
+        reason = f"missing exact-head main {workflow} run"
+    else:
+        if counterpart_state == "pending":
+            run.update(status="in_progress", conclusion=None)
+        else:
+            run["conclusion"] = "failure"
+        reason = (
+            "newest native proof has not completed successfully" if counterpart == "native"
+            else "CI has not completed successfully"
+        )
+    if counterpart_state == "failure":
+        with pytest.raises(ValueError) as rejected:
+            prepare_main_callback(state, first_source)
+        assert str(rejected.value) == reason
+    else:
+        assert prepare_main_callback(state, first_source) == {
+            "eligible": "false", "waiting": "main-proofs-pending",
+        }
+        collect_callback_without_incident(state, incident_transport)
+    assert_callback_created_nothing(state)
+    if counterpart == "python" and counterpart_state == "missing":
+        assert state["gate_attempts"] == []
+    else:
+        assert state["gate_attempts"] == [
+            (REPO, state["python_run"]["id"], {"head": state["python_run"]["head_sha"]})
+        ]
+    # The later counterpart completion changes the input; both real gates remain.
+    run.update(status="completed", conclusion="success")
+    state[f"{counterpart}_runs"] = [run]
+    second_source = "Native feed" if first_source == "CI" else "CI"
+    since = len(state["calls"])
+    with pytest.raises(PublicationFetchBoundary, match="before git fetch"):
+        prepare_main_callback(state, second_source)
+    assert_callback_validated_current_pair(state, since=since)
+    assert state["effects"] == [("git", ("fetch", "origin", run["head_sha"]))]
+
+
+@pytest.mark.parametrize("source", ["CI", "Native feed"])
+@pytest.mark.parametrize("slot", ["python", "native"])
+@pytest.mark.parametrize("readiness", ["missing", "queued", "in_progress"])
+def test_main_callbacks_wait_without_incident_for_observed_pending_pair(
+    main_callback_transport, observed_main_parser, incident_transport, source, slot, readiness
+):
+    state = main_callback_transport
+    run = state[f"{slot}_run"]
+    if readiness == "missing":
+        state[f"{slot}_runs"] = []
+    else:
+        run.update(status=readiness, conclusion=None)
+        state[f"{slot}_artifact_missing"] = True
+        for job in state[f"{slot}_jobs"]:
+            job.update(status=readiness, conclusion=None)
+    assert prepare_main_callback(state, source) == {
+        "eligible": "false", "waiting": "main-proofs-pending",
+    }
+    assert_callback_created_nothing(state)
+    collect_callback_without_incident(state, incident_transport)
+    workflow = "ci-post.yml" if slot == "python" else "native-feed-post.yml"
+    assert any(f"/actions/workflows/{workflow}/runs?" in row for row in state["calls"])
+    observed = {"workflow_runs": state[f"{slot}_runs"]}
+    assert observed in state["parsed_objects"], "the real parser did not consume readiness"
+    assert state["main_validations"] == []
+    if slot == "python" and readiness == "missing":
+        assert state["gate_attempts"] == []  # There is no Python run ID to gate yet.
+    else:
+        python = state["python_run"]
+        assert state["gate_attempts"] == [(REPO, python["id"], {"head": python["head_sha"]})]
+
+    # The same lifecycle consumes new completion input and reaches the real gate.
+    run.update(status="completed", conclusion="success")
+    state[f"{slot}_runs"] = [run]
+    state[f"{slot}_artifact_missing"] = False
+    for job in state[f"{slot}_jobs"]:
+        job.update(status="completed", conclusion="success")
+    with pytest.raises(PublicationFetchBoundary, match="before git fetch"):
+        prepare_main_callback(state, source)
+    assert_callback_validated_current_pair(state)
+    assert state["main_validations"][-1] == state["validated_pairs"][-1]
+    assert incident_transport["reads"] == incident_transport["writes"] == []
+
+
+@pytest.mark.parametrize("source", ["CI", "Native feed"])
+@pytest.mark.parametrize("readiness", ["missing", "queued", "in_progress"])
+@pytest.mark.parametrize(
+    "fault,reason",
+    [
+        ("stale-attempt", "stale CI attempt"),
+        ("network-non-object", "network: expected an object"),
+        (
+            "network-job-red",
+            "required job 'Live PyPI hashes' missing, duplicated, failed, cancelled or skipped",
+        ),
+        ("wrong-tree", "network: wrong tree"),
+        ("e2e-incomplete", "incomplete E2E evidence"),
+    ],
+)
+@pytest.mark.parametrize("existing_issue", [False, True], ids=["new-issue", "existing-issue"])
+def test_main_callbacks_refuse_invalid_python_while_native_pending(
+    main_callback_transport, observed_main_parser, incident_transport,
+    source, readiness, fault, reason, existing_issue,
+):
+    state = main_callback_transport
+    assert observed_main_parser is state
+    python, native = state["python_run"], state["native_run"]
+    current_python = copy.deepcopy(python)
+    proof = state["python_evidence"]
+    if readiness == "missing":
+        state["native_runs"] = []
+    else:
+        native.update(status=readiness, conclusion=None)
+        state["native_artifact_missing"] = True
+        for job in state["native_jobs"]:
+            job.update(status=readiness, conclusion=None)
+    if fault == "stale-attempt":
+        proof["attempt"] -= 1
+    elif fault == "network-non-object":
+        proof["main_proofs"]["network"] = []
+    elif fault == "network-job-red":
+        next(job for job in state["python_jobs"] if job["name"] == state["network_name"])[
+            "conclusion"
+        ] = "failure"
+    elif fault == "wrong-tree":
+        original_tree = proof["tree"]
+        proof["tree"] = contract.sha256(b"another completed Python evidence tree")[:40]
+        assert proof["tree"] != original_tree
+        assert proof["main_proofs"]["network"]["tree"] == original_tree
+    else:
+        assert fault == "e2e-incomplete"
+        for suite in ("docker", "database"):
+            proof["e2e"][suite].pop()
+    assert python == current_python
+    assert python["status"] == "completed" and python["conclusion"] == "success"
+    with pytest.raises(evidence.GateRejected) as rejected:
+        prepare_main_callback(state, source)
+    assert type(rejected.value) is evidence.GateRejected
+    assert str(rejected.value) == reason
+    assert_callback_created_nothing(state)
+    assert state["gate_attempts"] == [(REPO, python["id"], {"head": python["head_sha"]})]
+    assert_native_discovery(state)
+    assert {"workflow_runs": state["native_runs"]} in state["parsed_objects"]
+    if readiness != "missing":
+        assert native in state["parsed_objects"]
+    assert proof in state["parsed_objects"]
+    assert {"jobs": state["python_jobs"]} in state["parsed_objects"]
+    assert state["waiting_inputs"] == [
+        (proof, python, state["python_jobs"], {"head": python["head_sha"], "base": None}),
+    ]
+    assert state["waiting_validations"] == state["gate_inputs"] == state["main_inputs"] == []
+    assert state["artifact_observations"] == [
+        (python["id"], python["run_attempt"], f"release-evidence-{python['run_attempt']}"),
+    ]
+    incidents = incident_transport
+    if existing_issue:
+        incidents["issues"].append({
+            "number": 41, "state": "closed",
+            "body": "<!-- release-chain-data:run-930 -->\nolder observation",
+        })
+    report = reporting.collect(
+        state["callback_root"] / "downloaded-stages", failed=True, stage="prepare-publication"
+    )
+    assert report["state"] == "failed" and report["event_id"] is None
+    assert report["attempt"] == 930 and report["sequence"] == 2
+    reporting.incident(REPO, report, "release-owner", "prepare-publication")
+    assert len(incidents["reads"]) == 1
+    assert [(route, method) for route, method, _ in incidents["writes"]] == (
+        [("issues/41/comments", "POST"), ("issues/41", "PATCH")] if existing_issue else
+        [("issues", "POST"), ("issues/41", "PATCH")]
+    )
+    assert len(incidents["issues"]) == 1
+    issue = incidents["issues"][0]
+    assert issue["state"] == "open" and issue["title"] == "Data release failed: run-930"
+    assert "**failed**" in issue["body"] and "`prepare-publication`" in issue["body"]
+    assert_callback_created_nothing(state)
+
+
+@pytest.mark.parametrize("source", ["CI", "Native feed"])
+@pytest.mark.parametrize("readiness", ["missing", "queued", "in_progress"])
+def test_main_callbacks_wait_with_valid_python_while_native_pending_positive_twin(
+    main_callback_transport, observed_main_parser, incident_transport, source, readiness
+):
+    state = main_callback_transport
+    assert observed_main_parser is state
+    python, native = state["python_run"], state["native_run"]
+    if readiness == "missing":
+        state["native_runs"] = []
+    else:
+        native.update(status=readiness, conclusion=None)
+        state["native_artifact_missing"] = True
+        for job in state["native_jobs"]:
+            job.update(status=readiness, conclusion=None)
+    assert python["status"] == "completed" and python["conclusion"] == "success"
+    assert prepare_main_callback(state, source) == {
+        "eligible": "false", "waiting": "main-proofs-pending",
+    }
+    assert_callback_created_nothing(state)
+    collect_callback_without_incident(state, incident_transport)
+    assert incident_transport["issues"] == incident_transport["comments"] == []
+    assert state["gate_attempts"] == [(REPO, python["id"], {"head": python["head_sha"]})]
+    assert_native_discovery(state)
+    assert {"workflow_runs": state["native_runs"]} in state["parsed_objects"]
+    if readiness != "missing":
+        assert native in state["parsed_objects"]
+    proof = state["python_evidence"]
+    assert proof in state["parsed_objects"]
+    assert {"jobs": state["python_jobs"]} in state["parsed_objects"]
+    assert state["waiting_inputs"] == [
+        (proof, python, state["python_jobs"], {"head": python["head_sha"], "base": None}),
+    ]
+    assert state["waiting_validations"] == [proof]
+    assert state["gate_inputs"] == state["main_inputs"] == []
+    assert state["artifact_observations"] == [
+        (python["id"], python["run_attempt"], f"release-evidence-{python['run_attempt']}"),
+    ]
+
+
+@pytest.mark.parametrize("existing_issue", [False, True], ids=["new-issue", "existing-issue"])
+def test_callback_reporting_failure_still_opens_or_updates_incident(
+    tmp_path, incident_transport, existing_issue
+):
+    incidents = incident_transport
+    if existing_issue:
+        incidents["issues"].append({
+            "number": 41, "state": "closed",
+            "body": "<!-- release-chain-data:run-930 -->\nolder observation",
+        })
+    report = reporting.collect(tmp_path, failed=True, stage="prepare-publication")
+    assert report["state"] == "failed" and report["event_id"] is None
+    assert report["attempt"] == 930 and report["sequence"] == 2
+    reporting.incident(REPO, report, "release-owner", "prepare-publication")
+    assert len(incidents["reads"]) == 1
+    assert [(route, method) for route, method, _ in incidents["writes"]] == (
+        [("issues/41/comments", "POST"), ("issues/41", "PATCH")] if existing_issue else
+        [("issues", "POST"), ("issues/41", "PATCH")]
+    )
+    issue = incidents["issues"][0]
+    assert issue["state"] == "open"
+    assert issue["title"] == "Data release failed: run-930"
+    assert "**failed**" in issue["body"] and "`prepare-publication`" in issue["body"]
+
+
+@pytest.mark.parametrize("source", ["CI", "Native feed"])
+@pytest.mark.parametrize("slot", ["python", "native"])
+@pytest.mark.parametrize(
+    "fault", ["failure", "cancelled", "wrong-head", "wrong-attempt",
+              "malformed-proof", "malformed-json", "missing-artifact"],
+)
+def test_main_callbacks_keep_completed_and_malformed_proofs_decisive(
+    main_callback_transport, observed_main_parser, incident_transport, source, slot, fault
+):
+    state = main_callback_transport
+    run = state[f"{slot}_run"]
+    callback_id = None
+    if fault in {"failure", "cancelled"}:
+        run["conclusion"] = fault
+        reason = (
+            "CI has not completed successfully" if slot == "python"
+            else "newest native proof has not completed successfully"
+        )
+    elif fault == "wrong-head":
+        # The list still has the requested head; the current detail read contradicts it.
+        state[f"{slot}_runs"] = [copy.deepcopy(run)]
+        if source == ("CI" if slot == "python" else "Native feed"):
+            older_callback = {**run, "id": run["id"] - 1, "run_attempt": 1}
+            state[f"{slot}_runs"].append(older_callback)
+            callback_id = older_callback["id"]
+        run["head_sha"] = contract.sha256(b"contradictory current head")[:40]
+        reason = (
+            "counterpart is not exact-head main CI" if slot == "python"
+            else "newest native proof has not completed successfully"
+        )
+    elif fault == "wrong-attempt":
+        if slot == "python":
+            state["python_evidence"]["attempt"] -= 1
+            reason = "stale CI attempt"
+        else:
+            state["attestation"]["attempt"] -= 1
+            reason = "native: wrong attempt"
+    elif fault == "malformed-proof":
+        if slot == "python":
+            state["python_evidence"]["main_proofs"]["network"] = []
+            reason = "network: expected an object"
+        else:
+            state["attestation"]["legs"] = []
+            reason = "native legs: expected an object"
+    elif fault == "malformed-json":
+        filename = "evidence.json" if slot == "python" else "native-evidence.json"
+        state["artifact_raw"][filename] = b'{"run_id":1,"run_id":2}'
+        reason = "duplicate JSON key: run_id"
+    else:
+        state[f"{slot}_artifact_missing"] = True
+        artifact = "release-evidence" if slot == "python" else "native-evidence"
+        reason = f"missing unique {artifact}-{run['run_attempt']} artifact"
+    with pytest.raises(ValueError) as rejected:
+        prepare_main_callback(state, source, run_id=callback_id)
+    assert str(rejected.value) == reason
+    assert_callback_created_nothing(state)
+    assert state["parsed_objects"], "the real parser must observe the supplied refusal input"
+    if fault in {"wrong-attempt", "malformed-proof"}:
+        assert state["gate_inputs"], "the real validator must consume the artifact mutation"
+    if fault == "malformed-json":
+        assert b'{"run_id":1,"run_id":2}' in state["parsed_bytes"]
+    # A real refusal must still take the actionable failure path.
+    report = reporting.collect(
+        state["callback_root"], failed=True, stage="prepare-publication"
+    )
+    reporting.incident(REPO, report, "release-owner", "prepare-publication")
+    assert [(route, method) for route, method, _ in incident_transport["writes"]] == [
+        ("issues", "POST"), ("issues/41", "PATCH"),
+    ]
+
+
+@pytest.mark.parametrize("source", ["CI", "Native feed"])
+@pytest.mark.parametrize(
+    "fault",
+    ["native-tree", "native-attempt", "native-leg", "native-job-red",
+     "network-skipped", "network-job-red", "missing-native-artifact"],
+)
+def test_main_callbacks_refuse_invalid_proof_before_any_preparation(
+    main_callback_transport, source, fault
+):
+    state = main_callback_transport
+    if fault == "native-tree":
+        state["attestation"]["tree"] = contract.sha256(b"other tree")[:40]
+        reason = "native: wrong tree"
+    elif fault == "native-attempt":
+        state["attestation"]["attempt"] -= 1
+        reason = "native: wrong attempt"
+    elif fault == "native-leg":
+        state["attestation"]["legs"].pop("tsan")
+        reason = "native: missing or unexpected leg"
+    elif fault == "native-job-red":
+        next(job for job in state["native_jobs"] if job["name"] == "TSan")[
+            "conclusion"
+        ] = "failure"
+        reason = "required job 'TSan' missing, duplicated, failed, cancelled or skipped"
+    elif fault == "network-skipped":
+        network = state["python_evidence"]["main_proofs"]["network"]
+        network.update(executed=[], skipped=[network["node_id"]])
+        reason = "network executed: missing nonempty inventory"
+    elif fault == "network-job-red":
+        next(job for job in state["python_jobs"] if job["name"] == state["network_name"])[
+            "conclusion"
+        ] = "failure"
+        reason = "required job 'Live PyPI hashes' missing, duplicated, failed, cancelled or skipped"
+    else:
+        state["native_artifact_missing"] = True
+        reason = f"missing unique native-evidence-{state['native_run']['run_attempt']} artifact"
+    with pytest.raises(evidence.GateRejected) as rejected:
+        prepare_main_callback(state, source)
+    assert str(rejected.value) == reason
+    assert state["gate_attempts"] == [
+        (REPO, state["python_run"]["id"], {"head": state["python_run"]["head_sha"]})
+    ]
+    assert_callback_created_nothing(state)
+
+
+@pytest.mark.parametrize("source", ["CI", "Native feed"])
+@pytest.mark.parametrize("fault", ["owner", "changed-pr-head", "ambiguous-marker"])
+def test_main_callbacks_keep_release_authorization_before_gate(
+    main_callback_transport, source, fault
+):
+    state = main_callback_transport
+    pr = state["callback_pr"]
+    if fault == "owner":
+        pr["user"]["login"] = "other[bot]"
+        reason = "unexpected release PR owner"
+    elif fault == "changed-pr-head":
+        pr["head"]["sha"] = contract.sha256(b"changed PR head")[:40]
+        reason = "release PR head changed"
+    else:
+        pr["body"] += pr["body"]
+        reason = "ambiguous release PR marker"
+    with pytest.raises(ValueError) as rejected:
+        prepare_main_callback(state, source)
+    assert str(rejected.value) == reason
+    assert state["gate_attempts"] == []
+    assert_callback_created_nothing(state)
+
+
+@pytest.mark.parametrize("source", ["CI", "Native feed"])
+@pytest.mark.parametrize(
+    "fault", ["pending", "failure", "cancelled", "stale-attempt", "network-red"]
+)
+def test_main_callbacks_never_replace_newer_bad_python_with_old_green(
+    main_callback_transport, source, fault
+):
+    state = main_callback_transport
+    python = state["python_run"]
+    older = {**python, "id": python["id"] - 1, "run_attempt": 1}
+    state["python_runs"] = [python, older]
+    if fault == "pending":
+        python.update(status="in_progress", conclusion=None)
+        reason = "CI has not completed successfully"
+    elif fault in {"failure", "cancelled"}:
+        python["conclusion"] = fault
+        reason = "CI has not completed successfully"
+    elif fault == "stale-attempt":
+        state["python_evidence"]["attempt"] -= 1
+        reason = "stale CI attempt"
+    else:
+        next(job for job in state["python_jobs"] if job["name"] == state["network_name"])[
+            "conclusion"
+        ] = "failure"
+        reason = "required job 'Live PyPI hashes' missing, duplicated, failed, cancelled or skipped"
+    callback_id = older["id"] if source == "CI" else state["native_run"]["id"]
+    if fault == "pending":
+        assert prepare_main_callback(state, source, run_id=callback_id) == {
+            "eligible": "false", "waiting": "main-proofs-pending",
+        }
+    else:
+        with pytest.raises(evidence.GateRejected) as rejected:
+            prepare_main_callback(state, source, run_id=callback_id)
+        assert str(rejected.value) == reason
+    assert state["gate_attempts"] == [(REPO, python["id"], {"head": python["head_sha"]})]
+    assert not any(
+        f"/runs/{older['id']}/" in route or f"/artifacts/{older['id'] * 100}/" in route
+        for route in state["calls"]
+    ), "the old callback may be read; its jobs/artifacts cannot replace the newer Python run"
+    assert_callback_created_nothing(state)
+
+
+@pytest.mark.parametrize("source", ["CI", "Native feed"])
+@pytest.mark.parametrize(
+    "fault", ["pending", "failure", "cancelled", "missing-artifact", "wrong-tree"]
+)
+def test_main_callbacks_never_replace_newer_bad_native_with_old_green(
+    main_callback_transport, source, fault
+):
+    state = main_callback_transport
+    native = state["native_run"]
+    older = {**native, "id": native["id"] - 1, "run_attempt": 1}
+    state["native_runs"] = [native, older]
+    if fault == "pending":
+        native.update(status="in_progress", conclusion=None)
+        reason = "newest native proof has not completed successfully"
+    elif fault in {"failure", "cancelled"}:
+        native["conclusion"] = fault
+        reason = "newest native proof has not completed successfully"
+    elif fault == "missing-artifact":
+        state["native_artifact_missing"] = True
+        reason = f"missing unique native-evidence-{native['run_attempt']} artifact"
+    else:
+        state["attestation"]["tree"] = contract.sha256(b"other native tree")[:40]
+        reason = "native: wrong tree"
+    callback_id = older["id"] if source == "Native feed" else state["python_run"]["id"]
+    if fault == "pending":
+        assert prepare_main_callback(state, source, run_id=callback_id) == {
+            "eligible": "false", "waiting": "main-proofs-pending",
+        }
+    else:
+        with pytest.raises(evidence.GateRejected) as rejected:
+            prepare_main_callback(state, source, run_id=callback_id)
+        assert str(rejected.value) == reason
+    assert state["gate_attempts"] == [
+        (REPO, state["python_run"]["id"], {"head": state["python_run"]["head_sha"]})
+    ]
+    assert_native_discovery(state)
+    assert not any(
+        f"/runs/{older['id']}/" in route or f"/artifacts/{older['id'] * 100}/" in route
+        for route in state["calls"]
+    ), "an old native callback cannot select old native jobs/artifacts"
+    assert_callback_created_nothing(state)
+
+
+@pytest.mark.parametrize("source", ["CI", "Native feed"])
+def test_main_callbacks_use_reobserved_current_attempt(main_callback_transport, source):
+    state = main_callback_transport
+    python, native = state["python_run"], state["native_run"]
+    state["python_runs"] = [copy.deepcopy(python)]
+    state["native_runs"] = [copy.deepcopy(native)]
+    for run in (python, native):
+        run["run_attempt"] += 1
+    state["python_evidence"]["attempt"] = python["run_attempt"]
+    state["python_evidence"]["main_proofs"]["network"]["attempt"] = python["run_attempt"]
+    state["attestation"]["attempt"] = native["run_attempt"]
+    with pytest.raises(PublicationFetchBoundary, match="before git fetch"):
+        prepare_main_callback(state, source)
+    assert_callback_validated_current_pair(state)
+    for run in (python, native):
+        assert not any(
+            f"/runs/{run['id']}/attempts/{run['run_attempt'] - 1}/" in route
+            for route in state["calls"]
+        )
+
+
+@pytest.mark.parametrize("source", ["CI", "Native feed"])
+@pytest.mark.parametrize("slot", ["python", "native"])
+def test_main_callbacks_refuse_artifact_from_previous_attempt(
+    main_callback_transport, source, slot
+):
+    state = main_callback_transport
+    state[f"{slot}_artifact_attempt_delta"] = -1
+    run = state[f"{slot}_run"]
+    artifact = "release-evidence" if slot == "python" else "native-evidence"
+    with pytest.raises(evidence.GateRejected) as rejected:
+        prepare_main_callback(state, source)
+    assert str(rejected.value) == f"missing unique {artifact}-{run['run_attempt']} artifact"
+    assert state["gate_attempts"] == [
+        (REPO, state["python_run"]["id"], {"head": state["python_run"]["head_sha"]})
+    ]
+    assert_callback_created_nothing(state)
+
+
+def test_main_callback_old_green_transport_is_a_usable_positive_twin(main_callback_transport):
+    state = main_callback_transport
+    python, native = state["python_run"], state["native_run"]
+    older_python = {**python, "id": python["id"] - 1, "run_attempt": 1}
+    older_native = {**native, "id": native["id"] - 1, "run_attempt": 1}
+    state["python_runs"], state["native_runs"] = [older_python], [older_native]
+    with pytest.raises(PublicationFetchBoundary, match="before git fetch"):
+        prepare_main_callback(state, "CI", run_id=older_python["id"])
+    result = state["validated_pairs"][-1]
+    assert result["run_id"] == older_python["id"] and result["attempt"] == 1
+    assert result["main_proofs"]["network"]["run_id"] == older_python["id"]
+    assert result["main_proofs"]["native"]["run"]["id"] == older_native["id"]
+    assert result["main_proofs"]["native"]["attestation"]["run_id"] == older_native["id"]
+    assert state["effects"] == [("git", ("fetch", "origin", python["head_sha"]))]
+    assert not state["output"].exists()
+    assert state["callback_report"] == state["report_before"]
+
+
+class PublicationCandidateBoundary(RuntimeError):
+    """Stop before the later, independent pre-merge candidate API inventory."""
+
+
+@pytest.fixture
+def publication_main_transport(
+    main_callback_transport, observed_main_parser, bootstrap_lock, tmp_path, monkeypatch
+):
+    """Save a real full gate, then re-observe it through publication's lower I/O."""
+    state = main_callback_transport
+    python, native = state["python_run"], state["native_run"]
+    source = python["head_sha"]
+    event = contract.object_json((FIXTURES / "ready-event.json").read_bytes())
+    manifest = (FIXTURES / "release-manifest.json").read_bytes()
+    pr = state["callback_pr"]
+    # Reuse the authored package-byte inputs of test_prepare_passes_adopter_lock_for_previous.
+    # These controls validate proof/hash handling; they do not install or serve a package.
+    package_directory = tmp_path / "observed-package-bytes"
+    package_directory.mkdir()
+    for name, raw in {
+        "pineforge_data-0.3.1-py3-none-any.whl": b"tested wheel",
+        "pineforge_data-0.3.1.tar.gz": b"tested sdist",
+    }.items():
+        (package_directory / name).write_bytes(raw)
+    state["python_evidence"]["distributions"] = evidence.distribution_hashes(package_directory)
+    native.update(
+        updated_at="2026-11-07T12:00:00Z", display_title="Original completed run title",
+    )
+    for run, jobs in ((python, state["python_jobs"]), (native, state["native_jobs"])):
+        for index, job in enumerate(jobs, 1):
+            job.update(
+                id=run["id"] * 1000 + index, run_id=run["id"],
+                run_attempt=run["run_attempt"], head_sha=source,
+                updated_at="2026-11-07T12:00:00Z",
+            )
+    for leg, inventory in state["attestation"]["legs"].items():
+        inventory["artifact"] = f"native-leg-{leg}-{native['run_attempt']}"
+        inventory["registration_sha256"] = contract.sha256(contract.json_bytes({
+            "tests": [{"name": name} for name in inventory["registered"]],
+        }))
+    saved = reporting.gate_for_run(REPO, python["id"], head=source)
+    assert set(saved["main_proofs"]) == {"network", "native"}
+    assert state["main_validations"][-1] == saved
+    staged = contract.object_json((FIXTURES / "sample-release-receipt.json").read_bytes())
+    staged.update(
+        pr=automation.pr_identity(pr), state="deploying",
+        deployed=receipts.served(event, source, "0.3.1", saved["distributions"]),
+    )
+    lock = {**copy.deepcopy(bootstrap_lock), "event": event}
+    source_files = {
+        contract.RUNTIME: (
+            f'DEFAULT_RELEASE_IMAGE = (\n    "{contract.image_ref(event)}"\n)\n'
+        ).encode(),
+        contract.DOCKERFILE: (
+            f"ARG PINEFORGE_RELEASE_IMAGE={contract.image_ref(event)}\n"
+            f"ARG PINEFORGE_HUB_COMMIT={event['hub_commit']}\n"
+        ).encode(),
+        "pyproject.toml": b'[project]\nname = "pineforge-data"\nversion = "0.3.1"\n',
+        contract.LOCK: contract.json_bytes(lock), contract.MANIFEST: manifest,
+    }
+    state.update(
+        saved_gate=copy.deepcopy(saved), staged=staged, package_directory=package_directory,
+        publication_reads=[], publication_writes=[], fresh_gates=[], local_validations=[],
+        candidate_boundaries=[], downloads=[], download_files=[],
+    )
+    real_transport = evidence.gh_bytes
+    real_gate = reporting.gate_for_run
+    real_verify_local = reporting.verify_local
+    real_temporary_directory = reporting.tempfile.TemporaryDirectory
+
+    def api(repo, endpoint, method="GET", data=None):
+        assert repo == REPO
+        if method != "GET":
+            state["publication_writes"].append((endpoint, method, copy.deepcopy(data)))
+            raise AssertionError("publication must not mutate before the candidate boundary")
+        assert data is None
+        state["publication_reads"].append(endpoint)
+        if endpoint == "actions/runs/200":
+            return {
+                "id": 200, "run_attempt": 1, "path": ".github/workflows/release.yml",
+                "event": "workflow_run", "head_sha": source,
+                "status": "completed", "conclusion": "success",
+            }
+        if endpoint == "actions/runs/200/artifacts?per_page=100&page=1":
+            return {"artifacts": [{
+                "id": 200001, "name": "release-stage-1-50-verify", "expired": False,
+            }]}
+        if endpoint == "pulls/7":
+            return copy.deepcopy(pr)
+        if endpoint == f"commits/{source}":
+            return {"parents": [{"sha": BASE}]}
+        if endpoint == (
+            "actions/workflows/ci.yml/runs?event=pull_request&head_sha="
+            + pr["head"]["sha"] + "&per_page=100&page=1"
+        ):
+            state["candidate_boundaries"].append(endpoint)
+            assert len(state["fresh_gates"]) == len(state["local_validations"]) == 1
+            assert state["local_validations"][0] == lock
+            raise PublicationCandidateBoundary("before pre-merge candidate inventory read")
+        raise AssertionError(f"unexpected publication API read: {endpoint}")
+
+    def gh_bytes(route, **kwargs):
+        if route == f"repos/{REPO}/actions/runs/200/artifacts?per_page=100":
+            return contract.json_bytes({"artifacts": [{
+                "id": 200001, "name": "release-stage-1-50-verify", "expired": False,
+            }]})
+        if route == f"repos/{REPO}/actions/artifacts/200001/zip":
+            archive = io.BytesIO()
+            with zipfile.ZipFile(archive, "w") as zipped:
+                zipped.writestr("release-receipt.json", contract.json_bytes(staged))
+            return archive.getvalue()
+        return real_transport(route, **kwargs)
+
+    def hub_bytes(route, *, accept="application/vnd.github+json"):
+        state["publication_reads"].append(route)
+        if route == f"repos/{contract.HUB}/releases/tags/v{event['release_version']}":
+            assert accept == "application/vnd.github+json"
+            return contract.json_bytes({
+                "draft": False, "prerelease": False,
+                "assets": [{"id": 81, "name": "release-manifest.json"}],
+            })
+        assert route == f"repos/{contract.HUB}/releases/assets/81"
+        assert accept == "application/octet-stream"
+        return manifest
+
+    def download(command, *, check):
+        assert check is True
+        bundle = Path(command[-1])
+        assert command == [
+            "gh", "run", "download", "200", "--repo", REPO,
+            "--name", "validated-release-bundle-1", "--dir", str(bundle),
+        ]
+        paths = [bundle / "evidence.json", *(bundle / "source" / name for name in source_files)]
+        for path in paths:
+            if (
+                path.name.endswith(".env")
+                or not path.resolve().is_relative_to(tmp_path.resolve())
+            ):
+                raise AssertionError(f"refused publication fixture file: {path}")
+        state["download_files"].append([str(path) for path in paths])
+        state["downloads"].append(copy.deepcopy(command))
+        (bundle / "evidence.json").write_bytes(contract.json_bytes(state["saved_gate"]))
+        for name, raw in source_files.items():
+            path = bundle / "source" / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(raw)
+
+    def observe_gate(repo, run_id, **kwargs):
+        result = real_gate(repo, run_id, **kwargs)
+        state["fresh_gates"].append(copy.deepcopy(result))
+        return result
+
+    def verify_local(root):
+        result = real_verify_local(root)
+        state["local_validations"].append(copy.deepcopy(result))
+        return result
+
+    monkeypatch.setenv("GITHUB_RUN_ID", "300")
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
+    monkeypatch.setattr(automation, "api", api)
+    monkeypatch.setattr(reporting, "api", api)
+    monkeypatch.setattr(evidence, "gh_bytes", gh_bytes)
+    monkeypatch.setattr(contract, "gh_bytes", hub_bytes)
+    monkeypatch.setattr(reporting.subprocess, "run", download)
+    monkeypatch.setattr(reporting, "gate_for_run", observe_gate)
+    monkeypatch.setattr(reporting, "verify_local", verify_local)
+    monkeypatch.setattr(
+        reporting.tempfile, "TemporaryDirectory",
+        lambda: real_temporary_directory(dir=tmp_path),
+    )
+    return state
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    ["unchanged", "native-updated-at", "native-display-title",
+     "native-job-updated-at", "native-job-order"],
+)
+def test_publication_revalidates_full_main_proofs_despite_benign_metadata(
+    publication_main_transport, metadata
+):
+    state = publication_main_transport
+    native = state["native_run"]
+    if metadata == "native-updated-at":
+        native["updated_at"] = "2026-11-08T00:00:00Z"
+    elif metadata == "native-display-title":
+        native["display_title"] = "Updated display title for the same completed run"
+    elif metadata == "native-job-updated-at":
+        state["native_jobs"][0]["updated_at"] = "2026-11-08T00:01:00Z"
+    elif metadata == "native-job-order":
+        state["native_jobs"].reverse()
+    report = receipts.receipt(None)
+    with pytest.raises(PublicationCandidateBoundary, match="before pre-merge candidate inventory"):
+        reporting.publication(REPO, 200, report)
+    fresh = state["fresh_gates"][0]
+    assert fresh["main_proofs"]["native"]["run"] == native
+    assert fresh["main_proofs"]["native"]["jobs"] == state["native_jobs"]
+    assert fresh == state["main_validations"][-1]
+    assert native in state["parsed_objects"]
+    assert {"jobs": state["native_jobs"]} in state["parsed_objects"]
+    assert state["python_evidence"] in state["parsed_objects"]
+    assert fresh["distributions"] == evidence.distribution_hashes(state["package_directory"])
+    assert (fresh == state["saved_gate"]) is (metadata == "unchanged")
+    assert len(state["candidate_boundaries"]) == len(state["downloads"]) == 1
+    assert len(state["download_files"][0]) == 6
+    assert report["state"] == "deploying" and state["publication_writes"] == []
+    # Partial lifecycle: real main proof and local metadata validation precede the sentinel.
+    # Pre-merge candidate validation, OCI/PyPI/previous identity and finalization do not run.
+
+
+def test_publication_refuses_missing_release_marker(publication_main_transport):
+    state = publication_main_transport
+    state["callback_pr"]["body"] = None
+    assert automation.marker(state["callback_pr"]) is None
+    report = receipts.receipt(None)
+    with pytest.raises(ValueError, match=r"^publication PR identity moved$"):
+        reporting.publication(REPO, 200, report)
+    assert state["publication_reads"][-1] == "pulls/7"
+    assert state["fresh_gates"] == state["local_validations"] == []
+    assert state["downloads"] == state["download_files"] == []
+    assert state["candidate_boundaries"] == state["publication_writes"] == []
+    assert report["state"] == "deploying"
+
+
+def test_publication_accepts_release_marker_before_candidate_boundary(
+    publication_main_transport,
+):
+    state = publication_main_transport
+    report = receipts.receipt(None)
+    with pytest.raises(PublicationCandidateBoundary, match="before pre-merge candidate inventory"):
+        reporting.publication(REPO, 200, report)
+    assert len(state["fresh_gates"]) == len(state["local_validations"]) == 1
+    assert len(state["downloads"]) == len(state["candidate_boundaries"]) == 1
+    assert state["publication_writes"] == []
+    assert report["state"] == "deploying"
+
+
+@pytest.mark.parametrize(
+    "fault,reason,gate_completes",
+    [
+        ("native-id", "landed CI distributions/evidence moved", True),
+        ("native-attempt", "landed CI distributions/evidence moved", True),
+        ("tree", "landed CI distributions/evidence moved", True),
+        ("native-job-id", "landed CI distributions/evidence moved", True),
+        ("native-inventory", "landed CI distributions/evidence moved", True),
+        ("native-junit-digest", "landed CI distributions/evidence moved", True),
+        ("native-registration-digest", "landed CI distributions/evidence moved", True),
+        ("network-junit-digest", "landed CI distributions/evidence moved", True),
+        ("distribution", "landed CI distributions/evidence moved", True),
+        ("native-head", "newest native proof has not completed successfully", False),
+        ("native-workflow", "newest native proof has not completed successfully", False),
+        ("native-event", "newest native proof has not completed successfully", False),
+        ("native-conclusion", "newest native proof has not completed successfully", False),
+        ("native-tested-sha", "native: wrong tested_sha", False),
+        ("native-stale-attestation", "native: wrong attempt", False),
+        ("native-job-conclusion",
+         "required job 'TSan' missing, duplicated, failed, cancelled or skipped", False),
+        ("network-inventory", "network: missing unique required live-PyPI row", False),
+    ],
+)
+def test_publication_refuses_real_main_proof_identity_or_content_change(
+    publication_main_transport, fault, reason, gate_completes
+):
+    state = publication_main_transport
+    native, attestation = state["native_run"], state["attestation"]
+    network = state["python_evidence"]["main_proofs"]["network"]
+    leg = attestation["legs"]["tsan"]
+    if fault in {"native-id", "native-attempt"}:
+        field = "id" if fault == "native-id" else "run_attempt"
+        native[field] += 1
+        attestation.update(run_id=native["id"], attempt=native["run_attempt"])
+        for job in state["native_jobs"]:
+            job.update(run_id=native["id"], run_attempt=native["run_attempt"])
+        for name, inventory in attestation["legs"].items():
+            inventory["artifact"] = f"native-leg-{name}-{native['run_attempt']}"
+    elif fault == "tree":
+        tree = contract.sha256(b"different landed tree")[:40]
+        state["python_evidence"]["tree"] = network["tree"] = attestation["tree"] = tree
+    elif fault == "native-job-id":
+        state["native_jobs"][0]["id"] += 1
+    elif fault == "native-inventory":
+        leg["registered"].append("additional-native-row")
+        leg["executed"].append("additional-native-row")
+        junit = ElementTree.Element("testsuite")
+        for name in leg["executed"]:
+            ElementTree.SubElement(junit, "testcase", name=name)
+        leg["junit_sha256"] = contract.sha256(ElementTree.tostring(junit))
+        leg["registration_sha256"] = contract.sha256(contract.json_bytes({
+            "tests": [{"name": name} for name in leg["registered"]],
+        }))
+    elif fault in {"native-junit-digest", "native-registration-digest", "network-junit-digest"}:
+        target = network if fault == "network-junit-digest" else leg
+        field = "registration_sha256" if fault == "native-registration-digest" else "junit_sha256"
+        target[field] = contract.sha256(f"different report bytes: {fault}".encode())
+    elif fault == "distribution":
+        wheel = state["package_directory"] / "pineforge_data-0.3.1-py3-none-any.whl"
+        wheel.write_bytes(wheel.read_bytes() + b"changed")
+        state["python_evidence"]["distributions"] = evidence.distribution_hashes(
+            state["package_directory"]
+        )
+    elif fault in {"native-head", "native-workflow", "native-event"}:
+        state["native_runs"] = [copy.deepcopy(native)]
+        field, value = {
+            "native-head": ("head_sha", contract.sha256(b"different head")[:40]),
+            "native-workflow": ("path", ".github/workflows/native-feed.yml"),
+            "native-event": ("event", "workflow_dispatch"),
+        }[fault]
+        native[field] = value
+    elif fault == "native-conclusion":
+        native["conclusion"] = "failure"
+    elif fault == "native-tested-sha":
+        attestation["tested_sha"] = contract.sha256(b"different tested source")[:40]
+    elif fault == "native-stale-attestation":
+        attestation["attempt"] -= 1
+    elif fault == "native-job-conclusion":
+        next(job for job in state["native_jobs"] if job["name"] == "TSan")[
+            "conclusion"
+        ] = "failure"
+    else:
+        network["registered"].append("unrelated-network-row")
+        network["executed"].append("unrelated-network-row")
+    report = receipts.receipt(None)
+    with pytest.raises(ValueError) as rejected:
+        reporting.publication(REPO, 200, report)
+    assert str(rejected.value) == reason
+    assert len(state["fresh_gates"]) == int(gate_completes)
+    if gate_completes:
+        assert state["fresh_gates"][0] == state["main_validations"][-1]
+        assert state["fresh_gates"][0] != state["saved_gate"]
+    assert state["local_validations"] == state["candidate_boundaries"] == []
+    assert len(state["downloads"]) == 1 and state["publication_writes"] == []
+    assert report["state"] == "deploying"
+
+
+@pytest.fixture
+def retained_receipt_transport(tmp_path, monkeypatch):
+    report = contract.object_json((FIXTURES / "sample-release-receipt.json").read_bytes())
+    pr = {
+        "number": report["pr"]["number"], "merged": True, "merge_commit_sha": MERGE,
+        "base": {"ref": "main", "sha": BASE},
+        "head": {"sha": HEAD, "repo": {"full_name": REPO}},
+        "body": automation.body({
+            "kind": "release", "version": "0.3.1", "base": BASE,
+            "generated_head": HEAD, "event_id": report["event_id"],
+        }),
+    }
+    state = {
+        "report": report, "pr": pr, "saved": True,
+        "reads": [], "asset_reads": [], "uploads": [], "upload_files": [],
+        "temporary_directories": [],
+    }
+
+    def api(repo, endpoint, method="GET", data=None):
+        state["reads"].append(endpoint)
+        assert repo == REPO and method == "GET" and data is None
+        if endpoint == "pulls/7":
+            return copy.deepcopy(pr)
+        assert endpoint == "releases?per_page=100&page=1"
+        return [{
+            "tag_name": "v0.3.1",
+            "assets": [{"id": 98, "name": "release-receipt.json"}] if state["saved"] else [],
+        }]
+
+    def gh_bytes(endpoint, *, accept):
+        state["asset_reads"].append(endpoint)
+        assert endpoint == f"repos/{REPO}/releases/assets/98"
+        assert accept == "application/octet-stream"
+        return receipts.canonical(report)
+
+    def upload(command, *, check):
+        path = Path(command[4])
+        if (
+            path.name.endswith(".env")
+            or not path.resolve().is_relative_to(tmp_path.resolve())
+        ):
+            raise AssertionError(f"refused retained receipt fixture file: {path}")
+        assert check is True
+        assert command == [
+            "gh", "release", "upload", "v0.3.1", str(path), "--repo", REPO,
+        ]
+        state["upload_files"].append([path.name])
+        state["uploads"].append(path.read_bytes())
+
+    real_temporary_directory = reporting.tempfile.TemporaryDirectory
+
+    def temporary_directory():
+        state["temporary_directories"].append(tmp_path)
+        return real_temporary_directory(dir=tmp_path)
+
+    monkeypatch.setattr(automation, "api", api)
+    monkeypatch.setattr(reporting, "api", api)
+    monkeypatch.setattr(publishing, "gh_bytes", gh_bytes)
+    monkeypatch.setattr(reporting.subprocess, "run", upload)
+    monkeypatch.setattr(reporting.tempfile, "TemporaryDirectory", temporary_directory)
+    return state
+
+
+def test_retain_refuses_missing_release_marker(retained_receipt_transport):
+    state = retained_receipt_transport
+    state["pr"]["body"] = None
+    report = state["report"]
+    before = copy.deepcopy(report)
+    assert automation.marker(state["pr"]) is None
+    with pytest.raises(ValueError, match=r"^retained release marker missing$"):
+        reporting.retain(REPO, report)
+    assert state["reads"] == ["pulls/7"]
+    assert state["asset_reads"] == state["uploads"] == state["upload_files"] == []
+    assert state["temporary_directories"] == []
+    assert report == before
+
+
+@pytest.mark.parametrize("saved", [True, False])
+def test_retain_accepts_release_marker_and_preserves_receipt(retained_receipt_transport, saved):
+    state = retained_receipt_transport
+    state["saved"] = saved
+    report = state["report"]
+    before = copy.deepcopy(report)
+    reporting.retain(REPO, report)
+    assert state["reads"] == ["pulls/7", "releases?per_page=100&page=1"]
+    assert state["asset_reads"] == ([f"repos/{REPO}/releases/assets/98"] if saved else [])
+    assert state["upload_files"] == ([] if saved else [["release-receipt.json"]])
+    assert state["uploads"] == ([] if saved else [receipts.canonical(report)])
+    assert len(state["temporary_directories"]) == int(not saved)
+    assert report == before
+
+
+@pytest.mark.parametrize("status", ["pending", "testing", "merged", "deploying", "failed"])
+def test_retain_other_states_do_not_require_a_marker(retained_receipt_transport, status):
+    state = retained_receipt_transport
+    state["pr"]["body"] = None
+    state["report"]["state"] = status
+    before = copy.deepcopy(state["report"])
+    reporting.retain(REPO, state["report"])
+    assert state["reads"] == state["asset_reads"] == state["uploads"] == state["upload_files"] == []
+    assert state["temporary_directories"] == []
+    assert state["report"] == before
 
 
 class ObservedGitHub:

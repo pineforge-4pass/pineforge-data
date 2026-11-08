@@ -28,7 +28,7 @@ constexpr auto keepalive = std::chrono::seconds(5);       // the runner's WebSoc
 Json number(std::uint64_t value) { return Json::number(std::to_string(value)); }
 
 struct Client {
-    std::uint64_t next = 0;  // the next message index this client receives
+    std::atomic<std::uint64_t> next{0};  // the next message index this client receives
     std::deque<std::shared_ptr<const std::string>> queue;
     std::size_t queue_bytes = 0;
     bool live = false, slow = false;
@@ -57,7 +57,7 @@ struct Hub {
             // A client that cannot keep up is cut off; it never slows the producer or another client.
             if (shared->size() > config.client_queue_bytes - std::min(client->queue_bytes, config.client_queue_bytes)) {
                 client->slow = true;
-                log("warn", "client_slow", Json::object({{"next", number(client->next)}, {"queued_bytes", number(client->queue_bytes)}}));
+                log("warn", "client_slow", Json::object({{"next", number(client->next.load())}, {"queued_bytes", number(client->queue_bytes)}}));
                 continue;
             }
             client->queue_bytes += shared->size();
@@ -178,7 +178,7 @@ int admit(const mg_connection* constant, void* data) {
         else if (hub.connected >= hub.config.max_clients) status = 503, reason = "client limit reached (--max-clients)";
         else {
             auto* client = new Client;
-            client->next = index;
+            client->next.store(index);
             hub.clients.insert(client);
             ++hub.connected;
             mg_set_user_connection_data(constant, client);
@@ -219,7 +219,7 @@ void serve_client(mg_connection* connection, Hub& hub, Client* client) {
     const auto send = [&](const std::string& bytes, int opcode) {
         const auto written = mg_websocket_write(connection, opcode, bytes.data(), bytes.size());
         if (written <= 0 || (!bytes.empty() && static_cast<std::size_t>(written) != bytes.size())) {
-            log("warn", "client_write_failed", Json::object({{"next", number(client->next)}}));
+            log("warn", "client_write_failed", Json::object({{"next", number(client->next.load())}}));
             return false;
         }
         last_send = std::chrono::steady_clock::now();
@@ -227,7 +227,7 @@ void serve_client(mg_connection* connection, Hub& hub, Client* client) {
     };
     const auto expired = [&] {
         std::lock_guard<std::mutex> guard(hub.mutex);
-        return client->next < hub.first_retained;
+        return client->next.load() < hub.first_retained;
     };
     // The journal is read only while catching up: a client at the head holds no segment open.
     std::optional<JournalReader> reader;
@@ -238,18 +238,18 @@ void serve_client(mg_connection* connection, Hub& hub, Client* client) {
             std::lock_guard<std::mutex> guard(hub.mutex);
             stopping = hub.stopping;
             head = hub.published;
-            if (!stopping && client->next == head) client->live = true;
+            if (!stopping && client->next.load() == head) client->live = true;
         }
         if (stopping) { send_close(connection, 1001, "producer stopping"); return; }
         if (client->live) break;
         if (!reader) {
             reader.emplace(hub.journal);
-            if (!reader->seek(client->next)) {
+            if (!reader->seek(client->next.load())) {
                 send_close(connection, 4410, "cursor expired: older than the retained journal");
                 return;
             }
         }
-        while (client->next < head) {
+        while (client->next.load() < head) {
             if (hub.halting) { send_close(connection, 1001, "producer stopping"); return; }
             auto line = reader->next();
             if (!line) {
@@ -270,7 +270,7 @@ void serve_client(mg_connection* connection, Hub& hub, Client* client) {
                 }
             }
             if (!send(*line, MG_WEBSOCKET_OPCODE_TEXT)) return;
-            ++client->next;
+            client->next.fetch_add(1);
         }
     }
     reader.reset();
@@ -299,7 +299,7 @@ void serve_client(mg_connection* connection, Hub& hub, Client* client) {
         }
         if (line) {
             if (!send(*line, MG_WEBSOCKET_OPCODE_TEXT)) return;
-            ++client->next;
+            client->next.fetch_add(1);
         } else if (std::chrono::steady_clock::now() - last_send >= keepalive && !send("", MG_WEBSOCKET_OPCODE_PONG)) return;
     }
 }
@@ -344,7 +344,7 @@ void on_connection_close(const mg_connection* connection) {
         hub->clients.erase(client);
         --hub->connected;
     }
-    const auto next = client->next;
+    const auto next = client->next.load();
     delete client;
     mg_set_user_connection_data(connection, nullptr);
     try { log("info", "client_disconnected", Json::object({{"next", number(next)}})); } catch (...) {}

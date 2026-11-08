@@ -182,6 +182,37 @@ jobs:
       - if: matrix.python-version == '3.13'
         run: python -m twine check --strict dist/*
 
+  network-proof:
+    name: Live PyPI hashes
+    needs: [authz, main-ref]
+    runs-on: ubuntu-24.04
+    env:
+      PF_CI_LABELS: '["ubuntu-24.04"]'
+      PINEFORGE_NETWORK_TEST: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.13'
+          cache: pip
+      - run: python -m pip install -e '.[dev]' pytest-xdist
+      - name: Execute the required live PyPI hash row with one actual worker
+        run: pytest -n 1 tests/test_consumer_receipt.py::test_bootstrap_recorded_hashes_match_live_pypi --junitxml=network.xml
+      - name: Derive the required zero-skip inventory from the actual JUnit
+        env:
+          PYTHONPATH: scripts
+        run: python -m release_chain.main_proofs network --directory . --output network-proof.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: network-proof-${{ github.run_attempt }}
+          path: |
+            network.xml
+            network-proof.json
+          if-no-files-found: error
+
   docker:
     name: Docker runtime
     needs: [authz, main-ref]
@@ -399,7 +430,7 @@ jobs:
 
   ready:
     name: release/ready
-    needs: [authz, main-ref, test, contract, docker, database-e2e, distribution]
+    needs: [authz, main-ref, test, contract, docker, database-e2e, distribution, network-proof]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
@@ -421,6 +452,14 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           ATTEMPT: ${{ github.run_attempt }}
         run: gh run download "$RUN_ID" --name "python-package-distributions-$ATTEMPT" --dir dist
+      - name: Download this attempt's actual live PyPI report
+        if: needs.authz.result == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          ATTEMPT: ${{ github.run_attempt }}
+        run: gh run download "$RUN_ID" --name "network-proof-$ATTEMPT" --dir reports/network
       - name: Require the complete job inventory and bind evidence to this head/base/tree
         if: needs.authz.result == 'success'
         env:
@@ -428,9 +467,10 @@ jobs:
           NEEDS_JSON: >-
             {"test":${{ toJSON(needs.test) }},"contract":${{ toJSON(needs.contract) }},
             "docker":${{ toJSON(needs.docker) }},"database-e2e":${{ toJSON(needs.database-e2e) }},
-            "distribution":${{ toJSON(needs.distribution) }}}
+            "distribution":${{ toJSON(needs.distribution) }},
+            "network-proof":${{ toJSON(needs.network-proof) }}}
           GH_TOKEN: ${{ github.token }}
-        run: python -m release_chain.evidence aggregate --path dist
+        run: python -m release_chain.evidence aggregate --path dist --network-proof reports/network
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: needs.authz.result == 'success'
         with:
@@ -439,7 +479,7 @@ jobs:
           if-no-files-found: error
 
   check:
-    needs: [authz, main-ref, workflow-lint, test, docker, database-e2e, contract, distribution, docs-tests, ready]
+    needs: [authz, main-ref, workflow-lint, test, docker, database-e2e, contract, distribution, docs-tests, network-proof, ready]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10

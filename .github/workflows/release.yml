@@ -23,7 +23,7 @@ on:
         required: false
         type: boolean
   workflow_run:
-    workflows: [CI]
+    workflows: [CI, Native feed]
     types: [completed]
     branches: [main]
 

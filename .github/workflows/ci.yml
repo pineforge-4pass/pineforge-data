@@ -1,21 +1,14 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
 
 permissions:
   contents: read
   actions: read
 
-# Only a superseded pull_request run is cancelled: every other event (push to main,
-# whose run authorizes publication) gets its own run_id group and is never cancelled.
-# Every job runs on GitHub-hosted ubuntu-24.04 (owner decision CI-2 = A, 10-21 04:01, and #1050:
-# this repository is public and no job here holds a secret); dependabot counts as ours.
-# Fork PRs fail authz. Documentation/workflow-only PRs run the light checks and skip
-# the heavy suites and release/ready evidence. The required check independently proves
-# cheap skips; code PRs and every push run the full suites and produce release evidence.
+# Pull requests keep hosted runners and the independently verified cheap checks.
+# Main-branch proofs and release evidence run in ci-post.yml.
 concurrency:
   group: ci-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -51,7 +44,7 @@ jobs:
               # events; none of them runs pull-request code.
               ;;
             workflow_run)
-              # LB-437: bind identity to the triggering run and its re-runner.
+              # Bind identity to the triggering run and its re-runner.
               # These two App bots are fixed canon policy; ALLOWED_BOTS is PR-only.
               [ -n "${WR_HEAD_REPO:-}" ] || fail "workflow_run head repository is missing"
               [ -n "${WR_ACTOR:-}" ] || fail "workflow_run triggering actor is missing"
@@ -173,7 +166,7 @@ jobs:
               has_code=true
             fi
             if [[ "$has_code" == false && "$has_workflows" == true ]]; then
-              # LB-570: only tracked head files outside .github may opt in.
+              # Only tracked head files outside .github may opt in.
               if inside_worktree=$(git rev-parse --is-inside-work-tree) &&
                  [[ "$inside_worktree" == true ]] &&
                  workflow_tests=$(git ls-tree -r --name-only "$PR_HEAD" -- ':(top,literal)ci/workflow-tests'); then
@@ -236,7 +229,7 @@ jobs:
           fi
           tar -xzf "$lint_dir/$archive" -C "$lint_dir" actionlint
           "$lint_dir/actionlint" -version
-          printf '%s\n' '{"self-hosted-runner":{"labels":["pf-gcp-pr","pf-gcp-main","pf-gcp-post"]}}' > "$lint_dir/actionlint.yaml"
+          printf '%s\n' '{}' > "$lint_dir/actionlint.yaml"
           git ls-files -z -- .github/workflows > "$lint_dir/workflows"
           workflows=()
           while IFS= read -r -d '' path; do
@@ -623,7 +616,7 @@ jobs:
               has_code=true
             fi
             if [[ "$has_code" == false && "$has_workflows" == true ]]; then
-              # LB-570: only tracked head files outside .github may opt in.
+              # Only tracked head files outside .github may opt in.
               if inside_worktree=$(git rev-parse --is-inside-work-tree) &&
                  [[ "$inside_worktree" == true ]] &&
                  workflow_tests=$(git ls-tree -r --name-only "$PR_HEAD" -- ':(top,literal)ci/workflow-tests'); then

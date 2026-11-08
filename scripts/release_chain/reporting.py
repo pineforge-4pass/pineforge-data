@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from .automation import api, finish, inventory, marker, pr_identity, receipt
+from .automation import api, finish, inventory, marker, pr_identity
 from .contract import (
     HUB,
     gh_bytes,
@@ -22,7 +22,7 @@ from .contract import (
     sha256,
     verify_local,
 )
-from .evidence import artifact_json, gate_for_run
+from .evidence import artifact_json, gate_for_run, semantic_evidence_identity
 from .publishing import candidate_gate, stored_receipt, verified_package
 from .receipts import (
     DEPLOY_JOBS,
@@ -30,6 +30,7 @@ from .receipts import (
     FIELDS,
     WORKFLOW,
     candidate,
+    receipt,
     signal,
     timestamp,
 )
@@ -192,9 +193,11 @@ def publication(repo: str, run_id: int, report: dict[str, Any]) -> None:
         pr["merged"]
         and pr["head"]["repo"]["full_name"] == repo
         and pr["base"]["ref"] == "main"
+        and meta is not None
         and pr["head"]["sha"] == meta["generated_head"],
         "publication PR identity moved",
     )
+    assert meta is not None
     source = pr["merge_commit_sha"]
     require(report["pr"] == pr_identity(pr, base=meta["base"]), "publication PR evidence differs")
     commit = api(repo, f"commits/{source}")
@@ -221,12 +224,15 @@ def publication(repo: str, run_id: int, report: dict[str, Any]) -> None:
             check=True,
         )
         main_gate = object_json((bundle / "evidence.json").read_bytes())
+        fresh_gate = gate_for_run(repo, main_gate["run_id"], head=source)
         require(
-            gate_for_run(repo, main_gate["run_id"], head=source) == main_gate,
+            json_bytes(semantic_evidence_identity(fresh_gate))
+            == json_bytes(semantic_evidence_identity(main_gate)),
             "landed CI distributions/evidence moved",
         )
         lock = verify_local(bundle / "source")
         require(lock is not None and lock["event"] == event, "served bundle target differs")
+        assert lock is not None
         version = lock["package_version"]
         require(version == meta["version"], "served package differs from PR")
         candidate(report, event, candidate_gate(repo, pr), version)
@@ -299,7 +305,10 @@ def retain(repo: str, report: dict[str, Any]) -> None:
     if report["state"] != "verified":
         return
     pr = api(repo, f"pulls/{report['pr']['number']}")
-    version = marker(pr)["version"]
+    meta = marker(pr)
+    require(meta is not None, "retained release marker missing")
+    assert meta is not None
+    version = meta["version"]
     saved = stored_receipt(repo, version)
     if saved:
         require(

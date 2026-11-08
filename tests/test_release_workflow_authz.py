@@ -158,11 +158,14 @@ def assert_app_token_environments(workflow: dict[str, Any]) -> None:
         environment = job.get("environment")
         if isinstance(environment, dict):
             environment = environment.get("name")
-        assert (
+        if not (
             isinstance(environment, str)
             and environment.strip()
             and "${{" not in environment
-        ), f"{job_id}: App-token mint requires a literal non-empty environment"
+        ):
+            raise AssertionError(
+                f"{job_id}: App-token mint requires a literal non-empty environment"
+            )
         if script_mint or (private_key and not known_action):
             warnings.warn(
                 f"{job_id}: possible App-token mint; "

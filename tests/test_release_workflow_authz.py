@@ -768,7 +768,8 @@ def check_workflow_files(directory: Path) -> None:
         allowed_root = directory.resolve(strict=True)
     except (OSError, RuntimeError) as error:
         raise AssertionError(f"refused workflow input: {directory}") from error
-    assert allowed_root.is_dir(), f"refused workflow input: {directory}"
+    if not allowed_root.is_dir():
+        raise AssertionError(f"refused workflow input: {directory}")
     files = sorted(path for path in directory.iterdir() if path.suffix in {".yml", ".yaml"})
     assert files, "no workflow YAML files found"
     resolved_files = []
@@ -777,9 +778,8 @@ def check_workflow_files(directory: Path) -> None:
             resolved = path.resolve(strict=True)
         except (OSError, RuntimeError) as error:
             raise AssertionError(f"refused workflow input: {path}") from error
-        assert resolved.is_relative_to(allowed_root) and resolved.is_file(), (
-            f"refused workflow input: {path}"
-        )
+        if not (resolved.is_relative_to(allowed_root) and resolved.is_file()):
+            raise AssertionError(f"refused workflow input: {path}")
         resolved_files.append((path, resolved))
     print("Workflow preflight inputs:\n" + "\n".join(str(path) for path in files))
     for path, resolved in resolved_files:

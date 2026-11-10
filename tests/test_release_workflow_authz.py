@@ -947,3 +947,44 @@ def test_every_workflow_file_has_app_token_environment_preflight() -> None:
     check_workflow_files(WORKFLOWS)
     for name, job_id, environment in APP_ENV_INVENTORY:
         assert load(name)["jobs"][job_id].get("environment") == environment
+
+
+@pytest.fixture
+def symlinked_checkout_workflows(tmp_path: Path) -> tuple[Path, Path]:
+    root = tmp_path.resolve()
+    checkout = root / "checkout"
+    workflows = checkout / ".github/workflows"
+    workflows.mkdir(parents=True)
+    alias = root / "checkout-alias"
+    alias.symlink_to(checkout, target_is_directory=True)
+    aliased_workflows = alias / ".github/workflows"
+    assert alias.is_symlink()
+    assert aliased_workflows.resolve() == workflows.resolve()
+    return workflows, aliased_workflows
+
+
+def test_app_token_workflow_accepts_symlinked_checkout_root(
+    symlinked_checkout_workflows: tuple[Path, Path],
+) -> None:
+    workflows, aliased_workflows = symlinked_checkout_workflows
+    workflow = workflows / "mint.yml"
+    workflow.write_text(app_token_workflow("environment: release-bot"), encoding="utf-8")
+    check_workflow_files(workflows)
+    check_workflow_files(aliased_workflows)
+
+
+def test_app_token_workflow_refusal_matches_through_symlinked_checkout_root(
+    symlinked_checkout_workflows: tuple[Path, Path],
+) -> None:
+    workflows, aliased_workflows = symlinked_checkout_workflows
+    workflow = workflows / "mint.yaml"
+    workflow.write_text(app_token_workflow(), encoding="utf-8")
+    with pytest.raises(AssertionError) as direct_refusal:
+        check_workflow_files(workflows)
+    assert str(direct_refusal.value) == f"{workflow.name}:{APP_ENV_FINDING}"
+    with pytest.raises(AssertionError) as alias_refusal:
+        check_workflow_files(aliased_workflows)
+    assert str(alias_refusal.value) == str(direct_refusal.value)
+    workflow.write_text(app_token_workflow("environment: release-bot"), encoding="utf-8")
+    check_workflow_files(workflows)
+    check_workflow_files(aliased_workflows)

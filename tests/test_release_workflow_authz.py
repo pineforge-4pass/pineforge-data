@@ -729,8 +729,8 @@ def test_pages_deploy_is_main_only_and_never_a_pull_request() -> None:
     assert deploy["runs-on"] == HOSTED_RELEASE_RUNNER
 
 
-# CR-304: these refusals exercise the existing load_text preflight, which on
-# b8180f9 returns the parsed mapping without checking App-token environments.
+# App-token actions, private-key use, and script mints require literal non-empty
+# job environments; suspected alternative mints also warn for human review.
 APP_ENV_FINDING = "mint: App-token mint requires a literal non-empty environment"
 APP_ENV_INVENTORY = (
     ("pineforge-release.yml", "reconcile", "release-bot"),
@@ -762,31 +762,29 @@ def assert_app_environment_refusal(text: str, job_id: str = "mint") -> None:
 
 
 def check_workflow_files(directory: Path) -> None:
-    # Refuse sensitive names and symlinks before enumerating or opening inputs.
-    def safe_input(path: Path) -> None:
-        parts = tuple(part.casefold() for part in path.expanduser().absolute().parts)
-        forbidden = {".ssh", ".aws", ".codex"}
-        assert not forbidden.intersection(parts), f"refused workflow input: {path}"
-        named = "/".join(parts)
-        assert "/.config/zsh/keys" not in named, f"refused workflow input: {path}"
-        assert "/.config/pineforge" not in named, f"refused workflow input: {path}"
-        assert not any(part.endswith(".env") for part in parts), (
-            f"refused workflow input: {path}"
-        )
-        assert ".." not in path.parts, f"refused workflow input: {path}"
-        assert not any(item.is_symlink() for item in (*reversed(path.parents), path)), (
-            f"refused workflow symlink: {path}"
-        )
-
-    safe_input(directory)
+    # Canonicalize the supplied root so checkout aliases are portable.
+    # Check every resolved file for confinement before reading any workflow bytes.
+    try:
+        allowed_root = directory.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise AssertionError(f"refused workflow input: {directory}") from error
+    assert allowed_root.is_dir(), f"refused workflow input: {directory}"
     files = sorted(path for path in directory.iterdir() if path.suffix in {".yml", ".yaml"})
     assert files, "no workflow YAML files found"
-    for path in files:
-        safe_input(path)
-    print("Workflow preflight inputs:\n" + "\n".join(str(path) for path in files))
+    resolved_files = []
     for path in files:
         try:
-            load_text(path.read_text(encoding="utf-8"))
+            resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise AssertionError(f"refused workflow input: {path}") from error
+        assert resolved.is_relative_to(allowed_root) and resolved.is_file(), (
+            f"refused workflow input: {path}"
+        )
+        resolved_files.append((path, resolved))
+    print("Workflow preflight inputs:\n" + "\n".join(str(path) for path in files))
+    for path, resolved in resolved_files:
+        try:
+            load_text(resolved.read_text(encoding="utf-8"))
         except AssertionError as error:
             raise AssertionError(f"{path.name}:{error}") from error
 
@@ -988,3 +986,49 @@ def test_app_token_workflow_refusal_matches_through_symlinked_checkout_root(
     workflow.write_text(app_token_workflow("environment: release-bot"), encoding="utf-8")
     check_workflow_files(workflows)
     check_workflow_files(aliased_workflows)
+
+
+def test_app_token_workflow_refuses_sibling_prefix_symlink_before_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path.resolve()
+    workflows = root / "workflows"
+    workflows.mkdir()
+    first = workflows / "a.yml"
+    first.write_text(app_token_workflow("environment: release-bot"), encoding="utf-8")
+    sibling = root / f"{workflows.name}-sibling"
+    sibling.mkdir()
+    outside = sibling / "mint.yml"
+    outside.write_text(app_token_workflow("environment: release-bot"), encoding="utf-8")
+    escaped = workflows / "z.yml"
+    attempted_reads: list[Path] = []
+    real_read_text = Path.read_text
+
+    def observe_read_text(path: Path, *args: Any, **kwargs: Any) -> str:
+        attempted_reads.append(path)
+        return real_read_text(path, *args, **kwargs)
+
+    with monkeypatch.context() as observation:
+        observation.setattr(Path, "read_text", observe_read_text)
+        check_workflow_files(workflows)
+        assert attempted_reads == [first]
+        attempted_reads.clear()
+        escaped.symlink_to(outside)
+        with pytest.raises(AssertionError) as refused:
+            check_workflow_files(workflows)
+        assert str(refused.value) == f"refused workflow input: {escaped}"
+        assert attempted_reads == []
+
+
+def test_app_token_workflow_validates_in_root_file_symlink(tmp_path: Path) -> None:
+    workflows = tmp_path.resolve()
+    target = workflows / "mint-input"
+    target.write_text(app_token_workflow("environment: release-bot"), encoding="utf-8")
+    alias = workflows / "mint.yaml"
+    alias.symlink_to(target)
+    check_workflow_files(workflows)
+    target.write_text(app_token_workflow(), encoding="utf-8")
+    with pytest.raises(AssertionError) as refused:
+        check_workflow_files(workflows)
+    assert str(refused.value) == f"{alias.name}:{APP_ENV_FINDING}"

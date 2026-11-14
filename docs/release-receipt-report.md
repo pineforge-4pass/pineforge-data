@@ -1,5 +1,43 @@
 # Data consumer receipt v1 delivery report
 
+CR206 source repair is based on `c04245344da2100dc43ad8d8d1f38fc530922736`.
+The controls now enter the producer and reporting CLIs with independent API
+observations. This lane ran no tests, imports, syntax checks or builds.
+Defective-first/native validation on spark2, exact-source Claude review and
+CORE/LAKE/CI/live acceptance remain with ROOT. The historical checks below
+describe an earlier integration and are not evidence for this source return.
+
+Current stage artifacts may carry private `producer-outcome.json` alongside
+the unchanged receipt contract. Actual producer decisions distinguish a
+targetless no-op, a stored verified replay and current targeted output.
+The reporter binds the witness to the API-observed run/attempt/head, current
+artifact inventory and actual producer job, then consumes its decision inputs.
+Missing or invalid evidence never grants no-op success. Stored replay is
+compared with the immutable asset, installed lock and served package proof;
+its original identities remain unchanged and it is not re-emitted.
+
+The public `release-receipt-data` archive still contains exactly one
+`release-receipt.json`. The internal witness is never retained or dispatched.
+Incident fallback is diagnostic only and preserves upstream failure stages.
+Collection has one strict path for production and library callers; there is no
+permissive missing-snapshot default. Current stages must agree on the decision.
+Package stages bind the carried decision to the actual bundle's CI run,
+attempt, source and version. Repair handoffs check the completed publisher's
+current verification artifact and independently observed PR version/source.
+
+The control families exercise actual `prepare`, `manual`, `reconcile`,
+`github-release`, `preflight`, `verify`, `publication`, `collect` and `incident`
+commands using their existing arguments. Stored replay controls retain the
+original run 300 receipt while varying the current adapter envelope. The
+recovery-handoff control executes real main and pre-merge gate parsing over
+fixture transports. Existing full-main-proof controls stop at an explicit
+candidate boundary; the synthetic completion fixture replaces later proof
+boundaries. Neither is hosted or native acceptance evidence. The lane's
+VALID-PATHS-RED.md distinguishes baseline regressions, retained refusals and
+additional input checks; all execution results remain NOTRUN.
+
+## Historical integration record
+
 Implemented in `/Users/haoliangwen/code/pineforge-data-wt-rc-data` on
 `rc/data-adapter`. HEAD remains `63c66863272f4b362c1efa503d50dda0e34ced3c`.
 All changes remain in the working tree. No commits, pushes, file deletions,
@@ -77,9 +115,9 @@ those issues and Actions logs.
   send the four-key signal. Upload failure prevents dispatch. A transport error
   creates a local incident without overwriting an uploaded completion snapshot.
 
-All intermediate `release-stage-<attempt>-<stage>` snapshots also serialize
-exactly this same contract; none use a home-grown receipt/report shape. Only
-the literal coordinator artifact is selected by the hub policy.
+Intermediate receipt snapshots serialize the same public contract. CR206 also
+carries a separate private producer witness for targetless decisions and stored
+replay. Only the literal coordinator artifact is selected by the hub policy.
 
 For `verified`, both CI/E2E reference the complete successful pre-merge PR CI
 attempt, including release/ready. Main CI independently authorizes the exact

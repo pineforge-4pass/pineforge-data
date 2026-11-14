@@ -249,7 +249,9 @@ jobs:
         if: always()
         with:
           name: release-stage-${{ github.run_attempt }}-10-manual
-          path: ${{ runner.temp }}/release-receipt.json
+          path: |
+            ${{ runner.temp }}/release-receipt.json
+            ${{ runner.temp }}/producer-outcome.json
           if-no-files-found: warn
 
   prepare:
@@ -303,7 +305,9 @@ jobs:
         if: always()
         with:
           name: release-stage-${{ github.run_attempt }}-20-prepare
-          path: ${{ runner.temp }}/release-receipt.json
+          path: |
+            ${{ runner.temp }}/release-receipt.json
+            ${{ runner.temp }}/producer-outcome.json
           if-no-files-found: warn
 
   build:
@@ -357,7 +361,6 @@ jobs:
           name: validated-release-bundle-${{ github.run_attempt }}
           path: bundle/
       - uses: actions/download-artifact@v6
-        if: needs.prepare.outputs.has_target == 'true'
         with:
           name: release-stage-${{ github.run_attempt }}-20-prepare
           path: report/
@@ -369,7 +372,9 @@ jobs:
         if: always()
         with:
           name: release-stage-${{ github.run_attempt }}-30-github
-          path: report/release-receipt.json
+          path: |
+            report/release-receipt.json
+            report/producer-outcome.json
           if-no-files-found: warn
 
   publish:
@@ -397,7 +402,6 @@ jobs:
           name: validated-release-bundle-${{ github.run_attempt }}
           path: bundle/
       - uses: actions/download-artifact@v6
-        if: needs.prepare.outputs.has_target == 'true'
         with:
           name: release-stage-${{ github.run_attempt }}-30-github
           path: report/
@@ -413,7 +417,9 @@ jobs:
         if: always()
         with:
           name: release-stage-${{ github.run_attempt }}-40-publish
-          path: report/release-receipt.json
+          path: |
+            report/release-receipt.json
+            report/producer-outcome.json
           if-no-files-found: warn
 
   verify:
@@ -446,7 +452,7 @@ jobs:
           name: validated-release-bundle-${{ github.run_attempt }}
           path: bundle/
       - uses: actions/download-artifact@v6
-        if: needs.authz.result == 'success' && needs.prepare.outputs.has_target == 'true'
+        if: needs.authz.result == 'success'
         with:
           name: release-stage-${{ github.run_attempt }}-30-github
           path: report/
@@ -459,7 +465,9 @@ jobs:
         if: always()
         with:
           name: release-stage-${{ github.run_attempt }}-50-verify
-          path: report/release-receipt.json
+          path: |
+            report/release-receipt.json
+            report/producer-outcome.json
           if-no-files-found: warn
 
   report:

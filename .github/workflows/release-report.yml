@@ -91,6 +91,6 @@ jobs:
           PYTHONPATH: scripts
           GH_TOKEN: ${{ github.token }}
           FAILED: 'true'
-          STAGE: receipt-transport
+          STAGE: ${{ inputs.failed && inputs.stage || 'receipt-transport' }}
           RELEASE_ALERT_OWNER: ${{ vars.RELEASE_ALERT_OWNER }}
         run: python -m release_chain.reporting incident --receipt incident-release-receipt.json

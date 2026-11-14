@@ -33,6 +33,36 @@ FIELDS = {
     "deployed",
     "previous",
 }
+OUTCOME_FILE = "producer-outcome.json"
+OUTCOME_SCHEMA = "pineforge/internal-producer-outcome/v1"
+
+
+class ProducerReceipt(dict[str, Any]):
+    """Private decision state; attributes never enter the public receipt JSON."""
+
+    outcome: dict[str, Any] | None = None
+
+
+def observe_outcome(
+    report: dict[str, Any], outcome: str, reason: str, **inputs: Any
+) -> None:
+    require(isinstance(report, ProducerReceipt), "producer decision needs a working receipt")
+    assert isinstance(report, ProducerReceipt)
+    report.outcome = {"outcome": outcome, "reason": reason, "inputs": inputs}
+
+
+def producer_outcome(report: dict[str, Any]) -> dict[str, Any] | None:
+    observed = getattr(report, "outcome", None)
+    if observed is None:
+        return None
+    return {
+        "schema": OUTCOME_SCHEMA,
+        "run_id": int(os.environ["GITHUB_RUN_ID"]),
+        "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+        "head_sha": os.environ["GITHUB_SHA"],
+        **observed,
+        "receipt_sha256": sha256(canonical(report)) if report["event_id"] else None,
+    }
 
 
 def canonical(value: object) -> bytes:
@@ -48,9 +78,9 @@ def timestamp() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def receipt(event: dict[str, Any] | None, _stage: str = "") -> dict[str, Any]:
+def receipt(event: dict[str, Any] | None, _stage: str = "") -> ProducerReceipt:
     # A target-less working object is never written or uploaded as a receipt.
-    return {
+    return ProducerReceipt({
         "schema": "pineforge/consumer-receipt/v1",
         "consumer": "data",
         "event_id": event["event_id"] if event else None,
@@ -60,7 +90,7 @@ def receipt(event: dict[str, Any] | None, _stage: str = "") -> dict[str, Any]:
         "state": "pending",
         "timestamp": timestamp(),
         **dict.fromkeys(("pr", "ci", "e2e", "deploy", "preview", "deployed", "previous")),
-    }
+    })
 
 
 def checks(gate: dict[str, Any]) -> dict[str, Any]:

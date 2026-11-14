@@ -16,6 +16,7 @@ from urllib.error import HTTPError
 
 from .automation import api, finish, git, inventory, marker, pr_identity, snapshot
 from .contract import (
+    HEX40,
     LOCK,
     MANIFEST,
     RUNTIME,
@@ -40,7 +41,16 @@ from .evidence import (
 )
 from .main_proofs import NATIVE_WORKFLOW
 from .receipts import candidate as record_candidate
-from .receipts import canonical, receipt, served, timestamp
+from .receipts import (
+    OUTCOME_FILE,
+    OUTCOME_SCHEMA,
+    ProducerReceipt,
+    canonical,
+    observe_outcome,
+    receipt,
+    served,
+    timestamp,
+)
 
 # TEMPORARY first-adopter exemption (TX-DATA-BASELINE2, L6 10-19):
 # remove the data exemption and the hub form together, only after 0.3.1 is verified AND
@@ -284,7 +294,9 @@ def stored_receipt(repo: str, version: str) -> dict[str, Any] | None:
     )
 
 
-def recover_applied(repo: str, source: Path, report: dict[str, Any]) -> None:
+def recover_applied(
+    repo: str, source: Path, report: dict[str, Any], *, installed_source: str | None = None
+) -> None:
     """Replay completed receipts or repair a dropped publication transition."""
     version = package_version(source)
     saved = stored_receipt(repo, version)
@@ -301,7 +313,20 @@ def recover_applied(repo: str, source: Path, report: dict[str, Any]) -> None:
             image_digest == lock["event"]["image"]["digest"],
             "stored publication does not match installed defaults",
         )
+        require(
+            saved["release_version"] == lock["event"]["release_version"]
+            and saved["event_id"] == lock["event"]["event_id"],
+            "stored publication does not match installed target",
+        )
+        require(
+            isinstance(installed_source, str) and HEX40.fullmatch(installed_source),
+            "stored publication installed source missing",
+        )
         report.update(saved)
+        observe_outcome(
+            report, "replay", "stored-verified", version=version,
+            installed_source=installed_source, installed_lock_sha256=sha256(canonical(lock)),
+        )
         return
     prs = inventory(repo, "pulls?state=closed&base=main&sort=updated&direction=desc")
     candidates = [
@@ -369,6 +394,10 @@ def recover_applied(repo: str, source: Path, report: dict[str, Any]) -> None:
             },
         )
         report.update(receipt(None))  # The pinned reporting run owns the next snapshot.
+        observe_outcome(
+            report, "no-target", "publication-handoff", version=version,
+            publication_run=max(completed, key=lambda row: row["id"])["id"],
+        )
         return
     # App token needs Actions:write only on this consumer for lost-event repair.
     api(
@@ -450,6 +479,10 @@ def prepare(
         and marker(pr)
     ]
     if not matches:
+        observe_outcome(
+            report, "no-target", "ordinary-main", ci_run=run_id,
+            ci_attempt=run["run_attempt"], source=source,
+        )
         return {"eligible": "false"}  # Ordinary main pushes are not release requests.
     require(len(matches) == 1, "ambiguous merged release PR")
     pr = api(repo, f"pulls/{matches[0]['number']}")
@@ -473,7 +506,11 @@ def prepare(
                 "counterpart is not exact-head main CI",
             )
         evidence = gate_for_run(repo, run_id, head=source)
-    except ProofPending:
+    except ProofPending as pending:
+        observe_outcome(
+            report, "no-target", "main-proofs-pending", ci_run=run_id,
+            ci_attempt=run["run_attempt"], source=source, pending=str(pending),
+        )
         return {"eligible": "false", "waiting": "main-proofs-pending"}
     git("fetch", "origin", source)
     # Keep this process and scripts at the trusted default branch. Read source as data.
@@ -533,6 +570,11 @@ def prepare(
     if published is not None:
         require(published == evidence["distributions"], "PyPI version exists with different bytes")
     report["state"] = "deploying" if published is None else "merged"
+    if event is None:
+        observe_outcome(
+            report, "no-target", "package-publication", ci_run=run_id,
+            ci_attempt=run["run_attempt"], source=source, version=version,
+        )
     return {
         "eligible": "true",
         "published": str(published is not None).lower(),
@@ -636,12 +678,41 @@ def main() -> None:
     args = parser.parse_args()
     repo = os.environ["GITHUB_REPOSITORY"]
     report = (
-        object_json(args.receipt.read_bytes())
+        ProducerReceipt(object_json(args.receipt.read_bytes()))
         if args.receipt.exists()
         else receipt(None, "publish")
     )
     try:
         args.directory.mkdir(parents=True, exist_ok=True)
+        if args.command != "prepare" and report["event_id"] is None:
+            # Target-less package publication must carry prepare's actual decision.
+            # A missing targeted receipt can never select this path by absence.
+            observed = object_json((args.receipt.parent / OUTCOME_FILE).read_bytes())
+            gate = object_json((args.directory / "evidence.json").read_bytes())
+            require(
+                set(observed) == {
+                    "schema", "run_id", "run_attempt", "head_sha", "outcome",
+                    "reason", "inputs", "receipt_sha256",
+                }
+                and observed.get("schema") == OUTCOME_SCHEMA
+                and type(observed.get("run_id")) is int
+                and observed["run_id"] == int(os.environ["GITHUB_RUN_ID"])
+                and type(observed.get("run_attempt")) is int
+                and observed["run_attempt"] == int(os.environ["GITHUB_RUN_ATTEMPT"])
+                and observed.get("head_sha") == os.environ["GITHUB_SHA"]
+                and observed.get("outcome") == "no-target"
+                and observed.get("reason") == "package-publication"
+                and observed.get("receipt_sha256") is None
+                and observed.get("inputs") == {
+                    "ci_run": gate["run_id"], "ci_attempt": gate["attempt"],
+                    "source": gate["head"], "version": package_version(args.directory / "source"),
+                }
+                and verify_local(args.directory / "source") is None,
+                "missing or invalid package publication outcome",
+            )
+            observe_outcome(
+                report, "no-target", "package-publication", **observed["inputs"]
+            )
         if args.command == "prepare":
             outputs = prepare(Path.cwd(), repo, args.run, args.directory, report)
             with Path(os.environ["GITHUB_OUTPUT"]).open("a") as handle:

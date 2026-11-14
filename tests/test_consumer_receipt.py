@@ -5,8 +5,10 @@ import copy
 import io
 import json
 import os
+import sys
 import zipfile
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
 from xml.etree import ElementTree
 
@@ -283,15 +285,33 @@ def observed_main_parser(main_proof_transport, monkeypatch):
 @pytest.fixture
 def incident_transport(monkeypatch):
     """Real incident/inventory logic, with mutable issue observations at the API."""
-    state = {"issues": [], "reads": [], "writes": [], "comments": []}
+    state = {
+        "issues": [], "reads": [], "writes": [], "comments": [], "producer_reads": [],
+        "artifacts": [], "reports": [], "monkeypatch": monkeypatch,
+        "jobs": [{"name": "prepare", "status": "completed", "conclusion": "success"}],
+    }
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
     monkeypatch.setenv("GITHUB_RUN_ID", "930")
     monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
+    monkeypatch.setenv("GITHUB_SHA", MERGE)
 
     def api(repo, endpoint, method="GET", data=None):
         assert repo == REPO
         if method == "GET":
-            state["reads"].append(endpoint)
             assert data is None
+            if endpoint.startswith(("actions/runs/", "commits/", "pulls/")):
+                state["producer_reads"].append(endpoint)
+                if endpoint == "actions/runs/930":
+                    return {
+                        "id": 930, "run_attempt": 2, "head_sha": MERGE,
+                        "path": ".github/workflows/release.yml", "event": "workflow_run",
+                    }
+                if endpoint == "actions/runs/930/artifacts?per_page=100&page=1":
+                    return {"artifacts": copy.deepcopy(state["artifacts"])}
+                if endpoint == "actions/runs/930/attempts/2/jobs?per_page=100&page=1":
+                    return {"jobs": copy.deepcopy(state["jobs"])}
+                return publishing.api(repo, endpoint)
+            state["reads"].append(endpoint)
             assert endpoint == (
                 "issues?state=all&sort=updated&direction=desc&per_page=100&page=1"
             )
@@ -313,18 +333,268 @@ def incident_transport(monkeypatch):
     # inventory's original implementation resolves automation.api at call time.
     monkeypatch.setattr(automation, "api", api)
     monkeypatch.setattr(reporting, "api", api)
+    real_incident = reporting.incident
+
+    def observe_incident(repo, report, owner, stage):
+        state["reports"].append(copy.deepcopy(report))
+        return real_incident(repo, report, owner, stage)
+
+    monkeypatch.setattr(reporting, "incident", observe_incident)
     return state
+
+
+def callback_report_cli(directory, incidents, command, *, failed):
+    monkeypatch = incidents["monkeypatch"]
+    with monkeypatch.context() as cli:
+        cli.setenv("GITHUB_OUTPUT", str(directory.parent / "report-outputs"))
+        cli.setenv("GITHUB_STEP_SUMMARY", str(directory.parent / "report-summary"))
+        cli.setenv("RELEASE_ALERT_OWNER", "release-owner")
+        cli.setenv("STAGE", "prepare-publication")
+        cli.setenv("FAILED", str(failed).lower())
+        cli.setattr(sys, "argv", [
+            "release_chain.reporting", command, "--directory", str(directory),
+            "--receipt", str(directory.parent / "report-release-receipt.json"),
+        ])
+        reporting.main()
+    assert not (directory.parent / "report-release-receipt.json").exists()
+    assert (directory.parent / "report-outputs").read_text() == "has_event=false\n"
 
 
 def collect_callback_without_incident(state, incidents):
     directory = state["callback_root"] / "downloaded-stages"
-    assert list(directory.glob("release-stage-*/release-receipt.json")) == []
-    report = reporting.collect(directory, failed=False, stage="prepare-publication")
-    assert report["state"] == "pending" and report["event_id"] is None
-    assert report["pr"] is report["ci"] is report["deployed"] is None
-    reporting.incident(REPO, report, "release-owner", "prepare-publication")
+    stage = directory / "release-stage-2-20-prepare"
+    automation.finish(state["callback_report"], stage / "release-receipt.json")
+    # Match upload-artifact: no file means no artifact, including on the defective source.
+    if stage.exists() and any(stage.iterdir()):
+        incidents["artifacts"] = [{
+            "id": 93020, "name": "release-stage-2-20-prepare", "expired": False,
+        }]
+    callback_report_cli(directory, incidents, "collect", failed=False)
+    assert "**pending**" in (directory.parent / "report-summary").read_text()
     assert incidents["reads"] == incidents["writes"] == []
-    return report
+
+
+@pytest.mark.parametrize("source", ["CI", "Native feed"])
+@pytest.mark.parametrize("slot", ["python", "native"])
+@pytest.mark.parametrize("readiness", ["missing", "queued", "in_progress"])
+def test_cli_prepare_and_report_preserve_real_proof_waiting(
+    main_callback_transport, incident_transport, monkeypatch, source, slot, readiness
+):
+    state = main_callback_transport
+    run = state[f"{slot}_run"]
+    if readiness == "missing":
+        state[f"{slot}_runs"] = []
+    else:
+        run.update(status=readiness, conclusion=None)
+        for job in state[f"{slot}_jobs"]:
+            job.update(status=readiness, conclusion=None)
+    directory = state["callback_root"] / "downloaded-stages"
+    producer = directory / "release-stage-2-20-prepare"
+    callback = state["python_run" if source == "CI" else "native_run"]["id"]
+    with monkeypatch.context() as cli:
+        cli.setenv("GITHUB_OUTPUT", str(state["callback_root"] / "producer-outputs"))
+        cli.setattr(sys, "argv", [
+            "release_chain.publishing", "prepare", "--run", str(callback),
+            "--directory", str(state["output"]),
+            "--receipt", str(producer / "release-receipt.json"),
+        ])
+        publishing.main()
+    if producer.exists() and any(producer.iterdir()):
+        incident_transport["artifacts"] = [{
+            "id": 93020, "name": "release-stage-2-20-prepare", "expired": False,
+        }]
+    callback_report_cli(directory, incident_transport, "collect", failed=False)
+    assert incident_transport["issues"] == incident_transport["writes"] == []
+    assert not (producer / "release-receipt.json").exists()
+    decision = contract.object_json((producer / "producer-outcome.json").read_bytes())
+    assert decision["reason"] == "main-proofs-pending"
+    assert decision["inputs"]["source"] == state["python_run"]["head_sha"]
+    assert state["effects"] == []
+
+
+@pytest.mark.parametrize("fault", [
+    None, "missing", "run", "attempt", "head", "schema", "fields",
+    "ci-run", "ci-attempt", "source", "version",
+])
+def test_cli_targetless_package_carries_actual_outcome_through_every_publisher_stage(
+    main_callback_transport, incident_transport, monkeypatch, fault
+):
+    state = main_callback_transport
+    source = state["python_run"]["head_sha"]
+    pr = state["callback_pr"]
+    pr["body"] = automation.body({
+        "kind": "package", "event_id": None, "bump": "patch", "version": "0.3.1",
+        "generated_head": pr["head"]["sha"], "base": BASE,
+    })
+    pin = (
+        "ghcr.io/pineforge-4pass/pineforge-release:1.0.0@sha256:"
+        "b271873d0e91a9eeeb4595daaded9bdfbdbcd3925d3ec1300a833395e2004c86"
+    )
+    files = {
+        contract.RUNTIME: f'DEFAULT_RELEASE_IMAGE = "{pin}"\n'.encode(),
+        contract.DOCKERFILE: f"ARG PINEFORGE_RELEASE_IMAGE={pin}\n".encode(),
+        "pyproject.toml": b'[project]\nname = "pineforge-data"\nversion = "0.3.1"\n',
+    }
+    distributions = {
+        "pineforge_data-0.3.1-py3-none-any.whl": b"independent tested wheel bytes",
+        "pineforge_data-0.3.1.tar.gz": b"independent tested sdist bytes",
+    }
+    hashes = {name: contract.sha256(raw) for name, raw in distributions.items()}
+    state["python_evidence"]["distributions"] = hashes
+    release = {
+        "tag_name": "v0.3.1",
+        "assets": [{"id": index, "name": name} for index, name in enumerate(distributions, 1)],
+    }
+    metadata = {"urls": [
+        {"filename": name, "digests": {"sha256": hashes[name]},
+         "url": f"https://files.pythonhosted.org/{name}"}
+        for name in distributions
+    ]}
+    publication = {"available": False, "commands": []}
+    original_api, report_api = publishing.api, automation.api
+
+    def api(repo, endpoint, method="GET", data=None):
+        if endpoint == "":
+            return {"default_branch": "main"}
+        if endpoint == "releases/tags/v0.3.1":
+            return copy.deepcopy(release)
+        return original_api(repo, endpoint, method, data)
+
+    def inventory_api(repo, endpoint, method="GET", data=None):
+        if endpoint == "releases?per_page=100&page=1":
+            return [copy.deepcopy(release)]
+        return report_api(repo, endpoint, method, data)
+
+    def snapshot(revision, directory):
+        assert revision in {source, "origin/main"}
+        for name, raw in files.items():
+            path = directory / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(raw)
+
+    def git(*args):
+        if args[0] == "fetch":
+            return ""
+        if args[0] == "ls-remote":
+            return "retained tag"
+        assert args[0] == "rev-parse"
+        return {
+            f"{source}^{{tree}}": state["python_evidence"]["tree"],
+            f"{source}^1": BASE, "v0.3.1^{commit}": source,
+        }[args[1]]
+
+    def fetch(url, headers=None):
+        assert headers is None
+        if url == "https://pypi.org/pypi/pineforge-data/0.3.1/json":
+            if not publication["available"]:
+                raise HTTPError(url, 404, "not yet published", {}, None)
+            return contract.json_bytes(metadata)
+        assert url.startswith("https://files.pythonhosted.org/")
+        return distributions[url.rsplit("/", 1)[1]]
+
+    def asset_bytes(route, *, accept):
+        assert accept == "application/octet-stream"
+        asset = next(row for row in release["assets"] if route.endswith(f"/{row['id']}"))
+        return distributions[asset["name"]]
+
+    def process(command, *, check):
+        assert check is True
+        publication["commands"].append(command)
+        if command[:3] == ["gh", "run", "download"]:
+            assert command[3] == str(state["python_run"]["id"])
+            assert command[7] == f"python-package-distributions-{state['python_run']['run_attempt']}"
+            directory = Path(command[-1])
+            directory.mkdir(parents=True)
+            for name, raw in distributions.items():
+                (directory / name).write_bytes(raw)
+        else:
+            assert command == ["gh", "release", "edit", "v0.3.1", "--repo", REPO, "--latest"]
+
+    monkeypatch.setattr(publishing, "api", api)
+    monkeypatch.setattr(automation, "api", inventory_api)
+    monkeypatch.setattr(publishing, "snapshot", snapshot)
+    monkeypatch.setattr(publishing, "git", git)
+    monkeypatch.setattr(publishing, "fetch", fetch)
+    monkeypatch.setattr(publishing, "gh_bytes", asset_bytes)
+    monkeypatch.setattr(publishing.subprocess, "run", process)
+    incident_transport["jobs"] = [
+        {"name": name, "status": "completed", "conclusion": "success"}
+        for name in receipts.DEPLOY_JOBS
+    ]
+    directory = state["callback_root"] / "downloaded-stages"
+    previous = None
+    for command, stage_name in (
+        ("prepare", "20-prepare"), ("github-release", "30-github"),
+        ("preflight", "40-publish"), ("verify", "50-verify"),
+    ):
+        stage = directory / ("release-stage-2-" + stage_name)
+        if command == "verify":
+            previous = directory / "release-stage-2-30-github"
+        if previous is not None:
+            for filename in ("release-receipt.json", "producer-outcome.json"):
+                path = previous / filename
+                if path.exists():
+                    stage.mkdir(parents=True, exist_ok=True)
+                    (stage / filename).write_bytes(path.read_bytes())
+        if command == "verify":
+            # Independently observed PyPI transition after the upload boundary.
+            publication["available"] = True
+        with monkeypatch.context() as cli:
+            cli.setenv("GITHUB_OUTPUT", str(state["callback_root"] / "producer-outputs"))
+            argv = [
+                "release_chain.publishing", command, "--directory", str(state["output"]),
+                "--receipt", str(stage / "release-receipt.json"),
+            ]
+            if command == "prepare":
+                argv += ["--run", str(state["python_run"]["id"])]
+            cli.setattr(sys, "argv", argv)
+            if command == "preflight" and fault:
+                witness = stage / "producer-outcome.json"
+                if witness.exists():
+                    if fault == "missing":
+                        witness.rename(state["callback_root"] / "withheld-package-outcome.json")
+                    else:
+                        observed = contract.object_json(witness.read_bytes())
+                        if fault in {"run", "attempt"}:
+                            observed["run_id" if fault == "run" else "run_attempt"] += 1
+                        elif fault == "head":
+                            observed["head_sha"] = "9" * 40
+                        elif fault == "schema":
+                            observed["schema"] = "pineforge/consumer-receipt/v1"
+                        elif fault == "fields":
+                            observed["ignored"] = True
+                        elif fault in {"ci-run", "ci-attempt"}:
+                            observed["inputs"]["ci_run" if fault == "ci-run" else "ci_attempt"] += 1
+                        elif fault == "source":
+                            observed["inputs"]["source"] = "9" * 40
+                        else:
+                            observed["inputs"]["version"] = "8.9.10"
+                        witness.write_bytes(contract.json_bytes(observed))
+                # c042 accepts the same preflight inputs; it reaches its actual
+                # current-intent and distribution logic, without any new API.
+                with pytest.raises((ValueError, OSError)):
+                    publishing.main()
+                assert not (stage / "release-receipt.json").exists()
+                assert incident_transport["writes"] == []
+                return
+            publishing.main()
+        if stage.exists() and any(stage.iterdir()):
+            incident_transport["artifacts"].append({
+                "id": 93000 + len(incident_transport["artifacts"]),
+                "name": stage.name, "expired": False,
+            })
+        previous = stage
+    callback_report_cli(directory, incident_transport, "collect", failed=False)
+    assert incident_transport["issues"] == incident_transport["writes"] == []
+    assert len(state["validated_pairs"]) == 1
+    assert set(state["validated_pairs"][0]["main_proofs"]) == {"network", "native"}
+    assert len(publication["commands"]) == 2
+    assert all(not (path / "release-receipt.json").exists() for path in directory.iterdir())
+
+
+def callback_failure_incident(directory, incidents):
+    callback_report_cli(directory, incidents, "incident", failed=True)
+    return incidents["reports"][-1]
 
 
 def test_main_gate_consumes_matching_native_transport_positive_twin(main_proof_transport):
@@ -899,12 +1169,11 @@ def test_main_callbacks_refuse_invalid_python_while_native_pending(
             "number": 41, "state": "closed",
             "body": "<!-- release-chain-data:run-930 -->\nolder observation",
         })
-    report = reporting.collect(
-        state["callback_root"] / "downloaded-stages", failed=True, stage="prepare-publication"
+    report = callback_failure_incident(
+        state["callback_root"] / "downloaded-stages", incidents
     )
     assert report["state"] == "failed" and report["event_id"] is None
     assert report["attempt"] == 930 and report["sequence"] == 2
-    reporting.incident(REPO, report, "release-owner", "prepare-publication")
     assert len(incidents["reads"]) == 1
     assert [(route, method) for route, method, _ in incidents["writes"]] == (
         [("issues/41/comments", "POST"), ("issues/41", "PATCH")] if existing_issue else
@@ -967,10 +1236,9 @@ def test_callback_reporting_failure_still_opens_or_updates_incident(
             "number": 41, "state": "closed",
             "body": "<!-- release-chain-data:run-930 -->\nolder observation",
         })
-    report = reporting.collect(tmp_path, failed=True, stage="prepare-publication")
+    report = callback_failure_incident(tmp_path / "downloaded-stages", incidents)
     assert report["state"] == "failed" and report["event_id"] is None
     assert report["attempt"] == 930 and report["sequence"] == 2
-    reporting.incident(REPO, report, "release-owner", "prepare-publication")
     assert len(incidents["reads"]) == 1
     assert [(route, method) for route, method, _ in incidents["writes"]] == (
         [("issues/41/comments", "POST"), ("issues/41", "PATCH")] if existing_issue else
@@ -1044,10 +1312,7 @@ def test_main_callbacks_keep_completed_and_malformed_proofs_decisive(
     if fault == "malformed-json":
         assert b'{"run_id":1,"run_id":2}' in state["parsed_bytes"]
     # A real refusal must still take the actionable failure path.
-    report = reporting.collect(
-        state["callback_root"], failed=True, stage="prepare-publication"
-    )
-    reporting.incident(REPO, report, "release-owner", "prepare-publication")
+    callback_failure_incident(state["callback_root"] / "downloaded-stages", incident_transport)
     assert [(route, method) for route, method, _ in incident_transport["writes"]] == [
         ("issues", "POST"), ("issues/41", "PATCH"),
     ]
@@ -1352,6 +1617,11 @@ def publication_main_transport(
             return {"artifacts": [{
                 "id": 200001, "name": "release-stage-1-50-verify", "expired": False,
             }]}
+        if endpoint == "actions/runs/200/attempts/1/jobs?per_page=100&page=1":
+            return {"jobs": [
+                {"name": name, "status": "completed", "conclusion": "success"}
+                for name in receipts.DEPLOY_JOBS
+            ]}
         if endpoint == "pulls/7":
             return copy.deepcopy(pr)
         if endpoint == f"commits/{source}":
@@ -1427,6 +1697,7 @@ def publication_main_transport(
     monkeypatch.setattr(automation, "api", api)
     monkeypatch.setattr(reporting, "api", api)
     monkeypatch.setattr(evidence, "gh_bytes", gh_bytes)
+    monkeypatch.setattr(reporting, "gh_bytes", gh_bytes)
     monkeypatch.setattr(contract, "gh_bytes", hub_bytes)
     monkeypatch.setattr(reporting.subprocess, "run", download)
     monkeypatch.setattr(reporting, "gate_for_run", observe_gate)
@@ -1707,6 +1978,7 @@ class ObservedGitHub:
     def __init__(self):
         self.writes = []
         self.archive = b""
+        self.stage_artifacts = {}
         self.pr = {
             "number": 7,
             "merged": True,
@@ -1737,6 +2009,7 @@ class ObservedGitHub:
             },
             300: {
                 "id": 300,
+                "run_attempt": 1,
                 "path": ".github/workflows/pineforge-release.yml",
                 "head_sha": MERGE,
                 "event": "workflow_run",
@@ -1775,6 +2048,8 @@ class ObservedGitHub:
             if parts[-1] == "jobs":
                 return {"jobs": copy.deepcopy(self.jobs[run_id])}
             if parts[-1] == "artifacts":
+                if run_id in self.stage_artifacts:
+                    return {"artifacts": copy.deepcopy(self.stage_artifacts[run_id])}
                 name = "release-stage-1-50-verify" if run_id == 200 else "release-receipt-data"
                 return {
                     "artifacts": [
@@ -1801,11 +2076,13 @@ class ObservedGitHub:
 
 
 @pytest.fixture
-def completed_data_receipt(monkeypatch):
+def completed_data_receipt(monkeypatch, tmp_path):
     event = contract.object_json((FIXTURES / "ready-event.json").read_bytes())
     expected = contract.object_json((FIXTURES / "sample-release-receipt.json").read_bytes())
     monkeypatch.setenv("GITHUB_RUN_ID", "300")
     monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
+    monkeypatch.setenv("GITHUB_SHA", MERGE)
     monkeypatch.setenv("RELEASE_RECEIPT_POLICY", (FIXTURES / "receipt-policy.json").read_text())
     monkeypatch.setattr(receipts, "timestamp", lambda: "2020-01-01T00:07:00Z")
     monkeypatch.setattr(reporting, "timestamp", lambda: "2020-01-01T00:07:00Z")
@@ -1834,7 +2111,20 @@ def completed_data_receipt(monkeypatch):
     monkeypatch.setattr(
         reporting, "inventory", lambda repo, route, key: client.api(f"repos/{repo}/{route}")[key]
     )
-    monkeypatch.setattr(reporting, "artifact_json", lambda *args: copy.deepcopy(staged))
+    original_bytes = evidence.gh_bytes
+
+    def stage_bytes(route, **kwargs):
+        if route == f"repos/{REPO}/actions/artifacts/200/zip":
+            archive = io.BytesIO()
+            with zipfile.ZipFile(archive, "w") as zipped:
+                zipped.writestr("release-receipt.json", receipts.canonical(staged))
+            return archive.getvalue()
+        if route.startswith(f"repos/{REPO}/actions/runs/200/artifacts?"):
+            return contract.json_bytes(client.api(route))
+        return original_bytes(route, **kwargs)
+
+    monkeypatch.setattr(reporting, "gh_bytes", stage_bytes)
+    monkeypatch.setattr(evidence, "gh_bytes", stage_bytes)
     monkeypatch.setattr(
         reporting, "hub_manifest", lambda version: (FIXTURES / "release-manifest.json").read_bytes()
     )
@@ -1874,8 +2164,13 @@ def completed_data_receipt(monkeypatch):
         (Path(command[-1]) / "evidence.json").write_bytes(contract.json_bytes(main_gate))
 
     monkeypatch.setattr(reporting.subprocess, "run", download)
-    report = receipts.receipt(None)
-    reporting.publication(REPO, 200, report)
+    path = tmp_path / "coordinator" / "release-receipt.json"
+    with monkeypatch.context() as cli:
+        cli.setattr(sys, "argv", [
+            "release_chain.reporting", "publication", "--run", "200", "--receipt", str(path),
+        ])
+        reporting.main()
+    report = contract.object_json(path.read_bytes())
     assert verified_versions == ["0.3.1", "0.3.0"]
     assert report == expected
     return report, event, client, hub.profile("data")
@@ -1967,6 +2262,77 @@ def test_moved_reporting_source_queues_a_trusted_immutable_tag_run(completed_dat
             },
         )
     ]
+
+
+@pytest.mark.parametrize("moved", ["publisher", "reporter"])
+@pytest.mark.parametrize("fault", [
+    None, "version", "source", "publisher-attempt", "publisher-state",
+    "reporter-head", "missing-publisher-stage",
+])
+def test_cli_source_repair_handoff_is_silent_after_full_publication_checks(
+    completed_data_receipt, tmp_path, monkeypatch, moved, fault
+):
+    _report, _event, client, _policy = completed_data_receipt
+    client.runs[200 if moved == "publisher" else 300]["head_sha"] = "9" * 40
+    client.runs[80] = {
+        "id": 80, "run_attempt": 1, "head_sha": MERGE, "event": "push",
+        "head_branch": "main", "path": ".github/workflows/ci-post.yml",
+    }
+    client.jobs[300] = [{"name": "reconcile", "status": "completed", "conclusion": "success"}]
+    produced = tmp_path / "handoff"
+    monkeypatch.setenv("GITHUB_SHA", client.runs[300]["head_sha"])
+    monkeypatch.setattr(sys, "argv", [
+        "release_chain.reporting", "publication", "--run", "200",
+        "--receipt", str(produced / "release-receipt.json"),
+    ])
+    reporting.main()
+    directory = tmp_path / "handoff-download"
+    witness = produced / "producer-outcome.json"
+    client.stage_artifacts[300] = []
+    if witness.exists():
+        stage = directory / "release-stage-1-10-adapter"
+        stage.mkdir(parents=True)
+        (stage / witness.name).write_bytes(witness.read_bytes())
+        client.stage_artifacts[300] = [{
+            "id": 30010, "name": stage.name, "expired": False,
+        }]
+        if fault in {"version", "source"}:
+            decision = contract.object_json((stage / witness.name).read_bytes())
+            decision["inputs"]["version" if fault == "version" else "source"] = (
+                "8.9.10" if fault == "version" else "8" * 40
+            )
+            (stage / witness.name).write_bytes(contract.json_bytes(decision))
+    if fault == "publisher-attempt":
+        client.runs[200]["run_attempt"] += 1
+    elif fault == "publisher-state":
+        client.runs[200]["conclusion"] = "failure"
+    elif fault == "reporter-head":
+        client.runs[300]["head_sha"] = "8" * 40
+    elif fault == "missing-publisher-stage":
+        client.stage_artifacts[200] = []
+    monkeypatch.setenv("GITHUB_OUTPUT", str(tmp_path / "handoff-outputs"))
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "handoff-summary"))
+    monkeypatch.setenv("FAILED", "false")
+    monkeypatch.setenv("STAGE", "reconcile")
+    monkeypatch.setenv("RELEASE_ALERT_OWNER", "release-owner")
+    monkeypatch.setattr(sys, "argv", [
+        "release_chain.reporting", "collect", "--directory", str(directory),
+        "--receipt", str(tmp_path / "handoff-public-receipt.json"),
+    ])
+    if fault:
+        with pytest.raises(ValueError):
+            reporting.main()
+        assert not (tmp_path / "handoff-outputs").exists()
+    else:
+        reporting.main()
+        assert (tmp_path / "handoff-outputs").read_text() == "has_event=false\n"
+    assert not (tmp_path / "handoff-public-receipt.json").exists()
+    assert not (produced / "release-receipt.json").exists()
+    assert len(client.writes) == 1
+    assert client.writes[0][1] == (
+        "actions/workflows/release.yml/dispatches" if moved == "publisher"
+        else "actions/workflows/pineforge-release.yml/dispatches"
+    )
 
 
 def test_only_the_documented_replay_upload_can_skip(completed_data_receipt):
@@ -2616,14 +2982,28 @@ def test_successful_manual_pr_run_reports_progress_without_claiming_deploy(
     monkeypatch.setattr(
         reporting,
         "inventory",
-        lambda *args: [
-            {
+        lambda _repo, _endpoint, key: (
+            client.jobs[200] if key == "jobs" else [{
+                "id": 200,
                 "name": f"release-stage-{publisher['run_attempt']}-10-manual",
                 "expired": False,
-            }
-        ],
+            }]
+        ),
     )
-    monkeypatch.setattr(reporting, "artifact_json", lambda *args: copy.deepcopy(progress))
+    client.jobs[200].append({
+        "name": "manual-pr", "status": "completed", "conclusion": "success",
+    })
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as zipped:
+        zipped.writestr("release-receipt.json", receipts.canonical(progress))
+    original_bytes = reporting.gh_bytes
+
+    def stage_bytes(route, **kwargs):
+        if route == f"repos/{REPO}/actions/artifacts/200/zip":
+            return archive.getvalue()
+        return original_bytes(route, **kwargs)
+
+    monkeypatch.setattr(reporting, "gh_bytes", stage_bytes)
     result = receipts.receipt(None)
     reporting.publication(REPO, 200, result)
     assert result["state"] == "pr_open" and result["deploy"] is None

@@ -93,4 +93,4 @@ jobs:
           FAILED: 'true'
           STAGE: receipt-transport
           RELEASE_ALERT_OWNER: ${{ vars.RELEASE_ALERT_OWNER }}
-        run: python -m release_chain.reporting collect --receipt incident-release-receipt.json
+        run: python -m release_chain.reporting incident --receipt incident-release-receipt.json

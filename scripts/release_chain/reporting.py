@@ -35,14 +35,62 @@ from .receipts import (
     timestamp,
 )
 
+REPORT_STAGES = {"10-adapter", "10-manual", "20-prepare", "30-github", "40-publish", "50-verify"}
 
-def collect(directory: Path, *, failed: bool, stage: str) -> dict[str, Any]:
+
+def snapshot_identity(report: dict[str, Any], run_id: int, attempt: int) -> None:
+    """Check provenance before a snapshot can be relabelled or forwarded."""
+    require(set(report) == FIELDS, "release-snapshot-invalid: receipt fields differ")
+    require(
+        report["schema"] == "pineforge/consumer-receipt/v1"
+        and report["consumer"] == "data"
+        and isinstance(report["event_id"], str)
+        and bool(report["event_id"])
+        and isinstance(report["release_version"], str)
+        and bool(report["release_version"]),
+        "release-snapshot-invalid: expected a targeted data receipt",
+    )
+    require(
+        run_id > 0
+        and attempt > 0
+        and type(report["attempt"]) is int
+        and report["attempt"] == run_id
+        and type(report["sequence"]) is int
+        and report["sequence"] == attempt,
+        f"release-snapshot-attempt-mismatch: expected run {run_id} attempt {attempt}",
+    )
+
+
+def collect(
+    directory: Path, *, failed: bool, stage: str, require_snapshot: bool = False
+) -> dict[str, Any]:
+    # Target-less observations are still useful to local incident callers.
+    # The report command always requires a real snapshot; only incident mode
+    # may continue without one, and that mode cannot enable receipt transport.
+    run_id = int(os.environ.get("GITHUB_RUN_ID", "1"))
+    attempt = int(os.environ.get("GITHUB_RUN_ATTEMPT", "1"))
+    prefix = f"release-stage-{attempt}-"
     paths = sorted(directory.glob("release-stage-*/release-receipt.json"))
-    report = object_json(paths[-1].read_bytes()) if paths else receipt(None, stage)
-    require(set(report) == FIELDS, "receipt fields differ from the hub contract")
+    current = [path for path in paths if path.parent.name.startswith(prefix)]
+    if require_snapshot:
+        require(
+            current or not paths,
+            f"release-snapshot-attempt-mismatch: no snapshot for run {run_id} attempt {attempt}",
+        )
+        require(current, f"release-snapshot-missing: run {run_id} attempt {attempt}")
+    report = receipt(None, stage)
+    for path in current:
+        require(
+            path.parent.name[len(prefix) :] in REPORT_STAGES,
+            f"release-snapshot-invalid: unregistered stage {path.parent.name}",
+        )
+        try:
+            loaded = object_json(path.read_bytes())
+        except (OSError, ValueError) as error:
+            raise ValueError(f"release-snapshot-invalid: {path.parent.name}") from error
+        snapshot_identity(loaded, run_id, attempt)
+        report = loaded
     if failed:
-        report["attempt"] = int(os.environ.get("GITHUB_RUN_ID", "1"))
-        report["sequence"] = int(os.environ.get("GITHUB_RUN_ATTEMPT", "1"))
         report["state"] = "failed"
         report["timestamp"] = timestamp()
     return report
@@ -149,7 +197,10 @@ def publication(repo: str, run_id: int, report: dict[str, Any]) -> None:
     require(type(run_id) is int and run_id > 0, "invalid publication run ID")
     run = api(repo, f"actions/runs/{run_id}")
     require(
-        run["path"] == ".github/workflows/release.yml"
+        run.get("id") == run_id
+        and type(run.get("run_attempt")) is int
+        and run["run_attempt"] > 0
+        and run["path"] == ".github/workflows/release.yml"
         and run["event"] in {"workflow_run", "workflow_dispatch"}
         and run["status"] == "completed",
         "untrusted or incomplete publisher",
@@ -161,12 +212,15 @@ def publication(repo: str, run_id: int, report: dict[str, Any]) -> None:
         for row in artifacts
         if not row["expired"]
         and row["name"].startswith(prefix)
-        and row["name"][len(prefix) : 2 + len(prefix)] in {"10", "20", "30", "40", "50"}
+        and row["name"][len(prefix) :]
+        in {"10-manual", "20-prepare", "30-github", "40-publish", "50-verify"}
     )
-    if not stages:
-        return  # An ordinary main push/manual pre-manifest package has no product target.
+    require(
+        stages,
+        f"release-snapshot-missing: publisher run {run_id} attempt {run['run_attempt']}",
+    )
     loaded = artifact_json(repo, run_id, stages[-1], "release-receipt.json")
-    require(set(loaded) == FIELDS, "publisher receipt fields differ")
+    snapshot_identity(loaded, run_id, run["run_attempt"])
     report.update(loaded)
     report.update(
         attempt=int(os.environ["GITHUB_RUN_ID"]),
@@ -208,22 +262,31 @@ def publication(repo: str, run_id: int, report: dict[str, Any]) -> None:
     # Source remains data: never check out or execute the PR head or artifact scripts.
     with tempfile.TemporaryDirectory() as temporary:
         bundle = Path(temporary)
-        subprocess.run(
-            [
-                "gh",
-                "run",
-                "download",
-                str(run_id),
-                "--repo",
-                repo,
-                "--name",
-                f"validated-release-bundle-{run['run_attempt']}",
-                "--dir",
-                str(bundle),
-            ],
-            check=True,
-        )
-        main_gate = object_json((bundle / "evidence.json").read_bytes())
+        bundle_name = f"validated-release-bundle-{run['run_attempt']}"
+        try:
+            subprocess.run(
+                [
+                    "gh",
+                    "run",
+                    "download",
+                    str(run_id),
+                    "--repo",
+                    repo,
+                    "--name",
+                    bundle_name,
+                    "--dir",
+                    str(bundle),
+                ],
+                check=True,
+            )
+        except subprocess.CalledProcessError as error:
+            raise ValueError(
+                f"release-bundle-unavailable: run {run_id} artifact {bundle_name}"
+            ) from error
+        try:
+            main_gate = object_json((bundle / "evidence.json").read_bytes())
+        except (OSError, ValueError) as error:
+            raise ValueError(f"release-bundle-invalid: {bundle_name} evidence") from error
         fresh_gate = gate_for_run(repo, main_gate["run_id"], head=source)
         require(
             json_bytes(semantic_evidence_identity(fresh_gate))
@@ -330,7 +393,9 @@ def retain(repo: str, report: dict[str, Any]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("collect", "publication", "retain", "callback"))
+    parser.add_argument(
+        "command", choices=("collect", "publication", "retain", "callback", "incident")
+    )
     parser.add_argument("--directory", type=Path, default=Path("receipts"))
     parser.add_argument("--receipt", type=Path, default=Path("release-receipt.json"))
     parser.add_argument("--run", type=int)
@@ -345,14 +410,33 @@ def main() -> None:
             raise
         finally:
             finish(report, args.receipt)
-    elif args.command == "collect":
-        report = collect(
-            args.directory, failed=os.environ["FAILED"] == "true", stage=os.environ["STAGE"]
+    elif args.command in {"collect", "incident"}:
+        incident_only = args.command == "incident"
+        require(
+            not incident_only or os.environ["FAILED"] == "true",
+            "incident mode requires a failed report",
         )
+        try:
+            report = collect(
+                args.directory,
+                failed=os.environ["FAILED"] == "true",
+                stage=os.environ["STAGE"],
+                require_snapshot=not incident_only,
+            )
+        except ValueError:
+            if not incident_only:
+                raise
+            # Invalid release evidence must not prevent a run-scoped incident.
+            # This target-less object is never written or sent to the hub.
+            report = receipt(None)
+            report["state"] = "failed"
         # Stored verified replays are checked, but do not re-emit an old snapshot
         # under a new reporting source/run. Polling can recover the original artifact.
-        has_event = bool(report["event_id"]) and report["attempt"] == int(
-            os.environ["GITHUB_RUN_ID"]
+        has_event = (
+            not incident_only
+            and bool(report["event_id"])
+            and report["attempt"] == int(os.environ["GITHUB_RUN_ID"])
+            and report["sequence"] == int(os.environ["GITHUB_RUN_ATTEMPT"])
         )
         if (
             has_event

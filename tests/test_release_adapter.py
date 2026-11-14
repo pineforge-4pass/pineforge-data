@@ -1636,7 +1636,7 @@ def test_failed_downstream_job_overrides_earlier_green_receipt(tmp_path, ready) 
     event, _manifest = ready
     report = automation.receipt(event, "prepare")
     report["state"] = "deploying"
-    directory = tmp_path / "release-stage-1-20-prepare"
+    directory = tmp_path / f"release-stage-{report['sequence']}-20-prepare"
     directory.mkdir()
     (directory / "release-receipt.json").write_bytes(contract.json_bytes(report))
     result = reporting.collect(tmp_path, failed=True, stage="publication")

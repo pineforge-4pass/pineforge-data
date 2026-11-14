@@ -1306,8 +1306,14 @@ def publication_main_transport(
     saved = reporting.gate_for_run(REPO, python["id"], head=source)
     assert set(saved["main_proofs"]) == {"network", "native"}
     assert state["main_validations"][-1] == saved
+    publisher = {
+        "id": 200, "run_attempt": 1, "path": ".github/workflows/release.yml",
+        "event": "workflow_run", "head_sha": source,
+        "status": "completed", "conclusion": "success",
+    }
     staged = contract.object_json((FIXTURES / "sample-release-receipt.json").read_bytes())
     staged.update(
+        attempt=publisher["id"], sequence=publisher["run_attempt"],
         pr=automation.pr_identity(pr), state="deploying",
         deployed=receipts.served(event, source, "0.3.1", saved["distributions"]),
     )
@@ -1341,11 +1347,7 @@ def publication_main_transport(
         assert data is None
         state["publication_reads"].append(endpoint)
         if endpoint == "actions/runs/200":
-            return {
-                "id": 200, "run_attempt": 1, "path": ".github/workflows/release.yml",
-                "event": "workflow_run", "head_sha": source,
-                "status": "completed", "conclusion": "success",
-            }
+            return copy.deepcopy(publisher)
         if endpoint == "actions/runs/200/artifacts?per_page=100&page=1":
             return {"artifacts": [{
                 "id": 200001, "name": "release-stage-1-50-verify", "expired": False,
@@ -2604,8 +2606,10 @@ def test_successful_manual_pr_run_reports_progress_without_claiming_deploy(
     completed_data_receipt, monkeypatch
 ):
     report, _event, client, _policy = completed_data_receipt
+    publisher = client.runs[200]
     progress = copy.deepcopy(report)
     progress.update(
+        attempt=publisher["id"], sequence=publisher["run_attempt"],
         state="pr_open", ci=None, e2e=None, deploy=None, preview=None, deployed=None, previous=None
     )
     progress["pr"]["merge"] = None
@@ -2614,7 +2618,7 @@ def test_successful_manual_pr_run_reports_progress_without_claiming_deploy(
         "inventory",
         lambda *args: [
             {
-                "name": "release-stage-1-10-manual",
+                "name": f"release-stage-{publisher['run_attempt']}-10-manual",
                 "expired": False,
             }
         ],

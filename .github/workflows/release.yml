@@ -472,14 +472,15 @@ jobs:
 
   report:
     if: >-
-      !cancelled() && needs.authz.result == 'success' && !inputs.claim_placeholder
-    needs: [authz, manual-pr, prepare, build, github-release, publish, verify]
+      !cancelled() && needs.authz.result == 'success'
+    needs: [authz, claim-name, manual-pr, prepare, build, github-release, publish, verify]
     uses: ./.github/workflows/release-report.yml
     permissions:
       contents: read
       actions: read
       issues: write
     with:
+      orchestration: ${{ toJSON(needs) }}
       failed: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
-      stage: ${{ needs.publish.result == 'failure' && 'pypi-upload' || needs.verify.result == 'failure' && 'verify-publication' || needs.github-release.result == 'failure' && 'github-release' || needs.build.result == 'failure' && 'distribution-transfer' || needs.prepare.result == 'failure' && 'prepare-publication' || needs.manual-pr.result == 'failure' && 'prepare-pr' || 'publication' }}
+      stage: ${{ needs.publish.result == 'failure' && 'pypi-upload' || needs.verify.result == 'failure' && 'verify-publication' || needs.github-release.result == 'failure' && 'github-release' || needs.build.result == 'failure' && 'distribution-transfer' || needs.prepare.result == 'failure' && 'prepare-publication' || needs.manual-pr.result == 'failure' && 'prepare-pr' || needs.claim-name.result == 'failure' && 'claim-placeholder' || 'publication' }}
     secrets: inherit

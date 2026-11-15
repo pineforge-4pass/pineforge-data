@@ -2168,6 +2168,47 @@ def test_cli_stored_replay_preserves_original_identity_after_real_verification(
     assert "**verified**" in (state["root"] / "report-summary").read_text()
 
 
+@pytest.mark.parametrize("status", ["queued", "in_progress", None], ids=["queued", "running", "null"])
+def test_cli_stored_replay_uses_needs_completion_when_job_api_lags(
+    replay_cli_job, monkeypatch, status
+):
+    state = replay_cli_job
+    run = state["cli_run"]
+    run.update(
+        event="workflow_dispatch", repository={"full_name": "owner/data"},
+        head_repository={"full_name": "owner/data"},
+    )
+    job = state["cli_jobs"][0]
+    job.update(
+        status=status, conclusion=None, run_id=run["id"],
+        run_attempt=run["run_attempt"], head_sha=run["head_sha"],
+    )
+    state["cli_jobs"].append({
+        "name": "authz", "status": "completed", "conclusion": "success",
+        "run_id": run["id"], "run_attempt": run["run_attempt"], "head_sha": run["head_sha"],
+    })
+    path = state["root"] / "lag-workflow-event.json"
+    path.write_bytes(contract.json_bytes({
+        "repository": {"full_name": "owner/data"}, "ref": "refs/heads/main",
+        "inputs": {"publication_run": ""},
+    }))
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(path))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("RELEASE_NEEDS", contract.json_bytes({
+        "authz": {"result": "success", "outputs": {}},
+        "reconcile": {"result": "success", "outputs": {}},
+    }).decode())
+    original = (state["cli_stage"] / "release-receipt.json").read_bytes()
+    replay_collect_cli(state, monkeypatch)
+    assert (state["cli_stage"] / "release-receipt.json").read_bytes() == original
+    assert original == receipts.canonical(state["saved"])
+    assert (state["root"] / "report-outputs").read_text() == "has_event=false\n"
+    assert not (state["root"] / "report-release-receipt.json").exists()
+    assert state["reads"].count("https://pypi.org/pypi/pineforge-data/0.3.1/json") == 4
+    assert all(method == "GET" for _, method in state["cli_calls"])
+    assert state["processes"] == []
+
+
 @pytest.mark.parametrize("fault", [
     "missing-witness", "witness-json", "witness-run", "witness-attempt", "witness-head",
     "witness-schema", "witness-reason", "witness-digest", "witness-extra", "input-extra",
@@ -2177,30 +2218,30 @@ def test_cli_stored_replay_preserves_original_identity_after_real_verification(
 def test_cli_stored_replay_requires_independent_proof(replay_cli_job, monkeypatch, fault):
     state = replay_cli_job
     stage = state["cli_stage"]
+    assert (stage / "producer-outcome.json").is_file()
+    assert (stage / "release-receipt.json").is_file()
     if fault == "missing-witness":
         # Keep the withheld bytes outside the downloaded stage.
         path = stage / "producer-outcome.json"
-        if path.exists():
-            path.rename(state["root"] / "withheld-producer-outcome.json")
+        path.rename(state["root"] / "withheld-producer-outcome.json")
     elif fault.startswith("witness-") or fault == "input-extra":
         path = stage / "producer-outcome.json"
-        if path.exists():
-            value = contract.object_json(path.read_bytes())
-            if fault in {"witness-run", "witness-attempt"}:
-                value["run_id" if fault == "witness-run" else "run_attempt"] += 1
-            elif fault == "witness-head":
-                value["head_sha"] = "9" * 40
-            elif fault == "witness-schema":
-                value["schema"] = "pineforge/consumer-receipt/v1"
-            elif fault == "witness-reason":
-                value["reason"] = "ordinary-main"
-            elif fault == "witness-digest":
-                value["receipt_sha256"] = "0" * 64
-            elif fault == "input-extra":
-                value["inputs"]["ignored"] = True
-            else:
-                value["ignored"] = True
-            path.write_bytes(b"{" if fault == "witness-json" else contract.json_bytes(value))
+        value = contract.object_json(path.read_bytes())
+        if fault in {"witness-run", "witness-attempt"}:
+            value["run_id" if fault == "witness-run" else "run_attempt"] += 1
+        elif fault == "witness-head":
+            value["head_sha"] = "9" * 40
+        elif fault == "witness-schema":
+            value["schema"] = "pineforge/consumer-receipt/v1"
+        elif fault == "witness-reason":
+            value["reason"] = "ordinary-main"
+        elif fault == "witness-digest":
+            value["receipt_sha256"] = "0" * 64
+        elif fault == "input-extra":
+            value["inputs"]["ignored"] = True
+        else:
+            value["ignored"] = True
+        path.write_bytes(b"{" if fault == "witness-json" else contract.json_bytes(value))
     elif fault == "snapshot-attempt":
         path = stage / "release-receipt.json"
         value = contract.object_json(path.read_bytes())
@@ -2223,7 +2264,27 @@ def test_cli_stored_replay_requires_independent_proof(replay_cli_job, monkeypatc
         state["cli_run"]["run_attempt"] += 1
     else:
         state["cli_jobs"][0]["conclusion"] = "skipped"
-    with pytest.raises(ValueError):
+    cause = {
+        "missing-witness": "release-snapshot-attempt-mismatch:",
+        "witness-json": "release-snapshot-invalid:",
+        "witness-run": "release-producer-outcome-invalid: envelope or producer job differs",
+        "witness-attempt": "release-producer-outcome-invalid: envelope or producer job differs",
+        "witness-head": "release-producer-outcome-invalid: envelope or producer job differs",
+        "witness-schema": "release-producer-outcome-invalid: envelope or producer job differs",
+        "witness-reason": "release-producer-outcome-invalid: missing replay proof",
+        "witness-digest": "release-producer-outcome-invalid: missing replay proof",
+        "witness-extra": "release-producer-outcome-invalid: envelope or producer job differs",
+        "input-extra": "release-replay-invalid: installed source/version missing",
+        "snapshot-attempt": "release-producer-outcome-invalid: missing replay proof",
+        "stored-pin": "release-replay-invalid: immutable stored receipt differs",
+        "stored-state": "release-replay-invalid: immutable stored receipt differs",
+        "installed-lock": "release-replay-invalid: installed target differs",
+        "installed-version": "release-replay-invalid: installed target differs",
+        "served-bytes": "PyPI bytes differ",
+        "adapter-attempt": "release-producer-run-mismatch:",
+        "producer-skipped": "release-producer-job-mismatch: producer did not execute",
+    }[fault]
+    with pytest.raises(ValueError, match="^" + cause):
         replay_collect_cli(state, monkeypatch)
     assert not (state["root"] / "report-release-receipt.json").exists()
     assert not (state["root"] / "report-outputs").exists()
@@ -2270,7 +2331,8 @@ def test_cli_recovery_handoff_uses_real_gates_and_emits_no_new_receipt(
     saved_stage = contract.object_json((FIXTURES / "sample-release-receipt.json").read_bytes())
     saved_stage.update(
         attempt=400, sequence=4, state="deploying",
-        pr=automation.pr_identity(pr, base="b" * 40),
+        pr={"number": 7, "base": "main", "base_sha": "b" * 40,
+            "head": "a" * 40, "merge": source},
     )
     saved_stage["deployed"]["source"] = source
     observed_api, proof_bytes = automation.api, evidence.gh_bytes

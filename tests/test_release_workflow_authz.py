@@ -145,15 +145,11 @@ def assert_workflow_authz(workflow: dict[str, Any]) -> None:
             needs = [needs]
         assert "authz" in needs, f"{job_id}: needs authz"
 
-    report_tail = (
-        "needs.reconcile.result != 'skipped'"
-        if "reconcile" in jobs
-        else "!inputs.claim_placeholder"
-    )
     report = jobs["report"]
-    assert report["if"] == (
-        f"!cancelled() && {AUTHZ_PASSED} && {report_tail}"
-    ), "report: authz condition"
+    condition = f"!cancelled() && {AUTHZ_PASSED}"
+    if "reconcile" in jobs:
+        condition += " && needs.reconcile.result != 'skipped'"
+    assert report["if"] == condition, "report: authz condition"
     assert report["uses"] == "./.github/workflows/release-report.yml"
     assert report["secrets"] == "inherit"
 
@@ -221,12 +217,53 @@ def test_diagnostics_preserve_the_failed_stage_without_enabling_transport() -> N
     fallback = steps[-1]
     assert fallback["if"] == "failure()"
     assert fallback["env"]["STAGE"] == "${{ inputs.failed && inputs.stage || 'receipt-transport' }}"
+    assert fallback["env"]["FAILED"] == "${{ inputs.failed }}"
     assert fallback["run"] == (
         "python -m release_chain.reporting incident --receipt incident-release-receipt.json"
     )
     upload = next(step for step in steps if step.get("id") == "upload")
     assert upload["with"]["path"] == "release-receipt.json"
     assert upload["if"] == "inputs.hub && steps.receipt.outputs.has_event == 'true'"
+
+
+@pytest.mark.parametrize("name", RELEASE_WORKFLOWS)
+def test_actual_report_call_passes_complete_needs_without_a_verdict_override(name: str) -> None:
+    report = load(name)["jobs"]["report"]
+    assert report["with"]["orchestration"] == "${{ toJSON(needs) }}"
+    assert set(report["needs"]) == (
+        {"authz", "reconcile"} if name == "pineforge-release.yml" else {
+            "authz", "claim-name", "manual-pr", "prepare", "build", "github-release",
+            "publish", "verify",
+        }
+    )
+    if name == "release.yml":
+        assert report["if"] == "!cancelled() && needs.authz.result == 'success'"
+        assert "needs.claim-name.result == 'failure' && 'claim-placeholder'" in report["with"]["stage"]
+
+
+def test_run_context_is_private_data_captured_before_artifact_transport() -> None:
+    workflow = load("release-report.yml")
+    assert workflow["on"]["workflow_call"]["inputs"]["orchestration"] == {
+        "type": "string", "required": "true",
+    }
+    job = workflow["jobs"]["report"]
+    assert job["env"]["RELEASE_NEEDS"] == "${{ inputs.orchestration }}"
+    steps = job["steps"]
+    capture = next(step for step in steps if step.get("run") == "python -m release_chain.reporting context")
+    download = next(step for step in steps if step.get("uses", "").startswith("actions/download-artifact@"))
+    collect = next(step for step in steps if step.get("id") == "receipt")
+    private = next(
+        step for step in steps
+        if step.get("with", {}).get("name") == "release-run-context-${{ github.run_attempt }}"
+    )
+    assert steps.index(capture) < steps.index(download) < steps.index(collect) < steps.index(private)
+    assert "if" not in capture and "continue-on-error" not in capture
+    assert private["if"] == "always()"
+    assert private["with"]["path"] == "run-context.json"
+    assert private["with"]["if-no-files-found"] == "error"
+    public = next(step for step in steps if step.get("id") == "upload")
+    assert public["with"]["path"] == "release-receipt.json"
+    assert public["with"]["name"] == "release-receipt-data"
 
 
 @pytest.mark.parametrize("name", RELEASE_WORKFLOWS)
@@ -238,8 +275,8 @@ def test_structure_checker_rejects_unsafe_mutations(name: str, mutation: str) ->
         before, after = "    needs: authz\n", ""
         finding = "needs authz"
     elif mutation == "unguarded-report":
-        before = f"  report:\n    if: >-\n      !cancelled() && {AUTHZ_PASSED} && "
-        after = "  report:\n    if: >-\n      !cancelled() && "
+        before = f"  report:\n    if: >-\n      !cancelled() && {AUTHZ_PASSED}"
+        after = "  report:\n    if: >-\n      !cancelled()"
         finding = "report: authz condition"
     else:
         before = f'ALLOWED_BOTS: "{ALLOWED_BOTS}"'

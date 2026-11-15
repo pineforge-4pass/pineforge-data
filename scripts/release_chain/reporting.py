@@ -48,6 +48,10 @@ STAGE_JOBS = {
     "10-adapter": "reconcile", "10-manual": "manual-pr", "20-prepare": "prepare",
     "30-github": "github-release", "40-publish": "publish", "50-verify": "verify",
 }
+RUN_CONTEXT_FILE = "run-context.json"
+RUN_CONTEXT_PREFIX = "release-run-context-"
+RELEASE_NEEDS = {"authz", "claim-name", "manual-pr", *DEPLOY_JOBS}
+ADAPTER_NEEDS = {"authz", "reconcile"}
 NO_TARGET_STAGES = {
     "ordinary-main": {"20-prepare"},
     "main-proofs-pending": {"20-prepare"},
@@ -58,6 +62,7 @@ NO_TARGET_STAGES = {
     "publisher-handoff": {"10-adapter"},
     "reporter-handoff": {"10-adapter"},
     "publisher-no-target": {"10-adapter"},
+    "publisher-no-producer": {"10-adapter"},
 }
 NO_TARGET_INPUTS = {
     "ordinary-main": {"ci_run", "ci_attempt", "source"},
@@ -69,6 +74,7 @@ NO_TARGET_INPUTS = {
     "publisher-handoff": {"publication_run", "ci_run", "version", "source"},
     "reporter-handoff": {"publication_run", "version", "source"},
     "publisher-no-target": {"publication_run", "publication_attempt", "outcome_sha256"},
+    "publisher-no-producer": {"publication_run", "publication_attempt", "context_sha256"},
 }
 
 
@@ -76,7 +82,7 @@ def current_run(repo: str) -> dict[str, Any]:
     run_id, attempt = int(os.environ["GITHUB_RUN_ID"]), int(os.environ["GITHUB_RUN_ATTEMPT"])
     run = api(repo, f"actions/runs/{run_id}")
     require(
-        type(run.get("id")) is int and run["id"] == run_id > 0
+        isinstance(run, dict) and type(run.get("id")) is int and run["id"] == run_id > 0
         and type(run.get("run_attempt")) is int and run["run_attempt"] == attempt > 0
         and run.get("path") in {
             ".github/workflows/release.yml", ".github/workflows/" + WORKFLOW,
@@ -89,13 +95,16 @@ def current_run(repo: str) -> dict[str, Any]:
 
 
 def stage_rows(artifacts: list[Any], run: dict[str, Any]) -> list[dict[str, Any]]:
+    require(
+        all(isinstance(row, dict) and isinstance(row.get("name"), str) for row in artifacts),
+        "release-snapshot-invalid: malformed artifact inventory",
+    )
     prefix = f"release-stage-{run['run_attempt']}-"
     rows = [row for row in artifacts if row["name"].startswith(prefix)]
     require(
         rows or not any(row["name"].startswith("release-stage-") for row in artifacts),
         f"release-snapshot-attempt-mismatch: run {run['id']} attempt {run['run_attempt']}",
     )
-    require(rows, f"release-snapshot-missing: run {run['id']} attempt {run['run_attempt']}")
     allowed = REPORT_STAGES - {"10-adapter"}
     if run["path"] == ".github/workflows/" + WORKFLOW:
         allowed = {"10-adapter"}
@@ -111,8 +120,242 @@ def stage_rows(artifacts: list[Any], run: dict[str, Any]) -> list[dict[str, Any]
     return sorted(rows, key=lambda row: row["name"])
 
 
-def producer_job(stage: str, jobs: list[Any]) -> dict[str, Any]:
+def checked_context(
+    repo: str, run: dict[str, Any], jobs: list[Any], context: dict[str, Any],
+) -> dict[str, Any]:
+    """Check private workflow observations, never an expected product verdict."""
+    expected = ADAPTER_NEEDS if run["path"].endswith("/" + WORKFLOW) else RELEASE_NEEDS
+    require(
+        set(context) == {
+            "repository", "run_id", "run_attempt", "head_sha", "event_name", "event", "needs",
+        }
+        and context["repository"] == repo
+        and type(context["run_id"]) is int and context["run_id"] == run["id"]
+        and type(context["run_attempt"]) is int and context["run_attempt"] == run["run_attempt"]
+        and isinstance(context["head_sha"], str)
+        and re.fullmatch(r"[0-9a-f]{40}", context["head_sha"])
+        and context["head_sha"] == run["head_sha"]
+        and context["event_name"] == run["event"]
+        and isinstance(context["event"], dict) and isinstance(context["needs"], dict)
+        and (run.get("repository") or {}).get("full_name") == repo
+        and (run.get("head_repository") or {}).get("full_name") == repo,
+        "release-run-context-invalid: run binding differs",
+    )
+    event, needs = context["event"], context["needs"]
+    require(
+        (event.get("repository") or {}).get("full_name") == repo and set(needs) == expected,
+        "release-run-context-invalid: repository or needs inventory differs",
+    )
+    for name, observation in needs.items():
+        require(
+            isinstance(observation, dict) and set(observation) == {"result", "outputs"}
+            and isinstance(observation["result"], str)
+            and observation["result"] in {"success", "failure", "cancelled", "skipped"}
+            and isinstance(observation["outputs"], dict)
+            and all(isinstance(key, str) and isinstance(value, str)
+                    for key, value in observation["outputs"].items()),
+            "release-run-context-invalid: malformed needs observation",
+        )
+    require(needs["authz"]["result"] == "success", "release-run-context-invalid: authz did not pass")
+    require(
+        all(isinstance(job, dict) and isinstance(job.get("name"), str) for job in jobs)
+        and len({job["name"] for job in jobs}) == len(jobs)
+        and {job["name"] for job in jobs} <= expected | {"report", "report / report"}
+        and expected <= {job["name"] for job in jobs},
+        "release-producer-job-mismatch: current job names differ from needs",
+    )
+    for job in jobs:
+        require(
+            "status" in job and "conclusion" in job
+            and type(job.get("run_id")) is int and job["run_id"] == run["id"]
+            and type(job.get("run_attempt")) is int and job["run_attempt"] == run["run_attempt"]
+            and job.get("head_sha") == run["head_sha"],
+            "release-producer-job-mismatch: job run/attempt/source differs",
+        )
+        if job["name"] not in needs:
+            continue  # The reporting job is still running.
+        result = needs[job["name"]]["result"]
+        status = job.get("status")
+        require(
+            (status == "completed" and job.get("conclusion") == result)
+            or ((status is None or isinstance(status, str) and status in {"queued", "in_progress"})
+                and job.get("conclusion") is None),
+            "release-producer-job-mismatch: API contradicts workflow needs",
+        )
+    if run["event"] == "workflow_run":
+        source = event.get("workflow_run")
+        require(
+            event.get("action") == "completed" and isinstance(source, dict)
+            and type(source.get("id")) is int and source["id"] > 0
+            and type(source.get("run_attempt")) is int and source["run_attempt"] > 0,
+            "release-run-context-invalid: original upstream identity missing",
+        )
+        upstream = api(repo, f"actions/runs/{source['id']}")
+        require(
+            isinstance(upstream, dict) and type(upstream.get("id")) is int
+            and type(upstream.get("run_attempt")) is int,
+            "release-run-context-invalid: malformed checked upstream",
+        )
+        fields = {
+            "id", "run_attempt", "path", "name", "event", "head_branch", "head_sha",
+            "status", "conclusion",
+        }
+        allowed = (
+            {".github/workflows/ci.yml": "CI", ".github/workflows/release.yml": "Release"}
+            if expected == ADAPTER_NEEDS else {
+                ".github/workflows/ci-post.yml": "CI",
+                ".github/workflows/native-feed-post.yml": "Native feed",
+            }
+        )
+        require(
+            all(field in source and source[field] == upstream.get(field) for field in fields)
+            and upstream.get("status") == "completed"
+            and isinstance(upstream.get("conclusion"), str)
+            and upstream["conclusion"] in {
+                "success", "failure", "cancelled", "skipped", "neutral",
+                "timed_out", "action_required", "stale",
+            }
+            and upstream.get("path") in allowed
+            and upstream.get("name") == allowed[upstream["path"]]
+            and isinstance(upstream.get("head_sha"), str)
+            and re.fullmatch(r"[0-9a-f]{40}", upstream["head_sha"])
+            and (source.get("head_repository") or {}).get("full_name") == repo
+            and (upstream.get("head_repository") or {}).get("full_name") == repo
+            and (upstream.get("repository") or {}).get("full_name") == repo,
+            "release-run-context-invalid: checked upstream differs",
+        )
+        require(
+            (expected == RELEASE_NEEDS and upstream["head_branch"] == "main")
+            or (expected == ADAPTER_NEEDS and (
+                upstream["path"] == ".github/workflows/ci.yml" and upstream["event"] == "pull_request"
+                or upstream["path"] == ".github/workflows/release.yml"
+                and upstream["head_branch"] == "main"
+            )),
+            "release-run-context-invalid: upstream cannot invoke this workflow",
+        )
+    elif run["event"] == "workflow_dispatch" and expected == RELEASE_NEEDS:
+        inputs = event.get("inputs")
+        require(
+            isinstance(inputs, dict)
+            and set(inputs) == {"bump", "ci_run", "rollback_package", "claim_placeholder"}
+            and isinstance(inputs["bump"], str) and inputs["bump"] in {"patch", "minor", "major"}
+            and all(inputs[name] is None or isinstance(inputs[name], str)
+                    for name in ("ci_run", "rollback_package"))
+            and isinstance(inputs["claim_placeholder"], str)
+            and inputs["claim_placeholder"] in {"true", "false"},
+            "release-run-context-invalid: original Release inputs missing",
+        )
+    return context
+
+
+def workflow_context(repo: str, directory: Path) -> dict[str, Any] | None:
+    # Only the trusted workflow call supplies needs. The event is the runner's
+    # original event file, not a flag or a product-generated expected decision.
+    if "RELEASE_NEEDS" not in os.environ:
+        return None  # Historical executed producers still need terminal API proof.
+    try:
+        context = {
+            "repository": repo, "run_id": int(os.environ["GITHUB_RUN_ID"]),
+            "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+            "head_sha": os.environ["GITHUB_SHA"], "event_name": os.environ["GITHUB_EVENT_NAME"],
+            "event": object_json(Path(os.environ["GITHUB_EVENT_PATH"]).read_bytes()),
+            "needs": object_json(os.environ["RELEASE_NEEDS"].encode()),
+        }
+    except (OSError, ValueError, KeyError) as error:
+        raise ValueError("release-run-context-invalid: unreadable workflow event/needs") from error
+    # Capture data before any transport/API read. Consumers check it against
+    # independent observations; retaining this file alone grants no decision.
+    directory.parent.mkdir(parents=True, exist_ok=True)
+    (directory.parent / RUN_CONTEXT_FILE).write_bytes(canonical(context))
+    return context
+
+
+def publisher_context(
+    repo: str, run: dict[str, Any], jobs: list[Any], artifacts: list[Any],
+) -> dict[str, Any] | None:
+    name = RUN_CONTEXT_PREFIX + str(run["run_attempt"])
+    rows = [row for row in artifacts if row["name"] == name]
+    require(
+        rows or not any(row["name"].startswith(RUN_CONTEXT_PREFIX) for row in artifacts),
+        "release-run-context-invalid: context attempt differs",
+    )
+    if not rows:
+        return None
+    require(
+        len(rows) == 1 and rows[0]["expired"] is False,
+        "release-run-context-invalid: duplicate or expired context",
+    )
+    raw = gh_bytes(f"repos/{repo}/actions/artifacts/{rows[0]['id']}/zip")
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as zipped:
+            require(
+                zipped.namelist() == [RUN_CONTEXT_FILE],
+                "release-run-context-invalid: context archive layout differs",
+            )
+            context = object_json(zipped.read(RUN_CONTEXT_FILE))
+    except (OSError, zipfile.BadZipFile, ValueError) as error:
+        raise ValueError("release-run-context-invalid: unreadable context archive") from error
+    return checked_context(repo, run, jobs, context)
+
+
+def stage_inventory(
+    rows: list[Any], run: dict[str, Any], context: dict[str, Any] | None,
+) -> None:
+    if context is None:
+        require(rows, f"release-snapshot-missing: run {run['id']} attempt {run['run_attempt']}")
+        return
+    expected = {
+        stage for stage, name in STAGE_JOBS.items()
+        if name in context["needs"] and context["needs"][name]["result"] != "skipped"
+    }
+    prefix = f"release-stage-{run['run_attempt']}-"
+    require(
+        {row["name"][len(prefix):] for row in rows} == expected,
+        "release-snapshot-missing: stage inventory differs from executed producers",
+    )
+
+
+def checked_no_producer(run: dict[str, Any], context: dict[str, Any] | None) -> None:
+    require(
+        context is not None and run["path"] == ".github/workflows/release.yml"
+        and run.get("head_branch") == "main",
+        "release-snapshot-missing: no bound no-producer context",
+    )
+    assert context is not None
+    needs, event = context["needs"], context["event"]
+    require(
+        all(needs[name]["result"] == "skipped" for name in {"manual-pr", *DEPLOY_JOBS}),
+        "release-snapshot-missing: an executed producer requires evidence",
+    )
+    if run["event"] == "workflow_run":
+        source = event["workflow_run"]  # Already re-read and matched in checked_context.
+        require(
+            source["event"] == "workflow_dispatch" and source["head_branch"] == "main"
+            and needs["claim-name"]["result"] == "skipped",
+            "release-run-context-invalid: upstream event requires a producer",
+        )
+    else:
+        require(
+            run["event"] == "workflow_dispatch" and event.get("ref") == "refs/heads/main"
+            and event["inputs"]["claim_placeholder"] == "true"
+            and needs["claim-name"]["result"] == "success",
+            "release-run-context-invalid: dispatch requires a producer",
+        )
+
+
+def producer_job(
+    stage: str, jobs: list[Any], context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     matches = [job for job in jobs if job["name"] == STAGE_JOBS[stage]]
+    if context is not None:
+        result = context["needs"][STAGE_JOBS[stage]]["result"]
+        require(
+            len(matches) == 1 and result in {"success", "failure", "cancelled"},
+            "release-producer-job-mismatch: producer did not execute in this attempt",
+        )
+        # checked_context rejects conflicts and binds every API name/run/source.
+        # needs is the completion authority when same-run REST status is lagging.
+        return {**matches[0], "conclusion": result}
     require(
         len(matches) == 1 and matches[0]["status"] == "completed"
         and matches[0]["conclusion"] in {"success", "failure", "cancelled"},
@@ -153,7 +396,7 @@ def checked_no_target(repo: str, run: dict[str, Any], outcome: dict[str, Any]) -
             valid = type(value) is int and value > 0
         elif name in {"source", "base"}:
             valid = isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{40}", value))
-        elif name == "outcome_sha256":
+        elif name in {"outcome_sha256", "context_sha256"}:
             valid = isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{64}", value))
         elif name == "version":
             valid = isinstance(value, str) and bool(re.fullmatch(r"\d+\.\d+\.\d+", value))
@@ -217,22 +460,43 @@ def checked_no_target(repo: str, run: dict[str, Any], outcome: dict[str, Any]) -
             and publisher.get("event") in {"workflow_run", "workflow_dispatch"},
             "release-producer-outcome-invalid: handoff publisher differs",
         )
-        if reason == "publisher-no-target":
+        if reason == "publisher-no-producer":
             require(
                 publisher.get("run_attempt") == inputs["publication_attempt"],
                 "release-producer-outcome-invalid: publisher attempt moved",
             )
-            rows = stage_rows(inventory(
-                repo, f"actions/runs/{publisher['id']}/artifacts", "artifacts"
-            ), publisher)
+            artifacts = inventory(repo, f"actions/runs/{publisher['id']}/artifacts", "artifacts")
+            rows = stage_rows(artifacts, publisher)
             jobs = inventory(
                 repo, f"actions/runs/{publisher['id']}/attempts/{publisher['run_attempt']}/jobs", "jobs"
             )
+            context = publisher_context(repo, publisher, jobs, artifacts)
+            stage_inventory(rows, publisher, context)
+            require(not rows, "release-producer-outcome-invalid: publisher now has stage evidence")
+            checked_no_producer(publisher, context)
+            require(
+                sha256(canonical(context)) == inputs["context_sha256"],
+                "release-producer-outcome-invalid: publisher context differs",
+            )
+        elif reason == "publisher-no-target":
+            require(
+                publisher.get("run_attempt") == inputs["publication_attempt"],
+                "release-producer-outcome-invalid: publisher attempt moved",
+            )
+            artifacts = inventory(repo, f"actions/runs/{publisher['id']}/artifacts", "artifacts")
+            rows = stage_rows(artifacts, publisher)
+            jobs = inventory(
+                repo, f"actions/runs/{publisher['id']}/attempts/{publisher['run_attempt']}/jobs", "jobs"
+            )
+            # Old witness-bearing runs remain readable without a run context;
+            # empty inventories never take that compatibility path.
+            context = publisher_context(repo, publisher, jobs, artifacts)
+            stage_inventory(rows, publisher, context)
             checked = None
             for row in rows:
                 prior, decision = publication_stage(repo, row)
                 current = checked_stage(
-                    repo, publisher, row["name"].split("-", 3)[3], jobs, prior, decision
+                    repo, publisher, row["name"].split("-", 3)[3], jobs, prior, decision, context
                 )
                 same_decision(checked, current)
                 checked = current
@@ -274,7 +538,7 @@ def checked_handoff_target(
         repo, f"actions/runs/{publisher['id']}/artifacts", "artifacts"
     ), publisher)
     require(
-        rows[-1]["name"] == f"release-stage-{publisher['run_attempt']}-50-verify",
+        rows and rows[-1]["name"] == f"release-stage-{publisher['run_attempt']}-50-verify",
         "release-producer-outcome-invalid: handoff lacks publisher verification",
     )
     loaded, outcome = publication_stage(repo, rows[-1])
@@ -303,8 +567,9 @@ def checked_handoff_target(
 def checked_stage(
     repo: str, run: dict[str, Any], stage: str, jobs: list[Any],
     loaded: dict[str, Any] | None, outcome: dict[str, Any] | None,
+    context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    job = producer_job(stage, jobs)
+    job = producer_job(stage, jobs, context)
     if outcome is None:
         require(loaded is not None, "release-snapshot-missing: receipt and producer outcome absent")
         assert loaded is not None
@@ -414,21 +679,34 @@ def snapshot_identity(report: dict[str, Any], run_id: int, attempt: int) -> None
 
 def collect(directory: Path, *, failed: bool) -> dict[str, Any]:
     repo = os.environ["GITHUB_REPOSITORY"]
+    context = workflow_context(repo, directory)
     run = current_run(repo)
     rows = stage_rows(inventory(repo, f"actions/runs/{run['id']}/artifacts", "artifacts"), run)
     jobs = inventory(repo, f"actions/runs/{run['id']}/attempts/{run['run_attempt']}/jobs", "jobs")
+    if context is not None:
+        checked_context(repo, run, jobs, context)
+    stage_inventory(rows, run, context)
     upstream = {"reconcile"} if run["path"].endswith("/" + WORKFLOW) else {
         "manual-pr", *DEPLOY_JOBS,
     }
-    observed_failed = any(
-        job["name"] in upstream and job["conclusion"] in {"failure", "cancelled"} for job in jobs
-    )
+    if context is None:
+        observed_failed = any(
+            job["name"] in upstream and job["conclusion"] in {"failure", "cancelled"} for job in jobs
+        )
+    else:
+        observed_failed = any(
+            observation["result"] in {"failure", "cancelled"}
+            for observation in context["needs"].values()
+        )
     require(failed == observed_failed, "release-producer-job-mismatch: failure input differs")
     prefix = f"release-stage-{run['run_attempt']}-"
     require(
         {path.name for path in directory.glob(prefix + "*")} == {row["name"] for row in rows},
         "release-snapshot-missing: downloaded current inventory differs from GitHub",
     )
+    if not rows:
+        checked_no_producer(run, context)
+        return receipt(None)  # No producer ran; never fabricate a producer receipt/outcome.
     report = None
     for row in rows:
         directory_stage = directory / row["name"]
@@ -444,10 +722,10 @@ def collect(directory: Path, *, failed: bool) -> dict[str, Any]:
             outcome = object_json(path.read_bytes()) if path.exists() else None
         except (OSError, ValueError) as error:
             raise ValueError(f"release-snapshot-invalid: {row['name']}") from error
-        current = checked_stage(repo, run, row["name"][len(prefix):], jobs, loaded, outcome)
+        current = checked_stage(repo, run, row["name"][len(prefix):], jobs, loaded, outcome, context)
         same_decision(report, current)
         report = current
-    assert report is not None  # stage_rows requires a current artifact.
+    assert report is not None
     if failed:
         if getattr(report, "outcome", None):
             report = receipt(None)  # A failed envelope never rewrites an original replay.
@@ -566,12 +844,23 @@ def publication(repo: str, run_id: int, report: dict[str, Any]) -> None:
         "untrusted or incomplete publisher",
     )
     prefix = f"release-stage-{run['run_attempt']}-"
-    rows = stage_rows(inventory(repo, f"actions/runs/{run_id}/artifacts", "artifacts"), run)
+    artifacts = inventory(repo, f"actions/runs/{run_id}/artifacts", "artifacts")
+    rows = stage_rows(artifacts, run)
     jobs = inventory(repo, f"actions/runs/{run_id}/attempts/{run['run_attempt']}/jobs", "jobs")
+    context = publisher_context(repo, run, jobs, artifacts)
+    stage_inventory(rows, run, context)
+    if not rows:
+        checked_no_producer(run, context)
+        require(run["conclusion"] == "success", "target-less publisher failed")
+        observe_outcome(
+            report, "no-target", "publisher-no-producer", publication_run=run_id,
+            publication_attempt=run["run_attempt"], context_sha256=sha256(canonical(context)),
+        )
+        return
     loaded = None
     for row in rows:
         snapshot, outcome = publication_stage(repo, row)
-        current = checked_stage(repo, run, row["name"][len(prefix):], jobs, snapshot, outcome)
+        current = checked_stage(repo, run, row["name"][len(prefix):], jobs, snapshot, outcome, context)
         same_decision(loaded, current)
         loaded = current
     assert loaded is not None
@@ -767,14 +1056,19 @@ def retain(repo: str, report: dict[str, Any]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "command", choices=("collect", "publication", "retain", "callback", "incident")
+        "command", choices=("collect", "publication", "retain", "callback", "incident", "context")
     )
     parser.add_argument("--directory", type=Path, default=Path("receipts"))
     parser.add_argument("--receipt", type=Path, default=Path("release-receipt.json"))
     parser.add_argument("--run", type=int)
     args = parser.parse_args()
     repo = os.environ["GITHUB_REPOSITORY"]
-    if args.command == "publication":
+    if args.command == "context":
+        require(
+            workflow_context(repo, args.directory) is not None,
+            "release-run-context-invalid: trusted workflow needs missing",
+        )
+    elif args.command == "publication":
         report = receipt(None)
         try:
             publication(repo, args.run, report)
@@ -786,20 +1080,28 @@ def main() -> None:
     elif args.command in {"collect", "incident"}:
         incident_only = args.command == "incident"
         require(
-            not incident_only or os.environ["FAILED"] == "true",
-            "incident mode requires a failed report",
+            os.environ["FAILED"] in {"true", "false"},
+            "FAILED must be the actual workflow failure observation",
         )
+        diagnostic_error = None
         try:
             report = collect(
                 args.directory,
                 failed=os.environ["FAILED"] == "true",
             )
-        except ValueError:
+        except (
+            ValueError, OSError, subprocess.CalledProcessError, KeyError, TypeError, AttributeError,
+        ) as error:
             if not incident_only:
                 raise
             # Invalid release evidence must not prevent a run-scoped incident.
             # This target-less object is never written or sent to the hub.
             report = receipt(None)
+            diagnostic_error = f"{type(error).__name__}: {error}"
+        if incident_only:
+            # A delivery error is a real failure even if the upstream producers
+            # succeeded. Preserve any fully collected event/PR without emitting it.
+            report = ProducerReceipt(copy.deepcopy(report))
             report["state"] = "failed"
         # A replay is checked against the stored asset and installed proof. Its
         # original attempt, sequence, timestamp and pins remain untouched.
@@ -824,6 +1126,8 @@ def main() -> None:
         if not producer_decision or incident_only:
             incident(repo, report, os.environ["RELEASE_ALERT_OWNER"], os.environ["STAGE"])
         with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as handle:
+            if diagnostic_error is not None:
+                handle.write(f"Receipt collection failed: {diagnostic_error}\n")
             handle.write(
                 f"Data release state: **{report['state']}**; event `{report['event_id']}`.\n"
             )

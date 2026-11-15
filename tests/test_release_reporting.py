@@ -290,6 +290,500 @@ def assert_silent_noop(job):
     assert job["observed"].issues == []
 
 
+def bound_job_facts(run, facts):
+    """Raw attempt-job transport facts, independent of receipts and CLI results."""
+    return [
+        {"name": name, "status": "completed", "conclusion": result,
+         "run_id": run["id"], "run_attempt": run["run_attempt"], "head_sha": run["head_sha"]}
+        for name, result in facts
+    ]
+
+
+def trusted_call(job, monkeypatch, needs, event):
+    run = job["observed"].reporter
+    path = job["root"] / f"workflow-event-{run['id']}.json"
+    path.write_bytes(contract.json_bytes(event))
+    for key, value in {
+        "GITHUB_RUN_ID": str(run["id"]), "GITHUB_RUN_ATTEMPT": str(run["run_attempt"]),
+        "GITHUB_SHA": run["head_sha"], "GITHUB_EVENT_NAME": run["event"],
+        "GITHUB_EVENT_PATH": str(path), "RELEASE_NEEDS": contract.json_bytes(needs).decode(),
+    }.items():
+        monkeypatch.setenv(key, value)
+    return {
+        "repository": REPO, "run_id": run["id"], "run_attempt": run["run_attempt"],
+        "head_sha": run["head_sha"], "event_name": run["event"],
+        "event": copy.deepcopy(event), "needs": copy.deepcopy(needs),
+    }
+
+
+def no_producer_facts(job, monkeypatch, origin):
+    observed = job["observed"]
+    run = observed.reporter
+    run.update(
+        path=".github/workflows/release.yml", name="Release", head_branch="main",
+        event="workflow_dispatch" if origin == "claim" else "workflow_run",
+        repository={"full_name": REPO}, head_repository={"full_name": REPO},
+    )
+    needs = {
+        "authz": {"result": "success", "outputs": {}},
+        "claim-name": {"result": "success" if origin == "claim" else "skipped", "outputs": {}},
+        "manual-pr": {"result": "skipped", "outputs": {}},
+        "prepare": {"result": "skipped", "outputs": {}},
+        "build": {"result": "skipped", "outputs": {}},
+        "github-release": {"result": "skipped", "outputs": {}},
+        "publish": {"result": "skipped", "outputs": {}},
+        "verify": {"result": "skipped", "outputs": {}},
+    }
+    # These API facts are installed separately from needs; conflict controls
+    # mutate only one side. Nothing is copied from a production receipt/verdict.
+    observed.jobs[run["id"]] = bound_job_facts(run, [
+        ("authz", "success"), ("claim-name", "success" if origin == "claim" else "skipped"),
+        ("manual-pr", "skipped"), ("prepare", "skipped"), ("build", "skipped"),
+        ("github-release", "skipped"), ("publish", "skipped"), ("verify", "skipped"),
+    ])
+    if origin == "claim":
+        event = {
+            "repository": {"full_name": REPO}, "ref": "refs/heads/main",
+            "inputs": {"bump": "patch", "ci_run": "", "rollback_package": "",
+                       "claim_placeholder": "true"},
+        }
+    else:
+        upstream = {
+            "id": 810, "run_attempt": 3, "head_sha": MERGE, "head_branch": "main",
+            "name": "CI" if origin == "ci" else "Native feed",
+            "path": ".github/workflows/" + (
+                "ci-post.yml" if origin == "ci" else "native-feed-post.yml"
+            ),
+            "event": "workflow_dispatch", "status": "completed", "conclusion": "success",
+            "repository": {"full_name": REPO}, "head_repository": {"full_name": REPO},
+        }
+        observed.runs[810] = copy.deepcopy(upstream)
+        event = {"repository": {"full_name": REPO}, "action": "completed", "workflow_run": upstream}
+    return trusted_call(job, monkeypatch, needs, event)
+
+
+def retain_context_facts(job, context):
+    """Install raw workflow data at the real single-file artifact boundary."""
+    run = job["observed"].reporter
+    name = f"release-run-context-{run['run_attempt']}"
+    row = {"id": 62000, "name": name, "expired": False}
+    job["observed"].artifacts.setdefault(run["id"], []).append(row)
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as zipped:
+        zipped.writestr("run-context.json", contract.json_bytes(context))
+    job["observed"].archives[row["id"]] = archive.getvalue()
+    return row
+
+
+def adapter_call(job, monkeypatch, publisher=None, *, failed=False):
+    observed = job["observed"]
+    if publisher is not None:
+        observed.reporter = {
+            "id": 3100, "run_attempt": 7, "head_sha": MERGE,
+            "path": ".github/workflows/pineforge-release.yml", "event": "workflow_run",
+        }
+        observed.runs[3100] = observed.reporter
+    run = observed.reporter
+    run.update(repository={"full_name": REPO}, head_repository={"full_name": REPO})
+    if publisher is None:
+        run["event"] = "workflow_dispatch"
+        event = {"repository": {"full_name": REPO}, "ref": "refs/heads/main",
+                 "inputs": {"publication_run": ""}}
+    else:
+        event = {"repository": {"full_name": REPO}, "action": "completed",
+                 "workflow_run": copy.deepcopy(publisher)}
+    needs = {
+        "authz": {"result": "success", "outputs": {}},
+        "reconcile": {"result": "failure" if failed else "success", "outputs": {}},
+    }
+    observed.jobs[run["id"]] = bound_job_facts(run, [
+        ("authz", "success"), ("reconcile", "failure" if failed else "success"),
+    ])
+    monkeypatch.setenv("FAILED", str(failed).lower())
+    return trusted_call(job, monkeypatch, needs, event)
+
+
+@pytest.mark.parametrize("origin", ["ci", "native", "claim"])
+@pytest.mark.parametrize("inventory", ["empty", "unrelated"])
+def test_cli_no_producer_current_event_is_silent(report_job, monkeypatch, origin, inventory):
+    context = no_producer_facts(report_job, monkeypatch, origin)
+    if inventory == "unrelated":
+        report_job["observed"].artifacts[context["run_id"]] = [
+            {"id": 63000, "name": "unrelated-build-data", "expired": False},
+        ]
+    run_report(report_job, monkeypatch)
+    assert_silent_noop(report_job)
+    assert contract.object_json((report_job["root"] / "run-context.json").read_bytes()) == context
+    assert not (report_job["root"] / "producer-outcome.json").exists()
+
+
+def test_cli_claim_placeholder_preserves_unset_optional_inputs(report_job, monkeypatch):
+    job = report_job
+    context = no_producer_facts(job, monkeypatch, "claim")
+    context["event"]["inputs"].update(ci_run=None, rollback_package=None)
+    trusted_call(job, monkeypatch, context["needs"], context["event"])
+    run_report(job, monkeypatch)
+    assert_silent_noop(job)
+    assert contract.object_json((job["root"] / "run-context.json").read_bytes()) == context
+
+
+@pytest.mark.parametrize("origin", ["ci", "native", "claim"])
+def test_cli_no_producer_publication_and_adapter_recheck_raw_context(
+    report_job, monkeypatch, origin
+):
+    job = report_job
+    context = no_producer_facts(job, monkeypatch, origin)
+    publisher = job["observed"].reporter
+    publisher.update(status="completed", conclusion="success")
+    retain_context_facts(job, context)
+    publisher_id = publisher["id"]
+    adapter_call(job, monkeypatch, publisher)
+    produced = job["root"] / "no-producer-adapter"
+    monkeypatch.setattr(sys, "argv", [
+        "release_chain.reporting", "publication", "--run", str(publisher_id),
+        "--receipt", str(produced / "release-receipt.json"),
+    ])
+    reporting.main()
+    witness = produced / "producer-outcome.json"
+    assert witness.is_file()
+    value = contract.object_json(witness.read_bytes())
+    assert value["reason"] == "publisher-no-producer"
+    assert value["inputs"]["publication_run"] == publisher_id
+    assert value["inputs"]["context_sha256"] == contract.sha256(receipts.canonical(context))
+    assert ship_producer(job, produced, "10-adapter") is not None
+    run_report(job, monkeypatch)
+    assert_silent_noop(job)
+    assert not (produced / "release-receipt.json").exists()
+    assert sum(f"/actions/runs/{publisher_id}/artifacts" in route
+               for route in job["observed"].reads) == 2
+
+
+@pytest.mark.parametrize("damage,cause", [
+    ("missing-needs", "release-snapshot-missing:"),
+    ("caller-boolean", "release-run-context-invalid: repository or needs inventory differs"),
+    ("missing-event", "release-run-context-invalid: unreadable workflow event/needs"),
+    ("needs-missing", "release-run-context-invalid: repository or needs inventory differs"),
+    ("needs-malformed", "release-run-context-invalid: malformed needs observation"),
+    ("needs-conflict", "release-producer-job-mismatch: API contradicts workflow needs"),
+    ("upstream-attempt", "release-run-context-invalid: checked upstream differs"),
+    ("upstream-source", "release-run-context-invalid: checked upstream differs"),
+    ("upstream-event", "release-run-context-invalid: checked upstream differs"),
+    ("current-source", "release-run-context-invalid: run binding differs"),
+    ("push-requires-producer", "release-run-context-invalid: upstream event requires a producer"),
+    ("executed-missing", "release-snapshot-missing: stage inventory differs"),
+    ("unexpected-stage", "release-snapshot-invalid:"),
+    ("undownloaded-stage", "release-snapshot-missing: downloaded current inventory differs"),
+], ids=[
+    "missing-needs", "caller-boolean", "missing-event", "needs-missing", "needs-malformed",
+    "needs-conflict", "upstream-attempt", "upstream-source", "upstream-event", "current-source",
+    "push-requires-producer", "executed-missing", "unexpected-stage", "undownloaded-stage",
+])
+def test_cli_empty_inventory_requires_complete_orchestration(
+    report_job, monkeypatch, damage, cause
+):
+    job = report_job
+    context = no_producer_facts(job, monkeypatch, "ci")
+    observed, run = job["observed"], job["observed"].reporter
+    needs, event = context["needs"], context["event"]
+    if damage == "missing-needs":
+        monkeypatch.delenv("RELEASE_NEEDS")
+    elif damage == "caller-boolean":
+        monkeypatch.setenv("RELEASE_NEEDS", '{"no_target":true}')
+    elif damage == "missing-event":
+        monkeypatch.setenv("GITHUB_EVENT_PATH", str(job["root"] / "absent-event.json"))
+    elif damage == "needs-missing":
+        needs.pop("verify")
+    elif damage == "needs-malformed":
+        needs["prepare"]["result"] = ["skipped"]
+    elif damage == "needs-conflict":
+        needs["prepare"]["result"] = "success"
+    elif damage.startswith("upstream-"):
+        field = {"upstream-attempt": "run_attempt", "upstream-source": "head_sha",
+                 "upstream-event": "event"}[damage]
+        event["workflow_run"][field] = 99 if field == "run_attempt" else "push" if field == "event" else HEAD
+    elif damage == "current-source":
+        run["head_sha"] = HEAD
+    elif damage == "push-requires-producer":
+        event["workflow_run"]["event"] = "push"
+        observed.runs[810]["event"] = "push"
+    elif damage == "executed-missing":
+        needs["prepare"]["result"] = "success"
+        observed.jobs[run["id"]][3]["conclusion"] = "success"
+    elif damage == "unexpected-stage":
+        register_stage(job, run["run_attempt"], "99-unregistered")
+    else:
+        (job["root"] / "receipts" / f"release-stage-{run['run_attempt']}-20-prepare").mkdir(
+            parents=True
+        )
+    if damage not in {"missing-needs", "caller-boolean", "missing-event", "current-source"}:
+        trusted_call(job, monkeypatch, needs, event)
+    with pytest.raises(ValueError, match="^" + cause):
+        run_report(job, monkeypatch)
+    assert_no_delivery(job)
+
+
+@pytest.mark.parametrize("damage,cause", [
+    ("missing", "release-snapshot-missing:"),
+    ("expired", "release-run-context-invalid: duplicate or expired context"),
+    ("stale", "release-run-context-invalid: context attempt differs"),
+    ("duplicate", "release-run-context-invalid: duplicate or expired context"),
+    ("json", "release-run-context-invalid: unreadable context archive"),
+    ("layout", "release-run-context-invalid: unreadable context archive"),
+    ("repository", "release-run-context-invalid: run binding differs"),
+    ("run", "release-run-context-invalid: run binding differs"),
+    ("attempt", "release-run-context-invalid: run binding differs"),
+    ("head", "release-run-context-invalid: run binding differs"),
+    ("inputs", "release-run-context-invalid: original Release inputs missing"),
+    ("not-claim", "release-run-context-invalid: dispatch requires a producer"),
+    ("claim-failed", "release-producer-job-mismatch: API contradicts workflow needs"),
+], ids=[
+    "missing", "expired", "stale", "duplicate", "json", "layout", "repository", "run",
+    "attempt", "head", "inputs", "not-claim", "claim-failed",
+])
+def test_cli_publication_refuses_unbound_no_producer_context(
+    report_job, monkeypatch, damage, cause
+):
+    job = report_job
+    context = no_producer_facts(job, monkeypatch, "claim")
+    publisher = job["observed"].reporter
+    publisher.update(status="completed", conclusion="success")
+    if damage in {"repository", "run", "attempt", "head"}:
+        field = {"repository": "repository", "run": "run_id", "attempt": "run_attempt",
+                 "head": "head_sha"}[damage]
+        context[field] = "outside/data" if field == "repository" else (
+            HEAD if field == "head_sha" else context[field] + 1
+        )
+    elif damage == "inputs":
+        context["event"].pop("inputs")
+    elif damage == "not-claim":
+        context["event"]["inputs"]["claim_placeholder"] = "false"
+    row = retain_context_facts(job, context)
+    if damage == "missing":
+        job["observed"].artifacts[publisher["id"]].clear()
+    elif damage == "expired":
+        row["expired"] = True
+    elif damage == "stale":
+        row["name"] = f"release-run-context-{publisher['run_attempt'] - 1}"
+    elif damage == "duplicate":
+        job["observed"].artifacts[publisher["id"]].append(copy.deepcopy(row))
+    elif damage in {"json", "layout"}:
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as zipped:
+            zipped.writestr("nested/run-context.json" if damage == "layout" else "run-context.json",
+                            b"{" if damage == "json" else contract.json_bytes(context))
+        job["observed"].archives[row["id"]] = archive.getvalue()
+    elif damage == "claim-failed":
+        job["observed"].jobs[publisher["id"]][1]["conclusion"] = "failure"
+    publisher_id = publisher["id"]
+    adapter_call(job, monkeypatch, publisher)
+    monkeypatch.setattr(sys, "argv", [
+        "release_chain.reporting", "publication", "--run", str(publisher_id),
+        "--receipt", str(job["root"] / "release-receipt.json"),
+    ])
+    with pytest.raises(ValueError, match="^" + cause):
+        reporting.main()
+    assert_no_delivery(job)
+
+
+@pytest.mark.parametrize("status", ["queued", "in_progress", None], ids=["queued", "running", "null"])
+@pytest.mark.parametrize("failed", [False, True], ids=["targeted", "upstream-failure"])
+def test_cli_collect_uses_needs_completion_with_lagging_jobs(
+    report_job, monkeypatch, status, failed
+):
+    job = report_job
+    adapter_call(job, monkeypatch, failed=failed)
+    raw_job = job["observed"].jobs[job["observed"].reporter["id"]][1]
+    raw_job.update(status=status, conclusion=None)
+    write_stage(job)
+    run_report(job, monkeypatch)
+    saved = contract.object_json((job["root"] / "release-receipt.json").read_bytes())
+    assert saved["state"] == ("failed" if failed else "verified")
+    assert saved["pr"] == job["report"]["pr"]
+    assert (job["root"] / "outputs").read_text() == "has_event=true\n"
+    assert raw_job["status"] == status and raw_job["conclusion"] is None
+
+
+@pytest.mark.parametrize("status", ["queued", "in_progress", None], ids=["queued", "running", "null"])
+def test_cli_actual_no_target_producer_uses_needs_completion(report_job, monkeypatch, status):
+    job = report_job
+    produced = ordinary_producer(job, monkeypatch)
+    assert ship_producer(job, produced, "20-prepare") is not None
+    context = no_producer_facts(job, monkeypatch, "ci")
+    context["event"]["workflow_run"]["event"] = "push"
+    job["observed"].runs[810]["event"] = "push"
+    context["needs"]["prepare"]["result"] = "success"
+    raw_job = job["observed"].jobs[job["observed"].reporter["id"]][3]
+    raw_job.update(status=status, conclusion=None)
+    trusted_call(job, monkeypatch, context["needs"], context["event"])
+    run_report(job, monkeypatch)
+    assert_silent_noop(job)
+
+
+@pytest.mark.parametrize("damage,cause", [
+    ("name", "current job names differ from needs"),
+    ("duplicate", "current job names differ from needs"),
+    ("extra", "current job names differ from needs"),
+    ("run", "job run/attempt/source differs"),
+    ("attempt", "job run/attempt/source differs"),
+    ("source", "job run/attempt/source differs"),
+    ("terminal-conflict", "API contradicts workflow needs"),
+    ("nonterminal-conflict", "API contradicts workflow needs"),
+    ("failure-flag", "failure input differs"),
+    ("needs-skipped", "API contradicts workflow needs"),
+], ids=[
+    "name", "duplicate", "extra", "run", "attempt", "source", "terminal-conflict",
+    "nonterminal-conflict", "failure-flag", "needs-skipped",
+])
+def test_cli_needs_authority_refuses_conflicting_current_facts(
+    report_job, monkeypatch, damage, cause
+):
+    job = report_job
+    context = adapter_call(job, monkeypatch)
+    write_stage(job)
+    jobs = job["observed"].jobs[job["observed"].reporter["id"]]
+    raw = jobs[1]
+    if damage == "name":
+        raw["name"] = "unexpected-producer"
+    elif damage in {"duplicate", "extra"}:
+        jobs.append({**raw, "name": "reconcile" if damage == "duplicate" else "unregistered"})
+    elif damage in {"run", "attempt", "source"}:
+        field = {"run": "run_id", "attempt": "run_attempt", "source": "head_sha"}[damage]
+        raw[field] = HEAD if field == "head_sha" else raw[field] + 1
+    elif damage in {"terminal-conflict", "nonterminal-conflict"}:
+        raw.update(status="completed" if damage == "terminal-conflict" else "queued",
+                   conclusion="failure")
+    elif damage == "failure-flag":
+        monkeypatch.setenv("FAILED", "true")
+    else:
+        context["needs"]["reconcile"]["result"] = "skipped"
+        trusted_call(job, monkeypatch, context["needs"], context["event"])
+    with pytest.raises(ValueError, match="^release-producer-job-mismatch: " + cause):
+        run_report(job, monkeypatch)
+    assert_no_delivery(job)
+
+
+@pytest.mark.parametrize("boundary", ["run", "artifacts", "jobs"])
+def test_cli_transport_failure_reaches_run_scoped_diagnostic(
+    report_job, monkeypatch, boundary
+):
+    job, observed = report_job, report_job["observed"]
+    original = observed.consumer_api
+    run_id = observed.reporter["id"]
+    write_stage(job)
+    observed.jobs[run_id][0]["conclusion"] = "failure"
+    monkeypatch.setenv("FAILED", "true")
+    endpoint_to_fail = {
+        "run": f"actions/runs/{run_id}",
+        "artifacts": f"actions/runs/{run_id}/artifacts",
+        "jobs": f"actions/runs/{run_id}/attempts/{observed.reporter['run_attempt']}/jobs",
+    }[boundary]
+
+    def api(repo, endpoint, method="GET", data=None):
+        if method == "GET" and endpoint.split("?", 1)[0] == endpoint_to_fail:
+            raise subprocess.CalledProcessError(1, ["gh", "api", endpoint], stderr=b"API unavailable")
+        return original(repo, endpoint, method, data)
+
+    monkeypatch.setattr(reporting, "api", api)
+    monkeypatch.setattr(automation, "api", api)
+    with pytest.raises(subprocess.CalledProcessError):
+        run_report(job, monkeypatch)
+    assert_no_delivery(job)
+    run_report(job, monkeypatch, "incident")
+    assert not (job["root"] / "release-receipt.json").exists()
+    assert (job["root"] / "outputs").read_text() == "has_event=false\n"
+    assert "CalledProcessError" in (job["root"] / "summary").read_text()
+    assert observed.issues[0]["title"] == f"Data release failed: run-{run_id}"
+    assert all(endpoint.startswith("issues") for endpoint, _method, _data in observed.writes)
+
+
+@pytest.mark.parametrize("boundary", ["run", "event", "upstream"])
+def test_cli_malformed_repository_metadata_reaches_run_scoped_diagnostic(
+    report_job, monkeypatch, boundary
+):
+    job = report_job
+    context = no_producer_facts(job, monkeypatch, "ci")
+    observed = job["observed"]
+    if boundary == "run":
+        observed.reporter["repository"] = [REPO]
+    elif boundary == "event":
+        context["event"]["repository"] = [REPO]
+        trusted_call(job, monkeypatch, context["needs"], context["event"])
+    else:
+        observed.runs[810]["head_repository"] = [REPO]
+    monkeypatch.setenv("STAGE", "receipt-transport")
+    # This is an intentionally malformed raw observation, not a valid-path RED.
+    # Normal collection must still propagate the original collection failure.
+    with pytest.raises(AttributeError, match="^'list' object has no attribute 'get'$"):
+        run_report(job, monkeypatch)
+    assert_no_delivery(job)
+    run_report(job, monkeypatch, "incident")
+    assert not (job["root"] / "release-receipt.json").exists()
+    assert not (job["root"] / "producer-outcome.json").exists()
+    assert (job["root"] / "outputs").read_text() == "has_event=false\n"
+    assert "AttributeError" in (job["root"] / "summary").read_text()
+    issue = observed.issues[0]
+    assert issue["title"] == f"Data release failed: run-{observed.reporter['id']}"
+    assert "Stage: `receipt-transport`" in issue["body"]
+    assert all(endpoint.startswith("issues") for endpoint, _method, _data in observed.writes)
+
+
+@pytest.mark.parametrize("status", ["queued", "in_progress", None], ids=["queued", "running", "null"])
+def test_cli_actual_no_target_downstream_failure_is_an_incident(report_job, monkeypatch, status):
+    job = report_job
+    produced = ordinary_producer(job, monkeypatch)
+    assert ship_producer(job, produced, "20-prepare") is not None
+    context = no_producer_facts(job, monkeypatch, "ci")
+    context["event"]["workflow_run"]["event"] = "push"
+    job["observed"].runs[810]["event"] = "push"
+    context["needs"]["prepare"]["result"] = "success"
+    context["needs"]["build"]["result"] = "failure"
+    jobs = job["observed"].jobs[job["observed"].reporter["id"]]
+    jobs[3]["conclusion"] = "success"
+    jobs[4].update(status=status, conclusion=None)
+    trusted_call(job, monkeypatch, context["needs"], context["event"])
+    monkeypatch.setenv("FAILED", "true")
+    monkeypatch.setenv("STAGE", "distribution-transfer")
+    run_report(job, monkeypatch)
+    assert not (job["root"] / "release-receipt.json").exists()
+    assert (job["root"] / "outputs").read_text() == "has_event=false\n"
+    issue = job["observed"].issues[0]
+    assert issue["title"] == f"Data release failed: run-{job['observed'].reporter['id']}"
+    assert "Stage: `distribution-transfer`" in issue["body"]
+
+
+def test_cli_diagnostic_delivery_error_remains_visible(report_job, monkeypatch):
+    job = report_job
+    write_stage(job)
+    original = job["observed"].consumer_api
+
+    def api(repo, endpoint, method="GET", data=None):
+        if endpoint == "issues" and method == "POST":
+            raise subprocess.CalledProcessError(1, ["gh", "api", "issues"], stderr=b"delivery failed")
+        return original(repo, endpoint, method, data)
+
+    monkeypatch.setattr(reporting, "api", api)
+    with pytest.raises(subprocess.CalledProcessError):
+        run_report(job, monkeypatch, "incident")
+    assert not (job["root"] / "release-receipt.json").exists()
+    assert (job["root"] / "outputs").read_text() == "has_event=false\n"
+    assert job["observed"].issues == []
+
+
+def test_cli_delivery_failure_preserves_collected_event_and_pr(report_job, monkeypatch):
+    job = report_job
+    adapter_call(job, monkeypatch)
+    write_stage(job)
+    monkeypatch.setenv("STAGE", "receipt-transport")
+    run_report(job, monkeypatch, "incident")
+    issue = job["observed"].issues[0]
+    assert issue["title"] == f"Data release failed: {job['report']['event_id']}"
+    assert "Stage: `receipt-transport`" in issue["body"]
+    assert f"https://github.com/{REPO}/pull/7" in issue["body"]
+    assert not (job["root"] / "release-receipt.json").exists()
+    assert (job["root"] / "outputs").read_text() == "has_event=false\n"
+    assert all(endpoint.startswith("issues") for endpoint, _method, _data in job["observed"].writes)
+
+
 @pytest.mark.parametrize("workflow", ["ci-post.yml", "native-feed-post.yml"])
 def test_cli_ordinary_main_actual_producer_is_silent(report_job, monkeypatch, workflow):
     job = report_job
@@ -357,38 +851,55 @@ def test_cli_no_target_requires_current_bound_producer_evidence(report_job, monk
             parents=True)
     else:
         stage = ship_producer(job, produced, "20-prepare")
-        if stage is not None:
-            path = stage / "producer-outcome.json"
-            if damage == "json":
-                path.write_bytes(b"{")
-            elif damage in {"run", "attempt", "head", "reason", "inputs", "input-source"}:
-                value = contract.object_json(path.read_bytes())
-                if damage == "run":
-                    value["run_id"] += 1
-                elif damage == "attempt":
-                    value["run_attempt"] += 1
-                elif damage == "head":
-                    value["head_sha"] = "9" * 40
-                elif damage == "reason":
-                    value["reason"] = "unregistered"
-                elif damage == "inputs":
-                    value["inputs"] = {"ignored": True}
-                else:
-                    value["inputs"]["source"] = "9" * 40
-                path.write_bytes(contract.json_bytes(value))
-            elif damage == "not-downloaded":
-                # Download a different directory, preserving the API's current row.
-                stage.rename(stage.with_name("unregistered-download"))
+        assert stage is not None
+        path = stage / "producer-outcome.json"
+        assert path.is_file()
+        if damage == "json":
+            path.write_bytes(b"{")
+        elif damage in {"run", "attempt", "head", "reason", "inputs", "input-source"}:
+            value = contract.object_json(path.read_bytes())
+            if damage == "run":
+                value["run_id"] += 1
+            elif damage == "attempt":
+                value["run_attempt"] += 1
+            elif damage == "head":
+                value["head_sha"] = "9" * 40
+            elif damage == "reason":
+                value["reason"] = "unregistered"
+            elif damage == "inputs":
+                value["inputs"] = {"ignored": True}
+            else:
+                value["inputs"]["source"] = "9" * 40
+            path.write_bytes(contract.json_bytes(value))
+        elif damage == "not-downloaded":
+            # Download a different directory, preserving the API's current row.
+            stage.rename(stage.with_name("unregistered-download"))
     rows = job["observed"].artifacts.get(job["observed"].reporter["id"], [])
-    if rows and damage == "expired":
+    assert rows
+    if damage == "expired":
         rows[0]["expired"] = True
-    elif rows and damage == "unregistered":
+    elif damage == "unregistered":
         rows[0]["name"] += "-unknown"
     elif damage == "producer-skipped":
         job["observed"].jobs[job["observed"].reporter["id"]][0]["conclusion"] = "skipped"
     elif damage == "api-attempt":
         job["observed"].reporter["run_attempt"] += 1
-    with pytest.raises(ValueError):
+    cause = {
+        "missing": "release-snapshot-missing: receipt and producer outcome absent",
+        "json": "release-snapshot-invalid:",
+        "run": "release-producer-outcome-invalid: envelope or producer job differs",
+        "attempt": "release-producer-outcome-invalid: envelope or producer job differs",
+        "head": "release-producer-outcome-invalid: envelope or producer job differs",
+        "reason": "release-producer-outcome-invalid: no-target decision conflicts with snapshot",
+        "inputs": "release-producer-outcome-invalid: decision inputs differ",
+        "input-source": "release-producer-outcome-invalid: observed main input differs",
+        "expired": "release-snapshot-missing: current stage expired",
+        "unregistered": "release-snapshot-invalid: unregistered or duplicate stage",
+        "not-downloaded": "release-snapshot-missing: downloaded current inventory differs",
+        "producer-skipped": "release-producer-job-mismatch: producer did not execute",
+        "api-attempt": "release-producer-run-mismatch:",
+    }[damage]
+    with pytest.raises(ValueError, match="^" + cause):
         run_report(job, monkeypatch)
     assert_no_delivery(job)
 
@@ -855,7 +1366,13 @@ def test_publication_cli_requires_current_target(publisher_job, monkeypatch, fau
         "release_chain.reporting", "publication", "--run", str(job["publisher"]),
         "--receipt", str(job["root"] / "release-receipt.json"),
     ])
-    with pytest.raises(ValueError):
+    cause = {
+        "absent": "release-snapshot-missing:",
+        "wrong-run": "release-snapshot-attempt-mismatch:",
+        "wrong-attempt": "release-snapshot-attempt-mismatch:",
+        "receiptless": "release-snapshot-invalid: unreadable stage archive",
+    }[fault]
+    with pytest.raises(ValueError, match="^" + cause):
         reporting.main()
     assert_no_delivery(job)
 

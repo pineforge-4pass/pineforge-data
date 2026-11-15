@@ -76,9 +76,6 @@ expected head. No admin merge is used. Strict up-to-date required checks and an
 App without branch bypass are essential to close the final base-movement race.
 Merge queue is not enabled by this implementation.
 
-Tests run on the authorized slave or CI/cloud runners. The master runs no tests;
-the Mac is a frozen rollback copy. Source lanes return edits for ROOT to validate.
-
 ## Publication, completion and repair
 
 Successful PR CI wakes the reconciler through `workflow_run`. The App's merge
@@ -124,6 +121,32 @@ a later targetless stage cannot erase an earlier target. Package publication
 carries prepare's witness through GitHub Release, preflight and verification,
 checking its CI run/attempt, source and version against the bundle at each step.
 An absent targeted receipt cannot select the package-only path.
+
+The reporting workflow also retains private `run-context.json` in the separate
+`release-run-context-<attempt>` artifact. Before downloading stage artifacts it
+captures the runner's original event, including the upstream run and attempt for
+`workflow_run` or the original Release dispatch inputs, and the caller's actual
+`needs` observations. Consumers bind those facts to the repository, run, attempt
+and head, re-read the upstream run, and check the complete current job and stage
+inventories. This context stays outside the public receipt, immutable completion
+asset and four-key callback.
+
+A manual dispatch of **CI** or **Native feed** on main can complete a Release
+run with every release producer skipped. A successful `claim_placeholder` run
+also has no release producer. These runs finish quietly only with that complete
+context and matching independent observations. They create no product receipt
+or failed incident. An empty artifact list, a caller boolean, a missing context,
+or an executed producer with missing evidence cannot establish this outcome.
+Report-only retries cannot borrow context or stage evidence from another attempt;
+use **Re-run all jobs** when evidence needs regeneration.
+
+For jobs in the reporting run, the workflow's actual `needs` results establish
+completion. The attempt-jobs API independently supplies names and run/source
+bindings, but its status can still be queued, running or null after completion.
+Conflicting terminal conclusions, missing or unexpected jobs, and mismatched
+attempts or sources refuse collection. Historical runs without this context
+still require terminal API proof for their existing producer artifacts; they
+cannot use an empty inventory to establish a quiet no-target result.
 
 The internal witness has `schema`, `run_id`, `run_attempt`, `head_sha`, `outcome`,
 `reason`, `inputs` and `receipt_sha256`. Actual no-target decisions use a null
@@ -216,15 +239,17 @@ errors use the diagnostic-only `incident` command, which cannot write a receipt
 or enable transport. Upstream failures retain their actual stage; delivery
 failures use `receipt-transport`. A previously verified target never emits a later
 failed/superseded/progress receipt; local incidents still record those errors.
+Delivery diagnostics keep the collected event and PR when the evidence supports
+them. API or collection errors instead reach a run-scoped incident with the
+collection error recorded in the Actions summary. Failure to deliver the incident
+itself remains an error.
 
-CR206 controls enter the existing producer and reporter CLIs and model the
-workflow's current-attempt download layout. They cover ordinary main pushes
-from both proof workflows, pending proof pairs, each manual bump, package
-publication, repair handoffs, stored replay, and required-evidence refusals.
-They also vary independent API observations and carried inputs. These are
-authored controls: this source lane executed none of them. ROOT owns the
-original/fixed comparison on spark2, normal Claude review and CORE/LAKE/CI/live
-acceptance.
+Offline CLI controls cover manual upstream workflows, placeholder claims,
+ordinary main pushes, pending proof pairs, package bumps/publication, repair
+handoffs, stored replay, delayed job status and evidence refusals. GitHub,
+PyPI, GHCR and git observations use fixtures. Such controls demonstrate only
+the validators they actually execute; they do not establish hosted workflow,
+native, provider, publication or callback acceptance.
 
 The required hub `RELEASE_RECEIPT_POLICY.data` entry is checked into
 [`receipt-policy.json`](https://github.com/pineforge-4pass/pineforge-data/blob/main/tests/fixtures/release_chain/receipt-policy.json).
@@ -234,11 +259,13 @@ skips. The reporting workflow is `pineforge-release.yml`, artifact
 `release-receipt-data`, base `main`; deploy uses `release.yml` and the inventory
 above. A complete synthetic verified receipt is in
 [`sample-release-receipt.json`](https://github.com/pineforge-4pass/pineforge-data/blob/main/tests/fixtures/release_chain/sample-release-receipt.json).
-`tests/test_consumer_receipt.py` builds it through the real coordinator builder
-and validates it with the hub's field, GitHub-check, identity, artifact and
-signal checks vendored in `tests/hub_receipt_validator.py`. The sibling hub repo
-is unavailable in standalone CI, so the snapshot records its source hash. These
-unit tests run in CI only, together with the existing suites.
+`tests/test_consumer_receipt.py` builds it through the coordinator with fixed
+candidate, main, local-lock, OCI, served and previous proof boundaries. That
+fixture tests orchestration and the hub's field, GitHub-check, identity, artifact
+and signal checks vendored in `tests/hub_receipt_validator.py`; it cannot prove
+the replaced publication gates. The sibling hub repo is unavailable in
+standalone CI, so the snapshot records its source hash. Controls that stop at a
+candidate boundary likewise prove only the path up to that boundary.
 
 The event-driven or manually dispatched reconciler repairs dropped ready events and missing publication
 transitions, reuses verified receipts without republishing, and refuses to

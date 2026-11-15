@@ -550,29 +550,32 @@ def test_cli_targetless_package_carries_actual_outcome_through_every_publisher_s
             cli.setattr(sys, "argv", argv)
             if command == "preflight" and fault:
                 witness = stage / "producer-outcome.json"
-                if witness.exists():
-                    if fault == "missing":
-                        witness.rename(state["callback_root"] / "withheld-package-outcome.json")
+                assert witness.is_file()
+                if fault == "missing":
+                    witness.rename(state["callback_root"] / "withheld-package-outcome.json")
+                else:
+                    observed = contract.object_json(witness.read_bytes())
+                    if fault in {"run", "attempt"}:
+                        observed["run_id" if fault == "run" else "run_attempt"] += 1
+                    elif fault == "head":
+                        observed["head_sha"] = "9" * 40
+                    elif fault == "schema":
+                        observed["schema"] = "pineforge/consumer-receipt/v1"
+                    elif fault == "fields":
+                        observed["ignored"] = True
+                    elif fault in {"ci-run", "ci-attempt"}:
+                        observed["inputs"]["ci_run" if fault == "ci-run" else "ci_attempt"] += 1
+                    elif fault == "source":
+                        observed["inputs"]["source"] = "9" * 40
                     else:
-                        observed = contract.object_json(witness.read_bytes())
-                        if fault in {"run", "attempt"}:
-                            observed["run_id" if fault == "run" else "run_attempt"] += 1
-                        elif fault == "head":
-                            observed["head_sha"] = "9" * 40
-                        elif fault == "schema":
-                            observed["schema"] = "pineforge/consumer-receipt/v1"
-                        elif fault == "fields":
-                            observed["ignored"] = True
-                        elif fault in {"ci-run", "ci-attempt"}:
-                            observed["inputs"]["ci_run" if fault == "ci-run" else "ci_attempt"] += 1
-                        elif fault == "source":
-                            observed["inputs"]["source"] = "9" * 40
-                        else:
-                            observed["inputs"]["version"] = "8.9.10"
-                        witness.write_bytes(contract.json_bytes(observed))
-                # c042 accepts the same preflight inputs; it reaches its actual
-                # current-intent and distribution logic, without any new API.
-                with pytest.raises((ValueError, OSError)):
+                        observed["inputs"]["version"] = "8.9.10"
+                    witness.write_bytes(contract.json_bytes(observed))
+                # A missing prerequisite is a setup failure, never causal RED.
+                error = FileNotFoundError if fault == "missing" else ValueError
+                cause = "producer-outcome.json" if fault == "missing" else (
+                    "^missing or invalid package publication outcome$"
+                )
+                with pytest.raises(error, match=cause):
                     publishing.main()
                 assert not (stage / "release-receipt.json").exists()
                 assert incident_transport["writes"] == []
@@ -2077,6 +2080,11 @@ class ObservedGitHub:
 
 @pytest.fixture
 def completed_data_receipt(monkeypatch, tmp_path):
+    """Synthetic coordinator/contract wiring only.
+
+    Candidate, main, local-lock, OCI, served and previous proof boundaries use
+    fixed answers below. This fixture cannot establish full publication proof.
+    """
     event = contract.object_json((FIXTURES / "ready-event.json").read_bytes())
     expected = contract.object_json((FIXTURES / "sample-release-receipt.json").read_bytes())
     monkeypatch.setenv("GITHUB_RUN_ID", "300")
@@ -2269,7 +2277,7 @@ def test_moved_reporting_source_queues_a_trusted_immutable_tag_run(completed_dat
     None, "version", "source", "publisher-attempt", "publisher-state",
     "reporter-head", "missing-publisher-stage",
 ])
-def test_cli_source_repair_handoff_is_silent_after_full_publication_checks(
+def test_cli_source_repair_handoff_orchestration_with_stubbed_proof_boundaries(
     completed_data_receipt, tmp_path, monkeypatch, moved, fault
 ):
     _report, _event, client, _policy = completed_data_receipt
@@ -2289,19 +2297,19 @@ def test_cli_source_repair_handoff_is_silent_after_full_publication_checks(
     directory = tmp_path / "handoff-download"
     witness = produced / "producer-outcome.json"
     client.stage_artifacts[300] = []
-    if witness.exists():
-        stage = directory / "release-stage-1-10-adapter"
-        stage.mkdir(parents=True)
-        (stage / witness.name).write_bytes(witness.read_bytes())
-        client.stage_artifacts[300] = [{
-            "id": 30010, "name": stage.name, "expired": False,
-        }]
-        if fault in {"version", "source"}:
-            decision = contract.object_json((stage / witness.name).read_bytes())
-            decision["inputs"]["version" if fault == "version" else "source"] = (
-                "8.9.10" if fault == "version" else "8" * 40
-            )
-            (stage / witness.name).write_bytes(contract.json_bytes(decision))
+    assert witness.is_file()
+    stage = directory / "release-stage-1-10-adapter"
+    stage.mkdir(parents=True)
+    (stage / witness.name).write_bytes(witness.read_bytes())
+    client.stage_artifacts[300] = [{
+        "id": 30010, "name": stage.name, "expired": False,
+    }]
+    if fault in {"version", "source"}:
+        decision = contract.object_json((stage / witness.name).read_bytes())
+        decision["inputs"]["version" if fault == "version" else "source"] = (
+            "8.9.10" if fault == "version" else "8" * 40
+        )
+        (stage / witness.name).write_bytes(contract.json_bytes(decision))
     if fault == "publisher-attempt":
         client.runs[200]["run_attempt"] += 1
     elif fault == "publisher-state":
@@ -2320,7 +2328,17 @@ def test_cli_source_repair_handoff_is_silent_after_full_publication_checks(
         "--receipt", str(tmp_path / "handoff-public-receipt.json"),
     ])
     if fault:
-        with pytest.raises(ValueError):
+        cause = {
+            "version": "release-producer-outcome-invalid: handoff version/source differs",
+            "source": "release-producer-outcome-invalid: handoff version/source differs",
+            "publisher-attempt": "release-snapshot-attempt-mismatch:",
+            "publisher-state": "release-producer-outcome-invalid: handoff publisher differs",
+            "reporter-head": "release-producer-outcome-invalid: envelope or producer job differs",
+            "missing-publisher-stage": (
+                "release-producer-outcome-invalid: handoff lacks publisher verification"
+            ),
+        }[fault]
+        with pytest.raises(ValueError, match="^" + cause):
             reporting.main()
         assert not (tmp_path / "handoff-outputs").exists()
     else:

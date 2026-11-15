@@ -147,6 +147,7 @@ jobs:
       issues: write
     with:
       hub: true
+      orchestration: ${{ toJSON(needs) }}
       failed: ${{ needs.reconcile.result != 'success' }}
       stage: reconcile
     secrets: inherit

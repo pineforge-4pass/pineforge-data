@@ -356,11 +356,14 @@ def no_producer_facts(job, monkeypatch, origin):
     }
     # These API facts are installed separately from needs; conflict controls
     # mutate only one side. Nothing is copied from a production receipt/verdict.
-    observed.jobs[run["id"]] = bound_job_facts(run, [
-        ("authz", "success"), ("claim-name", "success" if origin == "claim" else "skipped"),
-        ("manual-pr", "skipped"), ("prepare", "skipped"), ("build", "skipped"),
-        ("github-release", "skipped"), ("publish", "skipped"), ("verify", "skipped"),
-    ]) + [active_report_job(run)]
+    observed.jobs[run["id"]] = [
+        *bound_job_facts(run, [
+            ("authz", "success"), ("claim-name", "success" if origin == "claim" else "skipped"),
+            ("manual-pr", "skipped"), ("prepare", "skipped"), ("build", "skipped"),
+            ("github-release", "skipped"), ("publish", "skipped"), ("verify", "skipped"),
+        ]),
+        active_report_job(run),
+    ]
     if origin == "claim":
         event = {
             "repository": {"full_name": REPO}, "ref": "refs/heads/main",
@@ -418,9 +421,12 @@ def adapter_call(job, monkeypatch, publisher=None, *, failed=False):
         "authz": {"result": "success", "outputs": {}},
         "reconcile": {"result": "failure" if failed else "success", "outputs": {}},
     }
-    observed.jobs[run["id"]] = bound_job_facts(run, [
-        ("authz", "success"), ("reconcile", "failure" if failed else "success"),
-    ]) + [active_report_job(run)]
+    observed.jobs[run["id"]] = [
+        *bound_job_facts(run, [
+            ("authz", "success"), ("reconcile", "failure" if failed else "success"),
+        ]),
+        active_report_job(run),
+    ]
     monkeypatch.setenv("FAILED", str(failed).lower())
     return trusted_call(job, monkeypatch, needs, event)
 
@@ -591,7 +597,8 @@ def test_cli_adapter_context_covers_real_trigger_and_running_report_row(
         }
         observed.attempts[(70, 1)] = copy.deepcopy(upstream)
         observed.runs[70] = {
-            **copy.deepcopy(upstream), "run_attempt": 2, "status": "in_progress", "conclusion": None,
+            **copy.deepcopy(upstream), "run_attempt": 2, "status": "in_progress",
+            "conclusion": None,
         }
         run["event"] = "workflow_run"
         event = {"repository": {"full_name": REPO}, "action": "completed", "workflow_run": upstream}
@@ -665,7 +672,9 @@ def test_cli_cancelled_before_execution_is_quiet_only_after_provider_recheck(
     assert exact in before and exact in reads
     assert exact + "/jobs?per_page=100&page=1" in reads
     assert f"repos/{REPO}/actions/runs/200/artifacts?per_page=100&page=1" in reads
-    assert set(job["observed"].job_pages[(200, publisher["run_attempt"])]) == {"total_count", "jobs"}
+    assert set(job["observed"].job_pages[(200, publisher["run_attempt"])]) == {
+        "total_count", "jobs",
+    }
     assert not any("supersed" in str(value) for value in witness.values())
 
 
@@ -889,7 +898,7 @@ def test_cli_manual_cancelled_witness_still_selects_latest_publisher(
     assert historical["head_sha"] == MERGE and observed.runs[200]["head_sha"] == HEAD
     before = len(observed.reads)
     with pytest.raises(
-        ValueError, match="^release-producer-outcome-invalid: cancelled publisher inputs differ$",
+        ValueError, match=r"^release-producer-outcome-invalid: cancelled publisher inputs differ$",
     ):
         run_report(job, monkeypatch)
     assert_no_delivery(job)
@@ -943,7 +952,9 @@ def test_cli_cancelled_before_execution_refuses_missing_or_conflicting_proof(
     if damage == "missing-count":
         page.pop("total_count")
     elif damage in {"partial-count", "string-count", "boolean-count"}:
-        page["total_count"] = {"partial-count": 1, "string-count": "0", "boolean-count": False}[damage]
+        page["total_count"] = {
+            "partial-count": 1, "string-count": "0", "boolean-count": False,
+        }[damage]
     elif damage in {"executed", "authz-refused", "contradictory-jobs"}:
         name = "authz" if damage == "authz-refused" else "prepare"
         observed.jobs[200] = bound_job_facts(publisher, [
@@ -1067,8 +1078,10 @@ def test_cli_non_cancelled_empty_publisher_still_requires_evidence(
     publisher = cancelled_publisher_facts(job, monkeypatch)
     publisher["conclusion"] = conclusion
     job["observed"].attempts[(200, publisher["run_attempt"])]["conclusion"] = conclusion
-    assert job["observed"].job_pages[(200, publisher["run_attempt"])] == {"total_count": 0, "jobs": []}
-    with pytest.raises(ValueError, match="^release-snapshot-missing:"):
+    assert job["observed"].job_pages[(200, publisher["run_attempt"])] == {
+        "total_count": 0, "jobs": [],
+    }
+    with pytest.raises(ValueError, match=r"^release-snapshot-missing:"):
         publication_cli(job, monkeypatch, 200)
     assert_no_delivery(job)
     assert not (job["root"] / "publication-producer" / "producer-outcome.json").exists()
@@ -1081,7 +1094,9 @@ def test_cancelled_publisher_cannot_erase_existing_target(report_job, monkeypatc
     before = receipts.canonical(report)
     with pytest.raises(
         ValueError,
-        match="^release-producer-outcome-invalid: cancelled publisher conflicts with current target$",
+        match=(
+            r"^release-producer-outcome-invalid: cancelled publisher conflicts with current target$"
+        ),
     ):
         reporting.publication(REPO, 200, report)
     assert receipts.canonical(report) == before
@@ -1100,7 +1115,8 @@ def test_cli_cancelled_publisher_with_stage_evidence_cannot_be_quiet(
         assert (produced / "producer-outcome.json").is_file()
         assert ship_producer(job, produced, "10-adapter") is not None
     job["observed"].artifacts[200].append({
-        "id": 61002, "name": f"release-stage-{publisher['run_attempt']}-20-prepare", "expired": False,
+        "id": 61002, "name": f"release-stage-{publisher['run_attempt']}-20-prepare",
+        "expired": False,
     })
     job["observed"].archives[61002] = receipt_archive(job["report"])
     cause = (
@@ -1166,7 +1182,9 @@ def test_cli_context_bearing_publisher_rechecks_actual_stage_evidence(report_job
     assert ship_producer(job, forwarded, "10-adapter") is not None
     run_report(job, monkeypatch)
     assert_silent_noop(job)
-    assert sum(f"/actions/runs/{publisher['id']}/artifacts" in route for route in observed.reads) == 2
+    assert (
+        sum(f"/actions/runs/{publisher['id']}/artifacts" in route for route in observed.reads) == 2
+    )
     # The real prepare decision and context checks run; this ordinary-main
     # case intentionally has no release PR, bundle, OCI or publication proof.
 
@@ -1234,7 +1252,9 @@ def test_cli_empty_publisher_no_target_witness_reaches_diagnostic(report_job, mo
     assert stage is not None and (stage / "producer-outcome.json").is_file()
     assert not (stage / "release-receipt.json").exists()
     assert observed.artifacts[publisher["id"]][0]["name"].startswith("release-run-context-")
-    with pytest.raises(ValueError, match="^release-producer-outcome-invalid: publisher outcome differs$"):
+    with pytest.raises(
+        ValueError, match=r"^release-producer-outcome-invalid: publisher outcome differs$",
+    ):
         run_report(job, monkeypatch)
     assert_no_delivery(job)
     run_report(job, monkeypatch, "incident")
@@ -1291,7 +1311,9 @@ def test_cli_empty_inventory_requires_complete_orchestration(
     elif damage.startswith("upstream-"):
         field = {"upstream-attempt": "run_attempt", "upstream-source": "head_sha",
                  "upstream-event": "event"}[damage]
-        event["workflow_run"][field] = 99 if field == "run_attempt" else "push" if field == "event" else HEAD
+        event["workflow_run"][field] = (
+            99 if field == "run_attempt" else "push" if field == "event" else HEAD
+        )
         if damage == "upstream-attempt":
             # A provider record at the requested endpoint with the wrong
             # recorded attempt must fail the binding, rather than lookup setup.
@@ -1381,7 +1403,9 @@ def test_cli_publication_refuses_unbound_no_producer_context(
     assert_no_delivery(job)
 
 
-@pytest.mark.parametrize("status", ["queued", "in_progress", None], ids=["queued", "running", "null"])
+@pytest.mark.parametrize(
+    "status", ["queued", "in_progress", None], ids=["queued", "running", "null"]
+)
 @pytest.mark.parametrize("failed", [False, True], ids=["targeted", "upstream-failure"])
 def test_cli_collect_uses_needs_completion_with_lagging_jobs(
     report_job, monkeypatch, status, failed
@@ -1399,7 +1423,9 @@ def test_cli_collect_uses_needs_completion_with_lagging_jobs(
     assert raw_job["status"] == status and raw_job["conclusion"] is None
 
 
-@pytest.mark.parametrize("status", ["queued", "in_progress", None], ids=["queued", "running", "null"])
+@pytest.mark.parametrize(
+    "status", ["queued", "in_progress", None], ids=["queued", "running", "null"]
+)
 def test_cli_actual_no_target_producer_uses_needs_completion(report_job, monkeypatch, status):
     job = report_job
     produced = ordinary_producer(job, monkeypatch)
@@ -1477,7 +1503,9 @@ def test_cli_transport_failure_reaches_run_scoped_diagnostic(
 
     def api(repo, endpoint, method="GET", data=None):
         if method == "GET" and endpoint.split("?", 1)[0] == endpoint_to_fail:
-            raise subprocess.CalledProcessError(1, ["gh", "api", endpoint], stderr=b"API unavailable")
+            raise subprocess.CalledProcessError(
+                1, ["gh", "api", endpoint], stderr=b"API unavailable"
+            )
         return original(repo, endpoint, method, data)
 
     monkeypatch.setattr(reporting, "api", api)
@@ -1511,7 +1539,7 @@ def test_cli_malformed_repository_metadata_reaches_run_scoped_diagnostic(
     monkeypatch.setenv("STAGE", "receipt-transport")
     # This is an intentionally malformed raw observation, not a valid-path RED.
     # Normal collection must still propagate the original collection failure.
-    with pytest.raises(AttributeError, match="^'list' object has no attribute 'get'$"):
+    with pytest.raises(AttributeError, match=r"^'list' object has no attribute 'get'$"):
         run_report(job, monkeypatch)
     assert_no_delivery(job)
     run_report(job, monkeypatch, "incident")
@@ -1525,7 +1553,9 @@ def test_cli_malformed_repository_metadata_reaches_run_scoped_diagnostic(
     assert all(endpoint.startswith("issues") for endpoint, _method, _data in observed.writes)
 
 
-@pytest.mark.parametrize("status", ["queued", "in_progress", None], ids=["queued", "running", "null"])
+@pytest.mark.parametrize(
+    "status", ["queued", "in_progress", None], ids=["queued", "running", "null"]
+)
 def test_cli_actual_no_target_downstream_failure_is_an_incident(report_job, monkeypatch, status):
     job = report_job
     produced = ordinary_producer(job, monkeypatch)
@@ -1557,7 +1587,9 @@ def test_cli_diagnostic_delivery_error_remains_visible(report_job, monkeypatch):
 
     def api(repo, endpoint, method="GET", data=None):
         if endpoint == "issues" and method == "POST":
-            raise subprocess.CalledProcessError(1, ["gh", "api", "issues"], stderr=b"delivery failed")
+            raise subprocess.CalledProcessError(
+                1, ["gh", "api", "issues"], stderr=b"delivery failed"
+            )
         return original(repo, endpoint, method, data)
 
     monkeypatch.setattr(reporting, "api", api)
@@ -1714,7 +1746,7 @@ def test_cli_report_only_rerun_cannot_reuse_prior_no_target_decision(report_job,
     old = job["observed"].reporter["run_attempt"]
     job["observed"].reporter["run_attempt"] = old + 1
     monkeypatch.setenv("GITHUB_RUN_ATTEMPT", str(old + 1))
-    with pytest.raises(ValueError, match="^release-snapshot-attempt-mismatch:"):
+    with pytest.raises(ValueError, match=r"^release-snapshot-attempt-mismatch:"):
         run_report(job, monkeypatch)
     assert_no_delivery(job)
 
@@ -1866,8 +1898,8 @@ def test_cli_reconcile_actual_targetless_decisions(report_job, monkeypatch, bump
         argv = ["release_adapter.py", "manual" if bump else "reconcile"]
         if bump:
             argv += ["--bump", bump]
-        producer.setattr(sys, "argv", argv + [
-            "--receipt", str(produced / "release-receipt.json"),
+        producer.setattr(sys, "argv", [
+            *argv, "--receipt", str(produced / "release-receipt.json"),
         ])
         release_adapter.main()
     if forward:
@@ -1883,7 +1915,7 @@ def test_cli_reconcile_actual_targetless_decisions(report_job, monkeypatch, bump
 
 
 def test_report_collect_refuses_absent_snapshot(report_job, monkeypatch):
-    with pytest.raises(ValueError, match="^release-snapshot-missing:"):
+    with pytest.raises(ValueError, match=r"^release-snapshot-missing:"):
         run_report(report_job, monkeypatch)
     assert_no_delivery(report_job)
 
@@ -1891,7 +1923,7 @@ def test_report_collect_refuses_absent_snapshot(report_job, monkeypatch):
 def test_report_collect_refuses_receiptless_stage(report_job, monkeypatch):
     register_stage(report_job, report_job["observed"].reporter["run_attempt"], "10-adapter").mkdir(
         parents=True)
-    with pytest.raises(ValueError, match="^release-snapshot-missing:"):
+    with pytest.raises(ValueError, match=r"^release-snapshot-missing:"):
         run_report(report_job, monkeypatch)
     assert_no_delivery(report_job)
 
@@ -1902,7 +1934,7 @@ def test_report_collect_refuses_other_attempt_snapshot(report_job, monkeypatch, 
     old["sequence"] += offset
     path = write_stage(report_job, report=old, attempt=old["sequence"])
     path.parent.rename(report_job["root"] / "withheld-other-attempt")
-    with pytest.raises(ValueError, match="^release-snapshot-attempt-mismatch:"):
+    with pytest.raises(ValueError, match=r"^release-snapshot-attempt-mismatch:"):
         run_report(report_job, monkeypatch)
     assert_no_delivery(report_job)
 
@@ -1915,8 +1947,10 @@ def test_report_collect_refuses_relabelled_snapshot(report_job, monkeypatch, fie
     write_stage(report_job, report=changed)
     monkeypatch.setenv("FAILED", str(failed).lower())
     if failed:
-        report_job["observed"].jobs[report_job["observed"].reporter["id"]][0]["conclusion"] = "failure"
-    with pytest.raises(ValueError, match="^release-snapshot-attempt-mismatch:"):
+        report_job["observed"].jobs[report_job["observed"].reporter["id"]][0]["conclusion"] = (
+            "failure"
+        )
+    with pytest.raises(ValueError, match=r"^release-snapshot-attempt-mismatch:"):
         run_report(report_job, monkeypatch)
     assert_no_delivery(report_job)
 
@@ -1937,14 +1971,14 @@ def test_report_collect_refuses_invalid_snapshot(report_job, monkeypatch, damage
     )
     if damage == "json":
         path.write_bytes(b"{")
-    with pytest.raises(ValueError, match="^release-snapshot-invalid:"):
+    with pytest.raises(ValueError, match=r"^release-snapshot-invalid:"):
         run_report(report_job, monkeypatch)
     assert_no_delivery(report_job)
 
 
 def test_report_collect_does_not_substitute_retained_receipt(report_job, monkeypatch):
     report_job["observed"].retain(report_job["report"])
-    with pytest.raises(ValueError, match="^release-snapshot-missing:"):
+    with pytest.raises(ValueError, match=r"^release-snapshot-missing:"):
         run_report(report_job, monkeypatch)
     assert_no_delivery(report_job)
     assert not any("/releases" in route for route in report_job["observed"].reads)
@@ -2026,7 +2060,7 @@ def test_retained_completion_rejects_pin_drift(report_job, slot):
         changed[slot]["facts_sha256"] = contract.sha256(slot.encode())
     observed = report_job["observed"]
     observed.retain(changed)
-    with pytest.raises(ValueError, match="^immutable completion receipt differs$"):
+    with pytest.raises(ValueError, match=r"^immutable completion receipt differs$"):
         reporting.retain(REPO, report_job["report"])
     assert observed.downloads == observed.writes == []
 
@@ -2138,7 +2172,7 @@ def test_publication_refuses_relabelled_snapshot(publisher_job, field):
     job["observed"].archives[job["publisher"] * 100] = receipt_archive(changed)
     report = receipts.receipt(None)
     before = copy.deepcopy(report)
-    with pytest.raises(ValueError, match="^release-snapshot-attempt-mismatch:"):
+    with pytest.raises(ValueError, match=r"^release-snapshot-attempt-mismatch:"):
         reporting.publication(REPO, job["publisher"], report)
     assert report == before
     assert job["observed"].downloads == job["observed"].writes == []
@@ -2211,7 +2245,7 @@ def test_publication_refuses_unavailable_attempt_bundle(publisher_job, inventory
         observed.bundles[f"validated-release-bundle-{job['publisher_attempt'] + offset}"] = {
             "evidence.json": contract.json_bytes({"run_id": 80}),
         }
-    with pytest.raises(ValueError, match="^release-bundle-unavailable:"):
+    with pytest.raises(ValueError, match=r"^release-bundle-unavailable:"):
         reporting.publication(REPO, job["publisher"], receipts.receipt(None))
     assert observed.downloads == [f"validated-release-bundle-{job['publisher_attempt']}"]
     assert observed.writes == []
@@ -2224,7 +2258,7 @@ def test_publication_refuses_invalid_bundle(publisher_job, contents):
     observed.bundles[f"validated-release-bundle-{job['publisher_attempt']}"] = (
         {} if contents == "missing-evidence" else {"evidence.json": b"{"}
     )
-    with pytest.raises(ValueError, match="^release-bundle-invalid:"):
+    with pytest.raises(ValueError, match=r"^release-bundle-invalid:"):
         reporting.publication(REPO, job["publisher"], receipts.receipt(None))
     assert observed.writes == []
 
@@ -2247,7 +2281,7 @@ def test_publication_current_bundle_reaches_main_gate(publisher_job, monkeypatch
 
     monkeypatch.setattr(reporting, "gate_for_run", before_main_gate)
     report = receipts.receipt(None)
-    with pytest.raises(MainGateBoundary, match="^before full main-proof gate$"):
+    with pytest.raises(MainGateBoundary, match=r"^before full main-proof gate$"):
         reporting.publication(REPO, job["publisher"], report)
     assert observed.downloads == [bundle]
     assert calls == [(REPO, main["run_id"], job["report"]["pr"]["merge"])]

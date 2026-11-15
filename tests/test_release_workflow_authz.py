@@ -238,7 +238,9 @@ def test_actual_report_call_passes_complete_needs_without_a_verdict_override(nam
     )
     if name == "release.yml":
         assert report["if"] == "!cancelled() && needs.authz.result == 'success'"
-        assert "needs.claim-name.result == 'failure' && 'claim-placeholder'" in report["with"]["stage"]
+        assert (
+            "needs.claim-name.result == 'failure' && 'claim-placeholder'" in report["with"]["stage"]
+        )
 
 
 def test_run_context_is_private_data_captured_before_artifact_transport() -> None:
@@ -249,14 +251,20 @@ def test_run_context_is_private_data_captured_before_artifact_transport() -> Non
     job = workflow["jobs"]["report"]
     assert job["env"]["RELEASE_NEEDS"] == "${{ inputs.orchestration }}"
     steps = job["steps"]
-    capture = next(step for step in steps if step.get("run") == "python -m release_chain.reporting context")
-    download = next(step for step in steps if step.get("uses", "").startswith("actions/download-artifact@"))
+    capture = next(
+        step for step in steps if step.get("run") == "python -m release_chain.reporting context"
+    )
+    download = next(
+        step for step in steps if step.get("uses", "").startswith("actions/download-artifact@")
+    )
     collect = next(step for step in steps if step.get("id") == "receipt")
     private = next(
         step for step in steps
         if step.get("with", {}).get("name") == "release-run-context-${{ github.run_attempt }}"
     )
-    assert steps.index(capture) < steps.index(download) < steps.index(collect) < steps.index(private)
+    assert (
+        steps.index(capture) < steps.index(download) < steps.index(collect) < steps.index(private)
+    )
     assert "if" not in capture and "continue-on-error" not in capture
     assert private["if"] == "always()"
     assert private["with"]["path"] == "run-context.json"

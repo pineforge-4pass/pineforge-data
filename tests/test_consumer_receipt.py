@@ -502,7 +502,9 @@ def test_cli_targetless_package_carries_actual_outcome_through_every_publisher_s
         publication["commands"].append(command)
         if command[:3] == ["gh", "run", "download"]:
             assert command[3] == str(state["python_run"]["id"])
-            assert command[7] == f"python-package-distributions-{state['python_run']['run_attempt']}"
+            assert command[7] == (
+                f"python-package-distributions-{state['python_run']['run_attempt']}"
+            )
             directory = Path(command[-1])
             directory.mkdir(parents=True)
             for name, raw in distributions.items():

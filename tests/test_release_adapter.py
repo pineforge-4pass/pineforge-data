@@ -1634,7 +1634,9 @@ def test_public_receipt_cannot_contain_homegrown_or_private_fields(ready) -> Non
         reporting.public_receipt(report)
 
 
-def test_failed_downstream_job_overrides_earlier_green_receipt(tmp_path, ready, monkeypatch) -> None:
+def test_failed_downstream_job_overrides_earlier_green_receipt(
+    tmp_path, ready, monkeypatch
+) -> None:
     monkeypatch.setenv("GITHUB_REPOSITORY", "owner/data")
     monkeypatch.setenv("GITHUB_RUN_ID", "200")
     monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "3")
@@ -2018,7 +2020,7 @@ def test_recovery_saved_receipt_requires_observed_installed_revision(saved_recov
     report = receipts.receipt(state["event"], "reconcile")
     before = copy.deepcopy(report)
     # Existing API shape reaches the actual old replay branch too.
-    with pytest.raises(ValueError, match="^stored publication installed source missing$"):
+    with pytest.raises(ValueError, match=r"^stored publication installed source missing$"):
         publishing.recover_applied("owner/data", state["root"], report)
     assert_saved_recovery_verification_order(state)
     assert report == before
@@ -2168,7 +2170,9 @@ def test_cli_stored_replay_preserves_original_identity_after_real_verification(
     assert "**verified**" in (state["root"] / "report-summary").read_text()
 
 
-@pytest.mark.parametrize("status", ["queued", "in_progress", None], ids=["queued", "running", "null"])
+@pytest.mark.parametrize(
+    "status", ["queued", "in_progress", None], ids=["queued", "running", "null"]
+)
 def test_cli_stored_replay_uses_needs_completion_when_job_api_lags(
     replay_cli_job, monkeypatch, status
 ):

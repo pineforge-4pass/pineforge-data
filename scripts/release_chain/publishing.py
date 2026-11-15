@@ -40,7 +40,6 @@ from .evidence import (
     matching_main_runs,
 )
 from .main_proofs import NATIVE_WORKFLOW
-from .receipts import candidate as record_candidate
 from .receipts import (
     OUTCOME_FILE,
     OUTCOME_SCHEMA,
@@ -51,6 +50,7 @@ from .receipts import (
     served,
     timestamp,
 )
+from .receipts import candidate as record_candidate
 
 # TEMPORARY first-adopter exemption (TX-DATA-BASELINE2, L6 10-19):
 # remove the data exemption and the hub form together, only after 0.3.1 is verified AND

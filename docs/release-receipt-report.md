@@ -23,11 +23,42 @@ bound to the repository and current run/attempt/head.
 
 Both the same-run collector and the completed-run adapter check this context
 against independent current run, job and artifact observations; a workflow-run
-source is re-read independently. Manual **CI** and **Native feed** dispatches on
+source is re-read at its recorded run ID and attempt. A later running attempt
+does not invalidate that completed original trigger. Missing or conflicting
+specific-attempt data still refuses. Manual **CI** and **Native feed** dispatches on
 main and successful placeholder claims can therefore finish silently when all
 release producers were skipped. Empty inventory alone cannot grant this outcome.
 Executed producers still require their evidence. Missing, stale or conflicting
 context and incomplete inventories refuse collection.
+
+One narrow case can be quiet without a context that had no chance to be written:
+the provider independently proves that the exact main-branch Release attempt
+completed with conclusion `cancelled`, and its complete attempt-job response
+explicitly declares `total_count: 0` and `jobs: []`. Repository, workflow,
+source and attempt must match, and no stage, context, bundle or receipt evidence
+may exist. Downloaded stage evidence also refuses this outcome. The adapter
+records `publisher-cancelled-before-execution` in the existing internal witness,
+bound to publisher ID, attempt and head, and rechecks the provider facts when
+collecting it.
+
+The adapter's own authenticated context remains required.
+For a `workflow_run` report, the witness tuple must first match the authenticated
+original event. The collector then reads that event's exact independent API
+attempt and complete job inventory, without reading the latest publisher run.
+Advancing only latest to a running or successful attempt therefore preserves
+the original cancelled-attempt outcome. Missing or conflicting historical facts
+still refuse. A manual `workflow_dispatch` request's original `publication_run`
+continues to select the latest publisher; an older cancelled witness cannot
+override that current target. Publisher evidence from any attempt still refuses
+the quiet cancellation outcome. Empty lists without complete metadata, any
+executed or refused authz job, or another publisher conclusion cannot authorize
+this outcome.
+This proves no execution; it does not establish why cancellation happened.
+No public receipt or callback is produced for that publisher.
+
+The context is an ordinary run artifact with the repository's artifact access
+and 90-day retention. It contains the full original event payload; "private"
+here means outside the public receipt contract, not a separate access boundary.
 
 Same-run completion comes from actual workflow `needs`; lagging REST status does
 not withhold a valid producer snapshot. The API still supplies independent job
@@ -133,8 +164,8 @@ those issues and Actions logs.
   send the four-key signal. Upload failure prevents dispatch. A transport error
   creates a local incident without overwriting an uploaded completion snapshot.
 
-Intermediate receipt snapshots serialize the same public contract. CR206 also
-carries a separate private producer witness for targetless decisions and stored
+Intermediate receipt snapshots serialize the same public contract. Stages also
+carry a separate private producer witness for targetless decisions and stored
 replay. Only the literal coordinator artifact is selected by the hub policy.
 
 For `verified`, both CI/E2E reference the complete successful pre-merge PR CI

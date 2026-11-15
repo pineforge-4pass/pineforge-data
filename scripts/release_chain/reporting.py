@@ -63,6 +63,7 @@ NO_TARGET_STAGES = {
     "reporter-handoff": {"10-adapter"},
     "publisher-no-target": {"10-adapter"},
     "publisher-no-producer": {"10-adapter"},
+    "publisher-cancelled-before-execution": {"10-adapter"},
 }
 NO_TARGET_INPUTS = {
     "ordinary-main": {"ci_run", "ci_attempt", "source"},
@@ -75,6 +76,7 @@ NO_TARGET_INPUTS = {
     "reporter-handoff": {"publication_run", "version", "source"},
     "publisher-no-target": {"publication_run", "publication_attempt", "outcome_sha256"},
     "publisher-no-producer": {"publication_run", "publication_attempt", "context_sha256"},
+    "publisher-cancelled-before-execution": {"publication_run", "publication_attempt", "source"},
 }
 
 
@@ -190,7 +192,9 @@ def checked_context(
             and type(source.get("run_attempt")) is int and source["run_attempt"] > 0,
             "release-run-context-invalid: original upstream identity missing",
         )
-        upstream = api(repo, f"actions/runs/{source['id']}")
+        # A later re-run does not change the completed attempt that invoked us.
+        # This is an independent attempt record, never the event as its own proof.
+        upstream = api(repo, f"actions/runs/{source['id']}/attempts/{source['run_attempt']}")
         require(
             isinstance(upstream, dict) and type(upstream.get("id")) is int
             and type(upstream.get("run_attempt")) is int,
@@ -343,6 +347,55 @@ def checked_no_producer(run: dict[str, Any], context: dict[str, Any] | None) -> 
         )
 
 
+def checked_cancelled_before_execution(
+    repo: str, run: dict[str, Any], jobs: list[Any], artifacts: list[Any],
+) -> None:
+    """The provider must explicitly prove that this cancelled attempt ran no jobs."""
+    require(
+        type(run.get("id")) is int and run["id"] > 0
+        and type(run.get("run_attempt")) is int and run["run_attempt"] > 0
+        and run.get("path") == ".github/workflows/release.yml"
+        and run.get("name") == "Release" and run.get("head_branch") == "main"
+        and run.get("event") in {"workflow_run", "workflow_dispatch"}
+        and isinstance(run.get("head_sha"), str)
+        and re.fullmatch(r"[0-9a-f]{40}", run["head_sha"])
+        and run.get("status") == "completed" and run.get("conclusion") == "cancelled"
+        and all(isinstance(run.get(key), dict) and run[key].get("full_name") == repo
+                for key in ("repository", "head_repository")),
+        "release-producer-outcome-invalid: cancelled publisher binding differs",
+    )
+    endpoint = f"actions/runs/{run['id']}/attempts/{run['run_attempt']}"
+    exact = api(repo, endpoint)
+    fields = {
+        "id", "run_attempt", "path", "name", "event", "head_branch", "head_sha",
+        "status", "conclusion",
+    }
+    require(
+        isinstance(exact, dict) and type(exact.get("id")) is int
+        and type(exact.get("run_attempt")) is int
+        and all(field in exact and exact[field] == run[field] for field in fields)
+        and all(isinstance(exact.get(key), dict) and exact[key].get("full_name") == repo
+                for key in ("repository", "head_repository")),
+        "release-producer-outcome-invalid: cancelled publisher attempt differs",
+    )
+    # inventory() deliberately returns rows only. This exceptional zero-job
+    # decision additionally needs the provider's complete explicit count.
+    page = api(repo, endpoint + "/jobs?per_page=100&page=1")
+    require(
+        isinstance(page, dict) and type(page.get("total_count")) is int
+        and page["total_count"] == 0 and isinstance(page.get("jobs"), list)
+        and page["jobs"] == [] and jobs == [],
+        "release-producer-outcome-invalid: cancelled publisher lacks complete zero-job inventory",
+    )
+    require(
+        not any(row["name"].startswith((
+            "release-stage-", RUN_CONTEXT_PREFIX, "validated-release-bundle-",
+        )) or row["name"] in {"release-receipt-data", "release-receipt.json", OUTCOME_FILE}
+                for row in artifacts),
+        "release-producer-outcome-invalid: cancelled publisher has evidence",
+    )
+
+
 def producer_job(
     stage: str, jobs: list[Any], context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -385,7 +438,10 @@ def publication_stage(
         raise ValueError("release-snapshot-invalid: unreadable stage archive") from error
 
 
-def checked_no_target(repo: str, run: dict[str, Any], outcome: dict[str, Any]) -> None:
+def checked_no_target(
+    repo: str, run: dict[str, Any], outcome: dict[str, Any],
+    context: dict[str, Any] | None = None,
+) -> None:
     reason, inputs = outcome["reason"], outcome["inputs"]
     require(
         set(inputs) == NO_TARGET_INPUTS[reason],
@@ -452,6 +508,45 @@ def checked_no_target(repo: str, run: dict[str, Any], outcome: dict[str, Any]) -
         commit = api(repo, f"commits/{inputs['base']}")
         require(commit.get("sha") == inputs["base"], "release-producer-outcome-invalid: base differs")
     else:
+        if reason == "publisher-cancelled-before-execution":
+            event = context["event"] if context is not None else {}
+            source = event.get("workflow_run")
+            dispatch = event.get("inputs")
+            require(
+                context is not None
+                and run["path"] == ".github/workflows/" + WORKFLOW
+                and (
+                    run["event"] == "workflow_run" and isinstance(source, dict)
+                    and source.get("id") == inputs["publication_run"]
+                    and source.get("run_attempt") == inputs["publication_attempt"]
+                    and source.get("head_sha") == inputs["source"]
+                    or run["event"] == "workflow_dispatch" and isinstance(dispatch, dict)
+                    and dispatch.get("publication_run") == str(inputs["publication_run"])
+                ),
+                "release-producer-outcome-invalid: cancelled publisher trigger differs",
+            )
+            if run["event"] == "workflow_run":
+                # checked_context authenticated this original event against
+                # its independent attempt record. The witness cannot choose
+                # another attempt, and a later re-run cannot replace this one.
+                publisher = api(
+                    repo, f"actions/runs/{source['id']}/attempts/{source['run_attempt']}"
+                )
+            else:
+                # A manual request still selects the current publisher.
+                publisher = api(repo, f"actions/runs/{dispatch['publication_run']}")
+            require(
+                isinstance(publisher, dict) and publisher.get("id") == inputs["publication_run"]
+                and publisher.get("run_attempt") == inputs["publication_attempt"]
+                and publisher.get("head_sha") == inputs["source"],
+                "release-producer-outcome-invalid: cancelled publisher inputs differ",
+            )
+            artifacts = inventory(repo, f"actions/runs/{publisher['id']}/artifacts", "artifacts")
+            jobs = inventory(
+                repo, f"actions/runs/{publisher['id']}/attempts/{publisher['run_attempt']}/jobs", "jobs"
+            )
+            checked_cancelled_before_execution(repo, publisher, jobs, artifacts)
+            return
         publisher = api(repo, f"actions/runs/{inputs['publication_run']}")
         require(
             publisher.get("id") == inputs["publication_run"]
@@ -493,6 +588,7 @@ def checked_no_target(repo: str, run: dict[str, Any], outcome: dict[str, Any]) -
             context = publisher_context(repo, publisher, jobs, artifacts)
             stage_inventory(rows, publisher, context)
             checked = None
+            decision = None
             for row in rows:
                 prior, decision = publication_stage(repo, row)
                 current = checked_stage(
@@ -501,7 +597,8 @@ def checked_no_target(repo: str, run: dict[str, Any], outcome: dict[str, Any]) -
                 same_decision(checked, current)
                 checked = current
             require(
-                decision is not None and sha256(canonical(decision)) == inputs["outcome_sha256"],
+                checked is not None and decision is not None
+                and sha256(canonical(decision)) == inputs["outcome_sha256"],
                 "release-producer-outcome-invalid: publisher outcome differs",
             )
             assert checked is not None
@@ -595,7 +692,7 @@ def checked_stage(
             and loaded is None and outcome["receipt_sha256"] is None,
             "release-producer-outcome-invalid: no-target decision conflicts with snapshot",
         )
-        checked_no_target(repo, run, outcome)
+        checked_no_target(repo, run, outcome, context)
         report = receipt(None)
     else:
         require(
@@ -723,6 +820,17 @@ def collect(directory: Path, *, failed: bool) -> dict[str, Any]:
         except (OSError, ValueError) as error:
             raise ValueError(f"release-snapshot-invalid: {row['name']}") from error
         current = checked_stage(repo, run, row["name"][len(prefix):], jobs, loaded, outcome, context)
+        if (
+            (getattr(current, "outcome", None) or {}).get("reason")
+            == "publisher-cancelled-before-execution"
+        ):
+            require(
+                {path.name for path in directory.glob("release-stage-*")} == {row["name"]}
+                and not any((directory / name).exists() for name in {
+                    "release-receipt.json", OUTCOME_FILE, RUN_CONTEXT_FILE, "evidence.json",
+                }),
+                "release-producer-outcome-invalid: cancelled publisher has downloaded evidence",
+            )
         same_decision(report, current)
         report = current
     assert report is not None
@@ -830,7 +938,9 @@ def callback(report: dict[str, Any]) -> None:
     )
 
 
-def publication(repo: str, run_id: int, report: dict[str, Any]) -> None:
+def publication(
+    repo: str, run_id: int, report: dict[str, Any], *, directory: Path = Path("receipts"),
+) -> None:
     """Finalize a completed Release run using observed candidate, deploy and PyPI evidence."""
     require(type(run_id) is int and run_id > 0, "invalid publication run ID")
     run = api(repo, f"actions/runs/{run_id}")
@@ -848,6 +958,24 @@ def publication(repo: str, run_id: int, report: dict[str, Any]) -> None:
     rows = stage_rows(artifacts, run)
     jobs = inventory(repo, f"actions/runs/{run_id}/attempts/{run['run_attempt']}/jobs", "jobs")
     context = publisher_context(repo, run, jobs, artifacts)
+    if not rows and context is None and run["conclusion"] == "cancelled":
+        checked_cancelled_before_execution(repo, run, jobs, artifacts)
+        require(
+            report["event_id"] is None and report["release_version"] is None,
+            "release-producer-outcome-invalid: cancelled publisher conflicts with current target",
+        )
+        require(
+            not any(directory.glob("release-stage-*"))
+            and not any((directory / name).exists() for name in {
+                "release-receipt.json", OUTCOME_FILE, RUN_CONTEXT_FILE, "evidence.json",
+            }),
+            "release-producer-outcome-invalid: cancelled publisher has downloaded evidence",
+        )
+        observe_outcome(
+            report, "no-target", "publisher-cancelled-before-execution",
+            publication_run=run_id, publication_attempt=run["run_attempt"], source=run["head_sha"],
+        )
+        return
     stage_inventory(rows, run, context)
     if not rows:
         checked_no_producer(run, context)
@@ -1071,7 +1199,7 @@ def main() -> None:
     elif args.command == "publication":
         report = receipt(None)
         try:
-            publication(repo, args.run, report)
+            publication(repo, args.run, report, directory=args.directory)
         except Exception:
             report["state"] = "failed"
             raise

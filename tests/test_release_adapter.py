@@ -2187,6 +2187,10 @@ def test_cli_stored_replay_uses_needs_completion_when_job_api_lags(
         "name": "authz", "status": "completed", "conclusion": "success",
         "run_id": run["id"], "run_attempt": run["run_attempt"], "head_sha": run["head_sha"],
     })
+    state["cli_jobs"].append({
+        "name": "report / report", "status": "in_progress", "conclusion": None,
+        "run_id": run["id"], "run_attempt": run["run_attempt"], "head_sha": run["head_sha"],
+    })
     path = state["root"] / "lag-workflow-event.json"
     path.write_bytes(contract.json_bytes({
         "repository": {"full_name": "owner/data"}, "ref": "refs/heads/main",

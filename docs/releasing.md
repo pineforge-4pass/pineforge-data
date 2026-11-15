@@ -127,9 +127,12 @@ The reporting workflow also retains private `run-context.json` in the separate
 captures the runner's original event, including the upstream run and attempt for
 `workflow_run` or the original Release dispatch inputs, and the caller's actual
 `needs` observations. Consumers bind those facts to the repository, run, attempt
-and head, re-read the upstream run, and check the complete current job and stage
-inventories. This context stays outside the public receipt, immutable completion
-asset and four-key callback.
+and head, re-read the upstream run's exact recorded attempt, and check the
+complete current job and stage inventories. A newer running attempt does not
+invalidate the original completed trigger; missing or conflicting exact-attempt
+data still fails. This context stays outside the public receipt, immutable
+completion asset and four-key callback. It is an ordinary repository run artifact
+holding the full event payload for 90 days, with the repository's artifact access.
 
 A manual dispatch of **CI** or **Native feed** on main can complete a Release
 run with every release producer skipped. A successful `claim_placeholder` run
@@ -140,13 +143,37 @@ or an executed producer with missing evidence cannot establish this outcome.
 Report-only retries cannot borrow context or stage evidence from another attempt;
 use **Re-run all jobs** when evidence needs regeneration.
 
+The sole context-free empty-publisher exception requires independent provider
+proof that the exact Release run/attempt on main completed as `cancelled` before
+any job executed. The selected run and independent specific-attempt record must
+match repository, workflow, main branch, head, run ID and attempt. The complete attempt-jobs response
+must explicitly declare integer `total_count: 0` and `jobs: []`, with no stage,
+context, bundle or receipt evidence and no downloaded stage. An executed job,
+including a refused authz job, incomplete inventory metadata, or a noncancelled
+publisher stays on the strict evidence paths. The adapter emits only an internal
+`publisher-cancelled-before-execution` witness bound to that publisher ID,
+attempt and head.
+
+Collection still requires the adapter's own authenticated
+reporting context. For a `workflow_run` trigger, collection first matches the
+witness's publisher ID, attempt and head to the authenticated original event,
+then selects that event's exact independent API attempt and complete jobs.
+A newer running or successful latest attempt cannot replace the original
+cancelled attempt; this consumer path does not read the latest publisher run.
+For manual `workflow_dispatch`, the original `publication_run` input still
+selects the latest publisher, so an older cancelled witness cannot suppress
+the current target. Publisher stage, context, bundle or receipt evidence,
+including evidence from a later attempt, still refuses this quiet outcome.
+It emits no public receipt or callback and makes no claim about the cause of
+cancellation.
+
 For jobs in the reporting run, the workflow's actual `needs` results establish
 completion. The attempt-jobs API independently supplies names and run/source
 bindings, but its status can still be queued, running or null after completion.
 Conflicting terminal conclusions, missing or unexpected jobs, and mismatched
 attempts or sources refuse collection. Historical runs without this context
 still require terminal API proof for their existing producer artifacts; they
-cannot use an empty inventory to establish a quiet no-target result.
+cannot use an empty inventory alone to establish a quiet no-target result.
 
 The internal witness has `schema`, `run_id`, `run_attempt`, `head_sha`, `outcome`,
 `reason`, `inputs` and `receipt_sha256`. Actual no-target decisions use a null

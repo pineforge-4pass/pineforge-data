@@ -50,6 +50,7 @@ class ReportObservations:
             }),
         }
         self.runs, self.jobs = {}, {}
+        self.attempts, self.job_pages = {}, {}
         for observed_id, observed_attempt, workflow, source, names in (
             (70, 2, "ci.yml", HEAD, receipts.CI_JOBS),
             (200, attempt + 2, "release.yml", MERGE, receipts.DEPLOY_JOBS),
@@ -98,7 +99,16 @@ class ReportObservations:
             if parts[-1] == "artifacts":
                 return {"artifacts": copy.deepcopy(self.artifacts.get(run_id, []))}
             if "attempts" in parts:
-                assert int(parts[4]) == self.runs[run_id]["run_attempt"]
+                attempt = int(parts[4])
+                if parts[-1] != "jobs":
+                    # No fallback to latest: the independently installed attempt
+                    # record can be absent, malformed or older than that run.
+                    return copy.deepcopy(self.attempts.get((run_id, attempt)))
+                if (run_id, attempt) in self.job_pages:
+                    return copy.deepcopy(self.job_pages[(run_id, attempt)])
+                # Explicit historical pages are independent of the latest run.
+                # Retain the legacy latest-only fallback for older fixtures.
+                assert attempt == self.runs[run_id]["run_attempt"]
             if parts[-1] == "jobs":
                 return {"jobs": copy.deepcopy(self.jobs[run_id])}
             return copy.deepcopy(self.runs[run_id])
@@ -299,6 +309,13 @@ def bound_job_facts(run, facts):
     ]
 
 
+def active_report_job(run):
+    return {
+        "name": "report / report", "status": "in_progress", "conclusion": None,
+        "run_id": run["id"], "run_attempt": run["run_attempt"], "head_sha": run["head_sha"],
+    }
+
+
 def trusted_call(job, monkeypatch, needs, event):
     run = job["observed"].reporter
     path = job["root"] / f"workflow-event-{run['id']}.json"
@@ -340,7 +357,7 @@ def no_producer_facts(job, monkeypatch, origin):
         ("authz", "success"), ("claim-name", "success" if origin == "claim" else "skipped"),
         ("manual-pr", "skipped"), ("prepare", "skipped"), ("build", "skipped"),
         ("github-release", "skipped"), ("publish", "skipped"), ("verify", "skipped"),
-    ])
+    ]) + [active_report_job(run)]
     if origin == "claim":
         event = {
             "repository": {"full_name": REPO}, "ref": "refs/heads/main",
@@ -358,6 +375,7 @@ def no_producer_facts(job, monkeypatch, origin):
             "repository": {"full_name": REPO}, "head_repository": {"full_name": REPO},
         }
         observed.runs[810] = copy.deepcopy(upstream)
+        observed.attempts[(810, 3)] = copy.deepcopy(upstream)
         event = {"repository": {"full_name": REPO}, "action": "completed", "workflow_run": upstream}
     return trusted_call(job, monkeypatch, needs, event)
 
@@ -392,13 +410,14 @@ def adapter_call(job, monkeypatch, publisher=None, *, failed=False):
     else:
         event = {"repository": {"full_name": REPO}, "action": "completed",
                  "workflow_run": copy.deepcopy(publisher)}
+        observed.attempts[(publisher["id"], publisher["run_attempt"])] = copy.deepcopy(publisher)
     needs = {
         "authz": {"result": "success", "outputs": {}},
         "reconcile": {"result": "failure" if failed else "success", "outputs": {}},
     }
     observed.jobs[run["id"]] = bound_job_facts(run, [
         ("authz", "success"), ("reconcile", "failure" if failed else "success"),
-    ])
+    ]) + [active_report_job(run)]
     monkeypatch.setenv("FAILED", str(failed).lower())
     return trusted_call(job, monkeypatch, needs, event)
 
@@ -458,6 +477,775 @@ def test_cli_no_producer_publication_and_adapter_recheck_raw_context(
                for route in job["observed"].reads) == 2
 
 
+def publication_cli(job, monkeypatch, publisher_id):
+    produced = job["root"] / "publication-producer"
+    monkeypatch.setattr(sys, "argv", [
+        "release_chain.reporting", "publication", "--run", str(publisher_id),
+        "--directory", str(job["root"] / "receipts"),
+        "--receipt", str(produced / "release-receipt.json"),
+    ])
+    reporting.main()
+    return produced
+
+
+@pytest.mark.parametrize("origin", ["ci", "native"])
+@pytest.mark.parametrize("entry", ["report", "publisher-and-adapter"])
+def test_cli_original_trigger_uses_recorded_attempt_after_rerun(
+    report_job, monkeypatch, origin, entry
+):
+    job = report_job
+    context = no_producer_facts(job, monkeypatch, origin)
+    observed = job["observed"]
+    original = context["event"]["workflow_run"]
+    original["run_attempt"] = 1
+    observed.attempts[(810, 1)] = copy.deepcopy(original)
+    # Independent latest-run response: it is deliberately still readable by
+    # exact85, so its RED is the real "checked upstream differs" refusal.
+    observed.runs[810].update(run_attempt=2, status="in_progress", conclusion=None)
+    trusted_call(job, monkeypatch, context["needs"], context["event"])
+    assert observed.attempts[(810, 1)]["status"] == "completed"
+    assert observed.runs[810]["run_attempt"] == 2
+    if entry == "report":
+        run_report(job, monkeypatch)
+    else:
+        publisher = observed.reporter
+        publisher.update(status="completed", conclusion="success")
+        retain_context_facts(job, context)
+        adapter_call(job, monkeypatch, publisher)
+        produced = publication_cli(job, monkeypatch, publisher["id"])
+        assert not (produced / "release-receipt.json").exists()
+        assert ship_producer(job, produced, "10-adapter") is not None
+        run_report(job, monkeypatch)
+    assert_silent_noop(job)
+    assert f"repos/{REPO}/actions/runs/810/attempts/1" in observed.reads
+    assert f"repos/{REPO}/actions/runs/810" not in observed.reads
+
+
+@pytest.mark.parametrize("damage,cause", [
+    ("missing", "malformed checked upstream"),
+    ("list", "malformed checked upstream"),
+    ("attempt-missing", "malformed checked upstream"),
+    ("attempt-type", "malformed checked upstream"),
+    ("id", "checked upstream differs"),
+    ("attempt", "checked upstream differs"),
+    ("source", "checked upstream differs"),
+    ("path", "checked upstream differs"),
+    ("name", "checked upstream differs"),
+    ("event", "checked upstream differs"),
+    ("branch", "checked upstream differs"),
+    ("repository", "checked upstream differs"),
+    ("head-repository", "checked upstream differs"),
+    ("incomplete", "checked upstream differs"),
+    ("conclusion", "checked upstream differs"),
+    ("partial", "checked upstream differs"),
+])
+def test_cli_original_trigger_requires_independent_specific_attempt(
+    report_job, monkeypatch, damage, cause
+):
+    job = report_job
+    no_producer_facts(job, monkeypatch, "ci")
+    observed = job["observed"]
+    exact = observed.attempts[(810, 3)]
+    assert exact == observed.runs[810] and exact is not observed.runs[810]
+    if damage in {"missing", "list"}:
+        observed.attempts[(810, 3)] = None if damage == "missing" else []
+    elif damage in {"attempt-missing", "partial"}:
+        exact.pop("run_attempt" if damage == "attempt-missing" else "path")
+    elif damage == "attempt-type":
+        exact["run_attempt"] = "3"
+    elif damage == "incomplete":
+        exact.update(status="in_progress", conclusion=None)
+    elif damage in {"repository", "head-repository"}:
+        exact[damage.replace("-", "_")] = {"full_name": "outside/data"}
+    else:
+        field, value = {
+            "id": ("id", 811), "attempt": ("run_attempt", 4), "source": ("head_sha", HEAD),
+            "path": ("path", ".github/workflows/native-feed-post.yml"),
+            "name": ("name", "Native feed"), "event": ("event", "push"),
+            "branch": ("head_branch", "other"), "conclusion": ("conclusion", "failure"),
+        }[damage]
+        exact[field] = value
+    with pytest.raises(ValueError, match="^release-run-context-invalid: " + cause):
+        run_report(job, monkeypatch)
+    assert_no_delivery(job)
+    assert f"repos/{REPO}/actions/runs/810/attempts/3" in observed.reads
+    assert f"repos/{REPO}/actions/runs/810" not in observed.reads
+
+
+@pytest.mark.parametrize("trigger", ["pr-ci", "hub-dispatch"])
+def test_cli_adapter_context_covers_real_trigger_and_running_report_row(
+    report_job, monkeypatch, trigger
+):
+    job = report_job
+    context = adapter_call(job, monkeypatch)
+    observed, run = job["observed"], job["observed"].reporter
+    if trigger == "pr-ci":
+        upstream = {
+            "id": 70, "run_attempt": 1, "name": "CI", "path": ".github/workflows/ci.yml",
+            "event": "pull_request", "head_branch": "bot/pineforge-release/main/stable/2.0.0",
+            "head_sha": HEAD, "status": "completed", "conclusion": "success",
+            "repository": {"full_name": REPO}, "head_repository": {"full_name": REPO},
+        }
+        observed.attempts[(70, 1)] = copy.deepcopy(upstream)
+        observed.runs[70] = {
+            **copy.deepcopy(upstream), "run_attempt": 2, "status": "in_progress", "conclusion": None,
+        }
+        run["event"] = "workflow_run"
+        event = {"repository": {"full_name": REPO}, "action": "completed", "workflow_run": upstream}
+    else:
+        run["event"] = "repository_dispatch"
+        event = {"repository": {"full_name": REPO}, "action": "pineforge-release-ready",
+                 "client_payload": copy.deepcopy(observed.event)}
+    trusted_call(job, monkeypatch, context["needs"], event)
+    assert observed.jobs[run["id"]][-1] == active_report_job(run)
+    write_stage(job)
+    original = receipts.canonical(job["report"])
+    run_report(job, monkeypatch)
+    assert (job["root"] / "release-receipt.json").read_bytes() == original
+    assert (job["root"] / "outputs").read_text() == "has_event=true\n"
+    if trigger == "pr-ci":
+        assert f"repos/{REPO}/actions/runs/70/attempts/1" in observed.reads
+        assert f"repos/{REPO}/actions/runs/70" not in observed.reads
+    # Collection scope: the staged receipt is a fixed fixture. The real
+    # reconcile/gates, replay and repair controls remain separate obligations.
+
+
+def cancelled_publisher_facts(
+    job, monkeypatch, trigger="workflow_run", report_trigger="workflow_run"
+):
+    observed = job["observed"]
+    publisher = {
+        "id": 200, "run_attempt": observed.runs[200]["run_attempt"], "head_sha": MERGE,
+        "path": ".github/workflows/release.yml", "name": "Release", "head_branch": "main",
+        "event": trigger, "status": "completed", "conclusion": "cancelled",
+        "repository": {"full_name": REPO}, "head_repository": {"full_name": REPO},
+    }
+    observed.runs[200] = publisher
+    observed.jobs[200] = []
+    # The count is an explicit transport observation, never len(jobs), a
+    # missing-key default, or a product/expected-receipt decision.
+    observed.job_pages[(200, publisher["run_attempt"])] = {"total_count": 0, "jobs": []}
+    observed.artifacts[200] = []
+    context = adapter_call(job, monkeypatch, publisher)
+    if report_trigger == "workflow_dispatch":
+        observed.reporter["event"] = report_trigger
+        trusted_call(job, monkeypatch, context["needs"], {
+            "repository": {"full_name": REPO}, "ref": "refs/heads/main",
+            "inputs": {"publication_run": "200"},
+        })
+    return publisher
+
+
+@pytest.mark.parametrize("trigger", ["workflow_run", "workflow_dispatch"])
+@pytest.mark.parametrize("report_trigger", ["workflow_run", "workflow_dispatch"])
+def test_cli_cancelled_before_execution_is_quiet_only_after_provider_recheck(
+    report_job, monkeypatch, trigger, report_trigger
+):
+    job = report_job
+    publisher = cancelled_publisher_facts(job, monkeypatch, trigger, report_trigger)
+    produced = publication_cli(job, monkeypatch, publisher["id"])
+    path = produced / "producer-outcome.json"
+    assert path.is_file() and not (produced / "release-receipt.json").exists()
+    witness = contract.object_json(path.read_bytes())
+    assert witness["reason"] == "publisher-cancelled-before-execution"
+    assert witness["inputs"] == {
+        "publication_run": 200, "publication_attempt": publisher["run_attempt"], "source": MERGE,
+    }
+    assert witness["receipt_sha256"] is None
+    assert witness["run_id"] == 3100 and witness["run_attempt"] == 7
+    assert ship_producer(job, produced, "10-adapter") is not None
+    before = list(job["observed"].reads)
+    run_report(job, monkeypatch)
+    assert_silent_noop(job)
+    reads = job["observed"].reads[len(before):]
+    exact = f"repos/{REPO}/actions/runs/200/attempts/{publisher['run_attempt']}"
+    assert exact in before and exact in reads
+    assert exact + "/jobs?per_page=100&page=1" in reads
+    assert f"repos/{REPO}/actions/runs/200/artifacts?per_page=100&page=1" in reads
+    assert set(job["observed"].job_pages[(200, publisher["run_attempt"])]) == {"total_count", "jobs"}
+    assert not any("supersed" in str(value) for value in witness.values())
+
+
+def original_cancelled_attempt_witness(job, monkeypatch, *, report_trigger="workflow_run"):
+    """Produce a real witness over separately authored event/run/attempt facts."""
+    observed = job["observed"]
+    original = {
+        "id": 200, "run_attempt": 1, "head_sha": MERGE,
+        "path": ".github/workflows/release.yml", "name": "Release", "head_branch": "main",
+        "event": "workflow_run", "status": "completed", "conclusion": "cancelled",
+        "repository": {"full_name": REPO}, "head_repository": {"full_name": REPO},
+    }
+    historical = {
+        "id": 200, "run_attempt": 1, "head_sha": MERGE,
+        "path": ".github/workflows/release.yml", "name": "Release", "head_branch": "main",
+        "event": "workflow_run", "status": "completed", "conclusion": "cancelled",
+        "repository": {"full_name": REPO}, "head_repository": {"full_name": REPO},
+    }
+    observed.runs[200] = {
+        "id": 200, "run_attempt": 1, "head_sha": MERGE,
+        "path": ".github/workflows/release.yml", "name": "Release", "head_branch": "main",
+        "event": "workflow_run", "status": "completed", "conclusion": "cancelled",
+        "repository": {"full_name": REPO}, "head_repository": {"full_name": REPO},
+    }
+    context = adapter_call(job, monkeypatch, original)
+    # Replace adapter_call's convenience copy before any product call. This
+    # historical API response is authored independently of the event and latest.
+    observed.attempts[(200, 1)] = historical
+    observed.jobs[200] = []
+    observed.job_pages[(200, 1)] = {"total_count": 0, "jobs": []}
+    observed.artifacts[200] = []
+    if report_trigger == "workflow_dispatch":
+        observed.reporter["event"] = report_trigger
+        context = trusted_call(job, monkeypatch, context["needs"], {
+            "repository": {"full_name": REPO}, "ref": "refs/heads/main",
+            "inputs": {"publication_run": "200"},
+        })
+    assert original == historical == observed.runs[200]
+    assert original is not historical and historical is not observed.runs[200]
+    assert observed.job_pages[(200, 1)] == {"total_count": 0, "jobs": []}
+    assert type(observed.job_pages[(200, 1)]["total_count"]) is int
+    assert observed.jobs[200] == observed.artifacts[200] == []
+    produced = publication_cli(job, monkeypatch, 200)
+    path = produced / "producer-outcome.json"
+    assert path.is_file() and not (produced / "release-receipt.json").exists()
+    witness = contract.object_json(path.read_bytes())
+    assert witness["reason"] == "publisher-cancelled-before-execution"
+    assert witness["inputs"] == {
+        "publication_run": 200, "publication_attempt": 1, "source": MERGE,
+    }
+    assert witness["run_id"] == 3100 and witness["run_attempt"] == 7
+    assert witness["receipt_sha256"] is None
+    stage = ship_producer(job, produced, "10-adapter")
+    assert stage is not None and (stage / "producer-outcome.json").is_file()
+    assert not (stage / "release-receipt.json").exists()
+    return context, historical, stage
+
+
+def advance_publisher_to_attempt_two(job, status, conclusion):
+    """Install raw latest facts and populated jobs, independent of the witness."""
+    observed = job["observed"]
+    latest = {
+        "id": 200, "run_attempt": 2, "head_sha": HEAD,
+        "path": ".github/workflows/release.yml", "name": "Release", "head_branch": "main",
+        "event": "workflow_run", "status": status, "conclusion": conclusion,
+        "repository": {"full_name": REPO}, "head_repository": {"full_name": REPO},
+    }
+    jobs = bound_job_facts(latest, [
+        ("authz", "success"), ("claim-name", "skipped"), ("manual-pr", "skipped"),
+        ("prepare", "success"), ("build", "success"), ("github-release", "success"),
+        ("publish", "success"), ("verify", "success"), ("report / report", "success"),
+    ])
+    if status == "in_progress":
+        jobs[-1].update(status="in_progress", conclusion=None)
+    elif conclusion == "cancelled":
+        jobs[-1]["conclusion"] = "cancelled"
+    observed.runs[200] = latest
+    observed.jobs[200] = jobs
+    observed.job_pages[(200, 2)] = {"total_count": 9, "jobs": copy.deepcopy(jobs)}
+    assert observed.attempts[(200, 1)]["run_attempt"] == 1
+    assert observed.attempts[(200, 1)]["conclusion"] == "cancelled"
+    assert observed.job_pages[(200, 1)] == {"total_count": 0, "jobs": []}
+    assert observed.job_pages[(200, 2)]["total_count"] == 9 and jobs
+    return latest
+
+
+@pytest.mark.parametrize("latest_status,latest_conclusion", [
+    ("in_progress", None), ("completed", "success"),
+])
+def test_cli_original_cancelled_witness_survives_publisher_rerun(
+    report_job, monkeypatch, latest_status, latest_conclusion
+):
+    job = report_job
+    context, historical, stage = original_cancelled_attempt_witness(job, monkeypatch)
+    observed = job["observed"]
+    event_before = receipts.canonical(context["event"])
+    historical_before = receipts.canonical(historical)
+    witness_before = (stage / "producer-outcome.json").read_bytes()
+    latest = advance_publisher_to_attempt_two(job, latest_status, latest_conclusion)
+    assert context["event"]["workflow_run"]["run_attempt"] == 1
+    assert historical is observed.attempts[(200, 1)] and historical is not latest
+    assert historical["head_sha"] == MERGE and latest["head_sha"] == HEAD
+    assert observed.artifacts[200] == []
+    before = len(observed.reads)
+    run_report(job, monkeypatch)
+    assert_silent_noop(job)
+    reads = observed.reads[before:]
+    exact = f"repos/{REPO}/actions/runs/200/attempts/1"
+    assert exact in reads and exact + "/jobs?per_page=100&page=1" in reads
+    assert f"repos/{REPO}/actions/runs/200/artifacts?per_page=100&page=1" in reads
+    assert f"repos/{REPO}/actions/runs/200" not in reads
+    assert not any("/actions/runs/200/attempts/2" in route for route in reads)
+    assert (stage / "producer-outcome.json").read_bytes() == witness_before
+    assert receipts.canonical(context["event"]) == event_before
+    assert receipts.canonical(observed.attempts[(200, 1)]) == historical_before
+    assert contract.object_json((job["root"] / "run-context.json").read_bytes()) == context
+
+
+@pytest.mark.parametrize("damage,cause", [
+    ("missing-record", "release-run-context-invalid: malformed checked upstream"),
+    ("malformed-record", "release-run-context-invalid: malformed checked upstream"),
+    ("missing-attempt", "release-run-context-invalid: malformed checked upstream"),
+    ("wrong-id", "release-run-context-invalid: checked upstream differs"),
+    ("wrong-attempt", "release-run-context-invalid: checked upstream differs"),
+    ("wrong-source", "release-run-context-invalid: checked upstream differs"),
+    ("missing-path", "release-run-context-invalid: checked upstream differs"),
+    ("incomplete-record", "release-run-context-invalid: checked upstream differs"),
+    ("wrong-conclusion", "release-run-context-invalid: checked upstream differs"),
+    ("wrong-repository", "release-run-context-invalid: checked upstream differs"),
+    (
+        "missing-count",
+        "release-producer-outcome-invalid: cancelled publisher lacks complete zero-job inventory",
+    ),
+    (
+        "partial-count",
+        "release-producer-outcome-invalid: cancelled publisher lacks complete zero-job inventory",
+    ),
+    (
+        "boolean-count",
+        "release-producer-outcome-invalid: cancelled publisher lacks complete zero-job inventory",
+    ),
+    (
+        "executed",
+        "release-producer-outcome-invalid: cancelled publisher lacks complete zero-job inventory",
+    ),
+    ("later-stage", "release-producer-outcome-invalid: cancelled publisher has evidence"),
+])
+def test_cli_original_cancelled_witness_requires_historical_proof_after_rerun(
+    report_job, monkeypatch, damage, cause
+):
+    job = report_job
+    context, historical, stage = original_cancelled_attempt_witness(job, monkeypatch)
+    observed = job["observed"]
+    advance_publisher_to_attempt_two(job, "completed", "success")
+    assert context["event"]["workflow_run"] == historical
+    assert (stage / "producer-outcome.json").is_file()
+    page = observed.job_pages[(200, 1)]
+    assert page == {"total_count": 0, "jobs": []}
+    if damage in {"missing-record", "malformed-record"}:
+        observed.attempts[(200, 1)] = None if damage == "missing-record" else []
+    elif damage in {"missing-attempt", "missing-path"}:
+        historical.pop("run_attempt" if damage == "missing-attempt" else "path")
+    elif damage in {
+        "wrong-id", "wrong-attempt", "wrong-source", "incomplete-record",
+        "wrong-conclusion", "wrong-repository",
+    }:
+        field, value = {
+            "wrong-id": ("id", 201), "wrong-attempt": ("run_attempt", 2),
+            "wrong-source": ("head_sha", HEAD), "incomplete-record": ("status", "in_progress"),
+            "wrong-conclusion": ("conclusion", "success"),
+            "wrong-repository": ("repository", {"full_name": "outside/data"}),
+        }[damage]
+        historical[field] = value
+    elif damage == "missing-count":
+        page.pop("total_count")
+    elif damage in {"partial-count", "boolean-count"}:
+        page["total_count"] = 1 if damage == "partial-count" else False
+    elif damage == "executed":
+        page.update(total_count=1, jobs=bound_job_facts(historical, [("authz", "failure")]))
+    else:
+        assert damage == "later-stage"
+        observed.artifacts[200].append({
+            "id": 61003, "name": "release-stage-2-20-prepare", "expired": False,
+        })
+        observed.archives[61003] = receipt_archive(job["report"])
+    before = len(observed.reads)
+    with pytest.raises(ValueError, match="^" + cause + "$"):
+        run_report(job, monkeypatch)
+    assert_no_delivery(job)
+    reads = observed.reads[before:]
+    assert f"repos/{REPO}/actions/runs/200/attempts/1" in reads
+    assert f"repos/{REPO}/actions/runs/200" not in reads
+    assert not any("/actions/runs/200/attempts/2" in route for route in reads)
+    assert context["event"]["workflow_run"]["run_attempt"] == 1
+    assert context["event"]["workflow_run"]["conclusion"] == "cancelled"
+    assert observed.runs[200]["run_attempt"] == 2
+    assert not (job["root"] / "publication-producer" / "release-receipt.json").exists()
+
+
+@pytest.mark.parametrize("movement", ["running", "successful", "cancelled", "source"])
+def test_cli_manual_cancelled_witness_still_selects_latest_publisher(
+    report_job, monkeypatch, movement
+):
+    job = report_job
+    context, historical, stage = original_cancelled_attempt_witness(
+        job, monkeypatch, report_trigger="workflow_dispatch",
+    )
+    observed = job["observed"]
+    historical_before = receipts.canonical(historical)
+    assert context["event"]["inputs"] == {"publication_run": "200"}
+    assert (stage / "producer-outcome.json").is_file()
+    if movement == "source":
+        observed.runs[200]["head_sha"] = HEAD
+    else:
+        status, conclusion = {
+            "running": ("in_progress", None), "successful": ("completed", "success"),
+            "cancelled": ("completed", "cancelled"),
+        }[movement]
+        advance_publisher_to_attempt_two(job, status, conclusion)
+    assert observed.job_pages[(200, 1)] == {"total_count": 0, "jobs": []}
+    assert historical["head_sha"] == MERGE and observed.runs[200]["head_sha"] == HEAD
+    before = len(observed.reads)
+    with pytest.raises(
+        ValueError, match="^release-producer-outcome-invalid: cancelled publisher inputs differ$",
+    ):
+        run_report(job, monkeypatch)
+    assert_no_delivery(job)
+    reads = observed.reads[before:]
+    assert f"repos/{REPO}/actions/runs/200" in reads
+    assert not any("/actions/runs/200/attempts/" in route for route in reads)
+    assert receipts.canonical(observed.attempts[(200, 1)]) == historical_before
+
+
+@pytest.mark.parametrize("damage,cause", [
+    ("missing-count", "cancelled publisher lacks complete zero-job inventory"),
+    ("partial-count", "cancelled publisher lacks complete zero-job inventory"),
+    ("string-count", "cancelled publisher lacks complete zero-job inventory"),
+    ("boolean-count", "cancelled publisher lacks complete zero-job inventory"),
+    ("executed", "cancelled publisher lacks complete zero-job inventory"),
+    ("authz-refused", "cancelled publisher lacks complete zero-job inventory"),
+    ("contradictory-jobs", "cancelled publisher lacks complete zero-job inventory"),
+    ("attempt-missing", "cancelled publisher attempt differs"),
+    ("attempt", "cancelled publisher attempt differs"),
+    ("attempt-source", "cancelled publisher attempt differs"),
+    ("attempt-repository", "cancelled publisher attempt differs"),
+    ("attempt-status", "cancelled publisher attempt differs"),
+    ("repository", "cancelled publisher binding differs"),
+    ("head-repository", "cancelled publisher binding differs"),
+    ("branch", "cancelled publisher binding differs"),
+    ("workflow-name", "cancelled publisher binding differs"),
+    ("bundle-evidence", "cancelled publisher has evidence"),
+    ("downloaded", "cancelled publisher has downloaded evidence"),
+    ("downloaded-receipt", "cancelled publisher has downloaded evidence"),
+])
+@pytest.mark.parametrize("boundary", ["publication", "adapter-recheck"])
+def test_cli_cancelled_before_execution_refuses_missing_or_conflicting_proof(
+    report_job, monkeypatch, damage, cause, boundary
+):
+    job = report_job
+    # A manual adapter input isolates the cancellation recheck. A workflow-run
+    # context would independently reject damaged attempt data even earlier.
+    publisher = cancelled_publisher_facts(
+        job, monkeypatch,
+        report_trigger="workflow_dispatch" if boundary == "adapter-recheck" else "workflow_run",
+    )
+    observed, attempt = job["observed"], publisher["run_attempt"]
+    produced = job["root"] / "publication-producer"
+    if boundary == "adapter-recheck":
+        produced = publication_cli(job, monkeypatch, 200)
+        assert (produced / "producer-outcome.json").is_file()
+        assert ship_producer(job, produced, "10-adapter") is not None
+    page = observed.job_pages[(200, attempt)]
+    exact = observed.attempts[(200, attempt)]
+    assert page == {"total_count": 0, "jobs": []}
+    if damage == "missing-count":
+        page.pop("total_count")
+    elif damage in {"partial-count", "string-count", "boolean-count"}:
+        page["total_count"] = {"partial-count": 1, "string-count": "0", "boolean-count": False}[damage]
+    elif damage in {"executed", "authz-refused", "contradictory-jobs"}:
+        name = "authz" if damage == "authz-refused" else "prepare"
+        observed.jobs[200] = bound_job_facts(publisher, [
+            (name, "failure" if damage == "authz-refused" else "success"),
+        ])
+        page["jobs"] = copy.deepcopy(observed.jobs[200])
+        page["total_count"] = 0 if damage == "contradictory-jobs" else 1
+    elif damage == "attempt-missing":
+        observed.attempts[(200, attempt)] = None
+    elif damage.startswith("attempt"):
+        field, value = {
+            "attempt": ("run_attempt", attempt + 1), "attempt-source": ("head_sha", HEAD),
+            "attempt-repository": ("repository", {"full_name": "outside/data"}),
+            "attempt-status": ("status", "in_progress"),
+        }[damage]
+        exact[field] = value
+    elif damage in {"repository", "head-repository", "branch", "workflow-name"}:
+        field, value = {
+            "repository": ("repository", {"full_name": "outside/data"}),
+            "head-repository": ("head_repository", {"full_name": "outside/data"}),
+            "branch": ("head_branch", "other"), "workflow-name": ("name", "Other"),
+        }[damage]
+        publisher[field] = value
+    elif damage == "bundle-evidence":
+        observed.artifacts[200].append({
+            "id": 61001, "name": f"validated-release-bundle-{attempt}", "expired": False,
+        })
+    elif damage == "downloaded":
+        (job["root"] / "receipts" / f"release-stage-{attempt}-20-prepare").mkdir(parents=True)
+    else:
+        directory = job["root"] / "receipts"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "release-receipt.json").write_bytes(b"{}")
+    with pytest.raises(ValueError, match="^release-producer-outcome-invalid: " + cause):
+        if boundary == "publication":
+            publication_cli(job, monkeypatch, 200)
+        else:
+            run_report(job, monkeypatch)
+    assert_no_delivery(job)
+    assert not (produced / "release-receipt.json").exists()
+    if boundary == "publication":
+        assert not (produced / "producer-outcome.json").exists()
+
+
+@pytest.mark.parametrize("damage,cause", [
+    ("input-attempt", "cancelled publisher trigger differs"),
+    ("input-source", "cancelled publisher trigger differs"),
+    ("input-other-publisher", "cancelled publisher trigger differs"),
+    ("input-other-cancelled-attempt", "cancelled publisher trigger differs"),
+    ("caller-boolean", "decision inputs differ"),
+    ("invented-cause", "no-target decision conflicts with snapshot"),
+    ("missing-current-context", "cancelled publisher trigger differs"),
+])
+def test_cli_cancelled_witness_cannot_supply_its_own_authority(
+    report_job, monkeypatch, damage, cause
+):
+    job = report_job
+    context, historical, stage = original_cancelled_attempt_witness(job, monkeypatch)
+    observed = job["observed"]
+    advance_publisher_to_attempt_two(job, "completed", "success")
+    assert context["event"]["workflow_run"] == historical
+    path = stage / "producer-outcome.json"
+    assert path.is_file() and not (stage / "release-receipt.json").exists()
+    value = contract.object_json(path.read_bytes())
+    assert value["reason"] == "publisher-cancelled-before-execution"
+    if damage == "input-attempt":
+        value["inputs"]["publication_attempt"] += 1
+    elif damage == "input-source":
+        value["inputs"]["source"] = HEAD
+    elif damage == "input-other-publisher":
+        # A different authentic cancelled run cannot stand in for the trigger.
+        other = {
+            "id": 201, "run_attempt": 1, "head_sha": MERGE,
+            "path": ".github/workflows/release.yml", "name": "Release", "head_branch": "main",
+            "event": "workflow_run", "status": "completed", "conclusion": "cancelled",
+            "repository": {"full_name": REPO}, "head_repository": {"full_name": REPO},
+        }
+        observed.runs[201] = other
+        observed.attempts[(201, 1)] = copy.deepcopy(other)
+        observed.jobs[201] = []
+        observed.job_pages[(201, 1)] = {"total_count": 0, "jobs": []}
+        observed.artifacts[201] = []
+        value["inputs"]["publication_run"] = 201
+    elif damage == "input-other-cancelled-attempt":
+        # Even an independently proven cancelled attempt of the same run
+        # cannot replace the original triggering attempt.
+        observed.attempts[(200, 2)] = {
+            "id": 200, "run_attempt": 2, "head_sha": HEAD,
+            "path": ".github/workflows/release.yml", "name": "Release", "head_branch": "main",
+            "event": "workflow_run", "status": "completed", "conclusion": "cancelled",
+            "repository": {"full_name": REPO}, "head_repository": {"full_name": REPO},
+        }
+        observed.runs[200].update(status="completed", conclusion="cancelled")
+        observed.jobs[200] = []
+        observed.job_pages[(200, 2)] = {"total_count": 0, "jobs": []}
+        assert observed.attempts[(200, 2)] == observed.runs[200]
+        assert observed.attempts[(200, 2)] is not observed.runs[200]
+        value["inputs"].update(publication_attempt=2, source=HEAD)
+    elif damage == "caller-boolean":
+        value["inputs"] = {"cancelled_before_execution": True}
+    elif damage == "invented-cause":
+        value["reason"] = "publisher-superseded"
+    else:
+        monkeypatch.delenv("RELEASE_NEEDS")
+    path.write_bytes(contract.json_bytes(value))
+    before = len(observed.reads)
+    with pytest.raises(ValueError, match="^release-producer-outcome-invalid: " + cause):
+        run_report(job, monkeypatch)
+    assert_no_delivery(job)
+    reads = observed.reads[before:]
+    assert f"repos/{REPO}/actions/runs/200" not in reads
+    assert not any("/actions/runs/201" in route for route in reads)
+    assert not any("/actions/runs/200/attempts/2" in route for route in reads)
+
+
+@pytest.mark.parametrize("conclusion", ["success", "failure", "skipped"])
+def test_cli_non_cancelled_empty_publisher_still_requires_evidence(
+    report_job, monkeypatch, conclusion
+):
+    job = report_job
+    publisher = cancelled_publisher_facts(job, monkeypatch)
+    publisher["conclusion"] = conclusion
+    job["observed"].attempts[(200, publisher["run_attempt"])]["conclusion"] = conclusion
+    assert job["observed"].job_pages[(200, publisher["run_attempt"])] == {"total_count": 0, "jobs": []}
+    with pytest.raises(ValueError, match="^release-snapshot-missing:"):
+        publication_cli(job, monkeypatch, 200)
+    assert_no_delivery(job)
+    assert not (job["root"] / "publication-producer" / "producer-outcome.json").exists()
+
+
+def test_cancelled_publisher_cannot_erase_existing_target(report_job, monkeypatch):
+    job = report_job
+    cancelled_publisher_facts(job, monkeypatch)
+    report = receipts.ProducerReceipt(copy.deepcopy(job["report"]))
+    before = receipts.canonical(report)
+    with pytest.raises(
+        ValueError,
+        match="^release-producer-outcome-invalid: cancelled publisher conflicts with current target$",
+    ):
+        reporting.publication(REPO, 200, report)
+    assert receipts.canonical(report) == before
+    assert getattr(report, "outcome", None) is None
+    assert_no_delivery(job)
+
+
+@pytest.mark.parametrize("boundary", ["publication", "adapter-recheck"])
+def test_cli_cancelled_publisher_with_stage_evidence_cannot_be_quiet(
+    report_job, monkeypatch, boundary
+):
+    job = report_job
+    publisher = cancelled_publisher_facts(job, monkeypatch)
+    if boundary == "adapter-recheck":
+        produced = publication_cli(job, monkeypatch, 200)
+        assert (produced / "producer-outcome.json").is_file()
+        assert ship_producer(job, produced, "10-adapter") is not None
+    job["observed"].artifacts[200].append({
+        "id": 61002, "name": f"release-stage-{publisher['run_attempt']}-20-prepare", "expired": False,
+    })
+    job["observed"].archives[61002] = receipt_archive(job["report"])
+    cause = (
+        "^release-producer-job-mismatch: producer did not execute"
+        if boundary == "publication"
+        else "^release-producer-outcome-invalid: cancelled publisher has evidence"
+    )
+    with pytest.raises(ValueError, match=cause):
+        if boundary == "publication":
+            publication_cli(job, monkeypatch, 200)
+        else:
+            run_report(job, monkeypatch)
+    assert_no_delivery(job)
+    if boundary == "publication":
+        assert not (job["root"] / "publication-producer" / "producer-outcome.json").exists()
+
+
+@pytest.mark.parametrize("damage,error,cause", [
+    ("missing-jobs", KeyError, "^'jobs'$"),
+    ("null-jobs", ValueError, "^unexpected GitHub inventory response$"),
+    ("null-page", TypeError, "'NoneType' object is not subscriptable"),
+])
+def test_cli_cancelled_publisher_malformed_job_inventory_refuses(
+    report_job, monkeypatch, damage, error, cause
+):
+    job = report_job
+    publisher = cancelled_publisher_facts(job, monkeypatch)
+    page = {"missing-jobs": {"total_count": 0},
+            "null-jobs": {"total_count": 0, "jobs": None}, "null-page": None}[damage]
+    job["observed"].job_pages[(200, publisher["run_attempt"])] = page
+    with pytest.raises(error, match=cause):
+        publication_cli(job, monkeypatch, 200)
+    assert_no_delivery(job)
+    assert not (job["root"] / "publication-producer" / "producer-outcome.json").exists()
+
+
+def test_cli_context_bearing_publisher_rechecks_actual_stage_evidence(report_job, monkeypatch):
+    job = report_job
+    produced = ordinary_producer(job, monkeypatch)
+    assert (produced / "producer-outcome.json").is_file()
+    context = no_producer_facts(job, monkeypatch, "ci")
+    context["event"]["workflow_run"]["event"] = "push"
+    observed = job["observed"]
+    observed.runs[810]["event"] = "push"
+    observed.attempts[(810, 3)]["event"] = "push"
+    context["needs"]["prepare"]["result"] = "success"
+    observed.jobs[observed.reporter["id"]][3]["conclusion"] = "success"
+    trusted_call(job, monkeypatch, context["needs"], context["event"])
+    stage = ship_producer(job, produced, "20-prepare")
+    assert stage is not None
+    row = observed.artifacts[observed.reporter["id"]][0]
+    observed.archives[row["id"]] = archive_stage(stage)
+    (job["root"] / "receipts").rename(job["root"] / "publisher-downloads")
+    publisher = observed.reporter
+    publisher.update(status="completed", conclusion="success")
+    observed.jobs[publisher["id"]][-1].update(status="completed", conclusion="success")
+    retain_context_facts(job, context)
+    adapter_call(job, monkeypatch, publisher)
+    forwarded = publication_cli(job, monkeypatch, publisher["id"])
+    assert not (forwarded / "release-receipt.json").exists()
+    value = contract.object_json((forwarded / "producer-outcome.json").read_bytes())
+    assert value["reason"] == "publisher-no-target"
+    assert ship_producer(job, forwarded, "10-adapter") is not None
+    run_report(job, monkeypatch)
+    assert_silent_noop(job)
+    assert sum(f"/actions/runs/{publisher['id']}/artifacts" in route for route in observed.reads) == 2
+    # The real prepare decision and context checks run; this ordinary-main
+    # case intentionally has no release PR, bundle, OCI or publication proof.
+
+
+@pytest.mark.parametrize("conclusion", ["success", "cancelled"])
+def test_cli_context_bearing_manual_publisher_preserves_target_and_failure(
+    report_job, monkeypatch, conclusion
+):
+    job = report_job
+    context = no_producer_facts(job, monkeypatch, "claim")
+    context["event"]["inputs"]["claim_placeholder"] = "false"
+    context["needs"]["claim-name"]["result"] = "skipped"
+    context["needs"]["manual-pr"]["result"] = conclusion
+    observed, publisher = job["observed"], job["observed"].reporter
+    # Independent provider job facts; no row is derived from the staged receipt.
+    observed.jobs[publisher["id"]][1]["conclusion"] = "skipped"
+    observed.jobs[publisher["id"]][2]["conclusion"] = conclusion
+    observed.jobs[publisher["id"]][-1].update(status="completed", conclusion="success")
+    trusted_call(job, monkeypatch, context["needs"], context["event"])
+    progress = copy.deepcopy(job["report"])
+    progress.update(state="pr_open", ci=None, e2e=None, deploy=None,
+                    preview=None, deployed=None, previous=None)
+    progress["pr"]["merge"] = None
+    stage = write_stage(job, report=progress, suffix="10-manual").parent
+    row = observed.artifacts[publisher["id"]][0]
+    observed.archives[row["id"]] = archive_stage(stage)
+    (job["root"] / "receipts").rename(job["root"] / "publisher-downloads")
+    publisher.update(status="completed", conclusion=conclusion)
+    retain_context_facts(job, context)
+    adapter_call(job, monkeypatch, publisher)
+    produced = publication_cli(job, monkeypatch, publisher["id"])
+    assert not (produced / "producer-outcome.json").exists()
+    actual = contract.object_json((produced / "release-receipt.json").read_bytes())
+    assert actual == {
+        **progress, "attempt": 3100, "sequence": 7, "timestamp": actual["timestamp"],
+        "state": "pr_open" if conclusion == "success" else "failed",
+    }
+    assert ship_producer(job, produced, "10-adapter") is not None
+    run_report(job, monkeypatch)
+    assert contract.object_json((job["root"] / "release-receipt.json").read_bytes()) == actual
+    assert observed.downloads == []
+    if conclusion == "success":
+        assert observed.writes == observed.issues == []
+    else:
+        assert observed.issues[0]["title"] == f"Data release failed: {actual['event_id']}"
+        assert all(endpoint.startswith("issues") for endpoint, _method, _data in observed.writes)
+    # Fixed manual progress snapshot: no claim of full deployment validation.
+
+
+def test_cli_empty_publisher_no_target_witness_reaches_diagnostic(report_job, monkeypatch):
+    job = report_job
+    context = no_producer_facts(job, monkeypatch, "claim")
+    observed, publisher = job["observed"], job["observed"].reporter
+    publisher.update(status="completed", conclusion="success")
+    retain_context_facts(job, context)
+    adapter_call(job, monkeypatch, publisher)
+    forged = receipts.receipt(None)
+    receipts.observe_outcome(
+        forged, "no-target", "publisher-no-target", publication_run=publisher["id"],
+        publication_attempt=publisher["run_attempt"], outcome_sha256="0" * 64,
+    )
+    produced = job["root"] / "forged-producer"
+    automation.finish(forged, produced / "release-receipt.json")
+    stage = ship_producer(job, produced, "10-adapter")
+    assert stage is not None and (stage / "producer-outcome.json").is_file()
+    assert not (stage / "release-receipt.json").exists()
+    assert observed.artifacts[publisher["id"]][0]["name"].startswith("release-run-context-")
+    with pytest.raises(ValueError, match="^release-producer-outcome-invalid: publisher outcome differs$"):
+        run_report(job, monkeypatch)
+    assert_no_delivery(job)
+    run_report(job, monkeypatch, "incident")
+    assert not (job["root"] / "release-receipt.json").exists()
+    assert (job["root"] / "outputs").read_text() == "has_event=false\n"
+    assert "ValueError: release-producer-outcome-invalid: publisher outcome differs" in (
+        job["root"] / "summary"
+    ).read_text()
+    assert observed.issues[0]["title"] == "Data release failed: run-3100"
+    assert all(endpoint.startswith("issues") for endpoint, _method, _data in observed.writes)
+    # Exact85 reaches its UnboundLocalError after the valid empty context,
+    # using only the old publisher-no-target vocabulary; no missing new API.
+
+
 @pytest.mark.parametrize("damage,cause", [
     ("missing-needs", "release-snapshot-missing:"),
     ("caller-boolean", "release-run-context-invalid: repository or needs inventory differs"),
@@ -501,11 +1289,16 @@ def test_cli_empty_inventory_requires_complete_orchestration(
         field = {"upstream-attempt": "run_attempt", "upstream-source": "head_sha",
                  "upstream-event": "event"}[damage]
         event["workflow_run"][field] = 99 if field == "run_attempt" else "push" if field == "event" else HEAD
+        if damage == "upstream-attempt":
+            # A provider record at the requested endpoint with the wrong
+            # recorded attempt must fail the binding, rather than lookup setup.
+            observed.attempts[(810, 99)] = copy.deepcopy(observed.runs[810])
     elif damage == "current-source":
         run["head_sha"] = HEAD
     elif damage == "push-requires-producer":
         event["workflow_run"]["event"] = "push"
         observed.runs[810]["event"] = "push"
+        observed.attempts[(810, 3)]["event"] = "push"
     elif damage == "executed-missing":
         needs["prepare"]["result"] = "success"
         observed.jobs[run["id"]][3]["conclusion"] = "success"
@@ -611,6 +1404,7 @@ def test_cli_actual_no_target_producer_uses_needs_completion(report_job, monkeyp
     context = no_producer_facts(job, monkeypatch, "ci")
     context["event"]["workflow_run"]["event"] = "push"
     job["observed"].runs[810]["event"] = "push"
+    job["observed"].attempts[(810, 3)]["event"] = "push"
     context["needs"]["prepare"]["result"] = "success"
     raw_job = job["observed"].jobs[job["observed"].reporter["id"]][3]
     raw_job.update(status=status, conclusion=None)
@@ -710,6 +1504,7 @@ def test_cli_malformed_repository_metadata_reaches_run_scoped_diagnostic(
         trusted_call(job, monkeypatch, context["needs"], context["event"])
     else:
         observed.runs[810]["head_repository"] = [REPO]
+        observed.attempts[(810, 3)]["head_repository"] = [REPO]
     monkeypatch.setenv("STAGE", "receipt-transport")
     # This is an intentionally malformed raw observation, not a valid-path RED.
     # Normal collection must still propagate the original collection failure.
@@ -735,6 +1530,7 @@ def test_cli_actual_no_target_downstream_failure_is_an_incident(report_job, monk
     context = no_producer_facts(job, monkeypatch, "ci")
     context["event"]["workflow_run"]["event"] = "push"
     job["observed"].runs[810]["event"] = "push"
+    job["observed"].attempts[(810, 3)]["event"] = "push"
     context["needs"]["prepare"]["result"] = "success"
     context["needs"]["build"]["result"] = "failure"
     jobs = job["observed"].jobs[job["observed"].reporter["id"]]

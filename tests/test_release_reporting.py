@@ -61,6 +61,9 @@ class ReportObservations:
                 "event": "workflow_run" if observed_id == 200 else "pull_request",
                 "status": "completed", "conclusion": "success",
             }
+            # Snapshot ordinary facts before receipt loading; later latest-run
+            # changes must not rewrite the independently installed attempt.
+            self.attempts[(observed_id, observed_attempt)] = copy.deepcopy(self.runs[observed_id])
             finished = "2020-01-01T00:06:00Z" if observed_id == 200 else "2020-01-01T00:04:00Z"
             self.jobs[observed_id] = [
                 {"name": name, "status": "completed", "conclusion": "success",

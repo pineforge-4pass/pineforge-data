@@ -1,9 +1,96 @@
 # Data consumer receipt v1 delivery report
 
-Implemented in `/Users/haoliangwen/code/pineforge-data-wt-rc-data` on
-`rc/data-adapter`. HEAD remains `63c66863272f4b362c1efa503d50dda0e34ced3c`.
-All changes remain in the working tree. No commits, pushes, file deletions,
-release publications or callbacks were performed locally.
+The public receipt and callback formats below describe the delivery contract.
+The historical integration record applies only to its recorded source revision;
+it does not establish validation of subsequent changes.
+
+Current stage artifacts may carry private `producer-outcome.json` alongside
+the unchanged receipt contract. Actual producer decisions distinguish a
+targetless no-op, a stored verified replay and current targeted output.
+The reporter binds the witness to the API-observed run/attempt/head, current
+artifact inventory and actual producer job, then consumes its decision inputs.
+Missing or invalid evidence never grants no-op success. Stored replay is
+compared with the immutable asset, installed lock and served package proof;
+its original identities remain unchanged and it is not re-emitted.
+
+The public `release-receipt-data` archive still contains exactly one
+`release-receipt.json`. The internal witness never enters the immutable public
+completion asset or callback. The reporting workflow separately retains private
+`run-context.json` as `release-run-context-<attempt>`, capturing the runner's
+original triggering event and the caller's actual `needs` data before transport.
+It includes the original upstream run/attempt/event or Release dispatch inputs,
+bound to the repository and current run/attempt/head.
+
+Both the same-run collector and the completed-run adapter check this context
+against independent current run, job and artifact observations; a workflow-run
+source is re-read at its recorded run ID and attempt. A later running attempt
+does not invalidate that completed original trigger. Missing or conflicting
+specific-attempt data still refuses. Manual **CI** and **Native feed** dispatches on
+main and successful placeholder claims can therefore finish silently when all
+release producers were skipped. Empty inventory alone cannot grant this outcome.
+Executed producers still require their evidence. Missing, stale or conflicting
+context and incomplete inventories refuse collection.
+
+One narrow case can be quiet without a context that had no chance to be written:
+the provider independently proves that the exact main-branch Release attempt
+completed with conclusion `cancelled`, and its complete attempt-job response
+explicitly declares `total_count: 0` and `jobs: []`. Repository, workflow,
+source and attempt must match, and no stage, context, bundle or receipt evidence
+may exist. Downloaded stage evidence also refuses this outcome. The adapter
+records `publisher-cancelled-before-execution` in the existing internal witness,
+bound to publisher ID, attempt and head, and rechecks the provider facts when
+collecting it.
+
+The adapter's own authenticated context remains required.
+For a `workflow_run` report, the witness tuple must first match the authenticated
+original event. The collector then reads that event's exact independent API
+attempt and complete job inventory, without reading the latest publisher run.
+Advancing only latest to a running or successful attempt therefore preserves
+the original cancelled-attempt outcome. Missing or conflicting historical facts
+still refuse. A manual `workflow_dispatch` request's original `publication_run`
+continues to select the latest publisher; an older cancelled witness cannot
+override that current target. Publisher evidence from any attempt still refuses
+the quiet cancellation outcome. Empty lists without complete metadata, any
+executed or refused authz job, or another publisher conclusion cannot authorize
+this outcome.
+This proves no execution; it does not establish why cancellation happened.
+No public receipt or callback is produced for that publisher.
+
+The context is an ordinary run artifact with the repository's artifact access
+and 90-day retention. It contains the full original event payload; "private"
+here means outside the public receipt contract, not a separate access boundary.
+
+Same-run completion comes from actual workflow `needs`; lagging REST status does
+not withhold a valid producer snapshot. The API still supplies independent job
+names and run/attempt/source bindings, and conflicting observations refuse.
+Incident fallback is diagnostic only and preserves upstream failure stages.
+Delivery failures use the collected event/PR when available, while API or
+collection failures reach a run-scoped incident. It never writes or dispatches
+a diagnostic receipt, and incident-delivery errors remain visible failures.
+Collection has one strict path for production and library callers; there is no
+permissive missing-snapshot default. Current stages must agree on the decision.
+Package stages bind the carried decision to the actual bundle's CI run,
+attempt, source and version. Repair handoffs check the completed publisher's
+current verification artifact and independently observed PR version/source.
+
+The control families exercise actual `prepare`, `manual`, `reconcile`,
+`github-release`, `preflight`, `verify`, `publication`, `collect` and `incident`
+commands using their existing arguments. Stored replay controls retain the
+original run 300 receipt while varying the current adapter envelope. The
+recovery-handoff control executes real main and pre-merge gate parsing over
+fixture transports. Existing full-main-proof controls stop at an explicit
+candidate boundary; the synthetic completion fixture replaces later proof
+boundaries. Its handoff controls test orchestration only. Historically, 14 rows
+were named as full publication checks over those fixed boundaries; those rows
+are invalid evidence of full-gate verification. Their scope is now named
+explicitly, without promoting the historical results. Neither fixture execution
+nor a skipped live-PyPI control establishes provider or native acceptance.
+
+## Historical integration record
+
+The original integration recorded source revision
+`63c66863272f4b362c1efa503d50dda0e34ced3c`. The following inventory and static
+check transcript belong to that historical integration.
 
 The integration review's sections 1 and 3, the entire hub **Consumer receipt
 contract v1** section, its reference builder and `release_receipts.py`'s
@@ -14,7 +101,7 @@ spelling follows the hub's actual code: Dockerfile line 74 consumes
 `RELEASE_VERSION`, `publish.yml` passes the v-prefixed Git tag, and
 `release_smoke.py` explicitly expects `v` + the bare release version.
 
-## Files changed
+## Historical file inventory
 
 - `.github/workflows/pineforge-release.yml`
 - `.github/workflows/release-report.yml`
@@ -77,9 +164,9 @@ those issues and Actions logs.
   send the four-key signal. Upload failure prevents dispatch. A transport error
   creates a local incident without overwriting an uploaded completion snapshot.
 
-All intermediate `release-stage-<attempt>-<stage>` snapshots also serialize
-exactly this same contract; none use a home-grown receipt/report shape. Only
-the literal coordinator artifact is selected by the hub policy.
+Intermediate receipt snapshots serialize the same public contract. Stages also
+carry a separate private producer witness for targetless decisions and stored
+replay. Only the literal coordinator artifact is selected by the hub policy.
 
 For `verified`, both CI/E2E reference the complete successful pre-merge PR CI
 attempt, including release/ready. Main CI independently authorizes the exact
@@ -299,11 +386,13 @@ in verify. Only publish can skip, after proving matching bytes already exist.
 
 ## Validation and remaining rollout requirement
 
-`tests/test_consumer_receipt.py` builds the sample through the actual completed
-publication coordinator, validates it with the hub's own validate_receipt /
+`tests/test_consumer_receipt.py` builds the sample through a synthetic completed
+publication coordinator fixture, validates it with the hub's own validate_receipt /
 check_run / identity logic, checks the artifact archive and exact signal with
 the hub checks, rejects schema/gate/source drift, and covers immutable-source
 repair, approved publication replay skips and verified-state non-regression.
+The fixture replaces candidate, main, local-lock, OCI, served and previous
+validators with fixed answers; those checks are outside its demonstrated scope.
 The sibling checkout cannot be imported in standalone consumer CI, so the
 minimal validator/check/helper snapshot is vendored in
 `tests/hub_receipt_validator.py`, not used by production. Its field-check
@@ -315,9 +404,9 @@ including their formatting, rather than rewritten to this repo's lint style.
 Upstream `scripts/release_receipts.py` SHA-256:
 `6fe7b0afcb7a34de9e28bce9d8372e5a4eaa6695398536697f59ed705b0cc23a`.
 
-Static checks only were run locally, per the owner rule. No pytest, Docker,
-database, distribution exercise, publication or live callback was run. Both the
-new hub-validator test and all existing suites remain CI work.
+Only static checks were recorded for that historical integration. The transcript
+contains no pytest, Docker, database, distribution exercise, publication or live
+callback evidence, and must not be used as validation of the current source.
 
 ```text
 $ ruff check .

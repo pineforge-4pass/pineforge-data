@@ -9,6 +9,9 @@ on:
       stage:
         type: string
         required: true
+      orchestration:
+        type: string
+        required: true
       hub:
         type: boolean
         default: false
@@ -21,6 +24,10 @@ permissions:
 jobs:
   report:
     runs-on: ubuntu-24.04
+    env:
+      # Supplied by the caller's real needs context; the runner retains the
+      # original triggering event in GITHUB_EVENT_PATH for this reusable call.
+      RELEASE_NEEDS: ${{ inputs.orchestration }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -29,6 +36,10 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
+      - name: Capture the original workflow event and actual needs before transport
+        env:
+          PYTHONPATH: scripts
+        run: python -m release_chain.reporting context
       - uses: actions/download-artifact@v6
         with:
           pattern: release-stage-${{ github.run_attempt }}-*
@@ -42,6 +53,14 @@ jobs:
           STAGE: ${{ inputs.stage }}
           RELEASE_ALERT_OWNER: ${{ vars.RELEASE_ALERT_OWNER }}
         run: python -m release_chain.reporting collect
+      - name: Retain private triggering event and orchestration observations
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: release-run-context-${{ github.run_attempt }}
+          path: run-context.json
+          if-no-files-found: error
+          retention-days: 90
       - name: Upload the single hub receipt snapshot
         id: upload
         if: inputs.hub && steps.receipt.outputs.has_event == 'true'
@@ -90,7 +109,7 @@ jobs:
         env:
           PYTHONPATH: scripts
           GH_TOKEN: ${{ github.token }}
-          FAILED: 'true'
-          STAGE: receipt-transport
+          FAILED: ${{ inputs.failed }}
+          STAGE: ${{ inputs.failed && inputs.stage || 'receipt-transport' }}
           RELEASE_ALERT_OWNER: ${{ vars.RELEASE_ALERT_OWNER }}
-        run: python -m release_chain.reporting collect --receipt incident-release-receipt.json
+        run: python -m release_chain.reporting incident --receipt incident-release-receipt.json

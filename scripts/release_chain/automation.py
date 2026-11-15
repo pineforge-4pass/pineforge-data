@@ -35,7 +35,16 @@ from .contract import (
     version_key,
 )
 from .evidence import gate_for_run
-from .receipts import FIELDS, candidate, canonical, receipt, timestamp
+from .receipts import (
+    FIELDS,
+    OUTCOME_FILE,
+    candidate,
+    canonical,
+    observe_outcome,
+    producer_outcome,
+    receipt,
+    timestamp,
+)
 
 MARKER = re.compile(r"<!-- pineforge-data-release (\{[^\n]+\}) -->")
 
@@ -91,6 +100,10 @@ def body(metadata: dict[str, Any]) -> str:
 
 def finish(report: dict[str, Any], path: Path) -> None:
     require(set(report) == FIELDS, "receipt fields differ from the hub contract")
+    outcome = producer_outcome(report)
+    if outcome is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        (path.parent / OUTCOME_FILE).write_bytes(canonical(outcome))
     if report["event_id"] is None:
         return  # No target means no receipt, including ordinary non-release main pushes.
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -441,7 +454,7 @@ def reconcile(
                     from .publishing import recover_applied
 
                     report.update(receipt(installed["event"], "reconcile-rollback"))
-                    recover_applied(repo, source, report)
+                    recover_applied(repo, source, report, installed_source=base)
                     return
                 report["state"] = "superseded"
                 return
@@ -454,7 +467,7 @@ def reconcile(
                 report["state"] = "merged"
                 from .publishing import recover_applied
 
-                recover_applied(repo, source, report)
+                recover_applied(repo, source, report, installed_source=base)
                 return
             installed_version = runtime_pin(source).split(":")[-2].split("@", 1)[0]
             if version_key(event["release_version"]) <= version_key(installed_version):
@@ -493,6 +506,7 @@ def reconcile(
             for pr in prs:
                 if marker(pr)["kind"] == "package":
                     maybe_merge(repo, pr, report, bot, None, None)
+            observe_outcome(report, "no-target", "no-ready-release", base=base)
             return
     same = [
         pr
@@ -526,3 +540,8 @@ def reconcile(
             # The retained PR comment is the human-facing supersession record.
             # One reporting run owns one target and one immutable hub receipt.
     maybe_merge(repo, pr, report, bot, event if not bump else None, manifest)
+    if bump and report["event_id"] is None:
+        observe_outcome(
+            report, "no-target", "package-bump", base=base, bump=bump, version=version,
+            pr=report["pr"]["number"],
+        )

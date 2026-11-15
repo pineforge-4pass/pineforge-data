@@ -76,10 +76,6 @@ expected head. No admin merge is used. Strict up-to-date required checks and an
 App without branch bypass are essential to close the final base-movement race.
 Merge queue is not enabled by this implementation.
 
-All tests run in GitHub CI or cloud runners. On the maintainer's Mac run only
-static checks, for example Ruff, mypy, Python compilation, actionlint and
-`git diff --check`.
-
 ## Publication, completion and repair
 
 Successful PR CI wakes the reconciler through `workflow_run`. The App's merge
@@ -104,12 +100,95 @@ The only receipt format is the hub's **Consumer receipt contract v1**,
 runs checked-out `main` tooling. Its `report` job calls `release-report.yml`'s
 `report` job, which uploads exactly **`release-receipt-data`** containing one root
 file **`release-receipt.json`**. Sorted, compact JSON with a final LF is used.
-Reruns replace that run's one live artifact and advance `sequence` using the
+Full producer reruns replace that run's one live artifact and advance `sequence` using the
 Actions run attempt. `attempt` is the reporting Actions run ID. Stage artifacts
-named `release-stage-<run_attempt>-<stage>` use the same receipt contract; they
-are private inputs, never separate hub-facing formats. Target-less operations
-produce no receipt; ordinary manual package publication still uses the existing
-landed CI evidence and gates, without requiring a product receipt artifact. CI/PR-head code never builds the hub artifact.
+named `release-stage-<run_attempt>-<stage>` contain a receipt for a current target
+or an internal `producer-outcome.json` witness for an actual targetless decision
+or stored replay. The witness is private and never enters the hub artifact,
+retained receipt or callback. Targetless operations produce no public receipt.
+Ordinary manual package publication still uses the existing landed CI evidence
+and gates. CI/PR-head code never builds the hub artifact.
+
+The producer records the actual decision and its inputs, bound to its Actions
+run, attempt and head. The reporter independently reads the current run, complete
+artifact inventory and producer jobs. Ordinary main pushes, pending main proofs,
+package bumps and repair handoffs can therefore finish quietly with a valid
+current witness. Missing files alone never authorize that result. Missing,
+expired, unregistered, invalid or wrong-attempt evidence fails collection.
+Re-running only the report job cannot borrow an earlier attempt's decision.
+Every downloaded current stage must agree on the target and producer decision;
+a later targetless stage cannot erase an earlier target. Package publication
+carries prepare's witness through GitHub Release, preflight and verification,
+checking its CI run/attempt, source and version against the bundle at each step.
+An absent targeted receipt cannot select the package-only path.
+
+The reporting workflow also retains private `run-context.json` in the separate
+`release-run-context-<attempt>` artifact. Before downloading stage artifacts it
+captures the runner's original event, including the upstream run and attempt for
+`workflow_run` or the original Release dispatch inputs, and the caller's actual
+`needs` observations. Consumers bind those facts to the repository, run, attempt
+and head, re-read the upstream run's exact recorded attempt, and check the
+complete current job and stage inventories. A newer running attempt does not
+invalidate the original completed trigger; missing or conflicting exact-attempt
+data still fails. This context stays outside the public receipt, immutable
+completion asset and four-key callback. It is an ordinary repository run artifact
+holding the full event payload for 90 days, with the repository's artifact access.
+
+A manual dispatch of **CI** or **Native feed** on main can complete a Release
+run with every release producer skipped. A successful `claim_placeholder` run
+also has no release producer. These runs finish quietly only with that complete
+context and matching independent observations. They create no product receipt
+or failed incident. An empty artifact list, a caller boolean, a missing context,
+or an executed producer with missing evidence cannot establish this outcome.
+Report-only retries cannot borrow context or stage evidence from another attempt;
+use **Re-run all jobs** when evidence needs regeneration.
+
+The sole context-free empty-publisher exception requires independent provider
+proof that the exact Release run/attempt on main completed as `cancelled` before
+any job executed. The selected run and independent specific-attempt record must
+match repository, workflow, main branch, head, run ID and attempt. The complete attempt-jobs response
+must explicitly declare integer `total_count: 0` and `jobs: []`, with no stage,
+context, bundle or receipt evidence and no downloaded stage. An executed job,
+including a refused authz job, incomplete inventory metadata, or a noncancelled
+publisher stays on the strict evidence paths. The adapter emits only an internal
+`publisher-cancelled-before-execution` witness bound to that publisher ID,
+attempt and head.
+
+Collection still requires the adapter's own authenticated
+reporting context. For a `workflow_run` trigger, collection first matches the
+witness's publisher ID, attempt and head to the authenticated original event,
+then selects that event's exact independent API attempt and complete jobs.
+A newer running or successful latest attempt cannot replace the original
+cancelled attempt; this consumer path does not read the latest publisher run.
+For manual `workflow_dispatch`, the original `publication_run` input still
+selects the latest publisher, so an older cancelled witness cannot suppress
+the current target. Publisher stage, context, bundle or receipt evidence,
+including evidence from a later attempt, still refuses this quiet outcome.
+It emits no public receipt or callback and makes no claim about the cause of
+cancellation.
+
+For jobs in the reporting run, the workflow's actual `needs` results establish
+completion. The attempt-jobs API independently supplies names and run/source
+bindings, but its status can still be queued, running or null after completion.
+Conflicting terminal conclusions, missing or unexpected jobs, and mismatched
+attempts or sources refuse collection. Historical runs without this context
+still require terminal API proof for their existing producer artifacts; they
+cannot use an empty inventory alone to establish a quiet no-target result.
+
+The internal witness has `schema`, `run_id`, `run_attempt`, `head_sha`, `outcome`,
+`reason`, `inputs` and `receipt_sha256`. Actual no-target decisions use a null
+receipt digest; replay binds the unchanged original receipt's canonical bytes.
+The decision comes from producer execution, with no caller override. The
+reporter also checks the relevant PR, input run or completed publisher facts.
+Pending proof inputs record the observed wait; a later counterpart completion
+does not turn that earlier valid decision into an incident.
+
+Stored verified replay keeps the original receipt's `attempt`, `sequence`,
+timestamp, event and all pins. The current adapter envelope is checked separately.
+The reporter compares the snapshot with the immutable stored receipt, reads the
+installed lock at the producer's recorded source revision and rechecks the served
+package proof. Replay produces no new hub artifact, retained asset, callback or
+incident. A stale targeted receipt without this replay proof still fails.
 
 CI and E2E both reference the complete successful **pre-merge** `ci.yml` run,
 including `release/ready`. The landed `ci-post.yml` run authorizes the exact
@@ -183,9 +262,21 @@ successful artifact upload, a separate hub-only App token POSTs
 or publication run. The event type is fixed by the hub; no configurable legacy
 callback format remains. Upload failure prevents callback. Callback failures
 alert locally; hub polling can still collect the immutable artifact. Reporting
-errors write a separate local incident snapshot without replacing a previously
-uploaded completion snapshot. A previously verified target never emits a later
+errors use the diagnostic-only `incident` command, which cannot write a receipt
+or enable transport. Upstream failures retain their actual stage; delivery
+failures use `receipt-transport`. A previously verified target never emits a later
 failed/superseded/progress receipt; local incidents still record those errors.
+Delivery diagnostics keep the collected event and PR when the evidence supports
+them. API or collection errors instead reach a run-scoped incident with the
+collection error recorded in the Actions summary. Failure to deliver the incident
+itself remains an error.
+
+Offline CLI controls cover manual upstream workflows, placeholder claims,
+ordinary main pushes, pending proof pairs, package bumps/publication, repair
+handoffs, stored replay, delayed job status and evidence refusals. GitHub,
+PyPI, GHCR and git observations use fixtures. Such controls demonstrate only
+the validators they actually execute; they do not establish hosted workflow,
+native, provider, publication or callback acceptance.
 
 The required hub `RELEASE_RECEIPT_POLICY.data` entry is checked into
 [`receipt-policy.json`](https://github.com/pineforge-4pass/pineforge-data/blob/main/tests/fixtures/release_chain/receipt-policy.json).
@@ -195,13 +286,15 @@ skips. The reporting workflow is `pineforge-release.yml`, artifact
 `release-receipt-data`, base `main`; deploy uses `release.yml` and the inventory
 above. A complete synthetic verified receipt is in
 [`sample-release-receipt.json`](https://github.com/pineforge-4pass/pineforge-data/blob/main/tests/fixtures/release_chain/sample-release-receipt.json).
-`tests/test_consumer_receipt.py` builds it through the real coordinator builder
-and validates it with the hub's field, GitHub-check, identity, artifact and
-signal checks vendored in `tests/hub_receipt_validator.py`. The sibling hub repo
-is unavailable in standalone CI, so the snapshot records its source hash. These
-unit tests run in CI only, together with the existing suites.
+`tests/test_consumer_receipt.py` builds it through the coordinator with fixed
+candidate, main, local-lock, OCI, served and previous proof boundaries. That
+fixture tests orchestration and the hub's field, GitHub-check, identity, artifact
+and signal checks vendored in `tests/hub_receipt_validator.py`; it cannot prove
+the replaced publication gates. The sibling hub repo is unavailable in
+standalone CI, so the snapshot records its source hash. Controls that stop at a
+candidate boundary likewise prove only the path up to that boundary.
 
-The 15-minute reconciler repairs dropped ready events and missing publication
+The event-driven or manually dispatched reconciler repairs dropped ready events and missing publication
 transitions, reuses verified receipts without republishing, and refuses to
 replace the tested dependency with a moving image alias. Actions write access
 is used only on this consumer to replay its existing `Release` workflow after
@@ -214,6 +307,7 @@ publish an ordinary data change, leave `ci_run` empty and choose a semantic
 `bump`; the App opens a version PR under the same gates. Use **Re-run all jobs**
 for a CI or publication retry: evidence from earlier attempts cannot fill a
 missing job in the current attempt.
+The periodic schedule remains disabled in `pineforge-release.yml`.
 
 ## Rollback
 

@@ -4,6 +4,7 @@ import copy
 import io
 import shutil
 import subprocess
+import sys
 import time
 import zipfile
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Any
 from xml.etree import ElementTree
 
 import pytest
+import release_adapter
 import yaml
 from release_chain import automation, contract, evidence, publishing, receipts, reporting
 
@@ -1597,7 +1599,7 @@ def test_replayed_applied_event_creates_no_pr_or_merge(ready, baseline, monkeypa
         ),
     )
     monkeypatch.setattr(automation, "api", lambda *args: pytest.fail("duplicate mutated GitHub"))
-    monkeypatch.setattr(publishing, "recover_applied", lambda *args: None)
+    monkeypatch.setattr(publishing, "recover_applied", lambda *args, **kwargs: None)
     report = automation.receipt(None, "test")
     automation.reconcile("owner/data", {"client_payload": event}, report, "release[bot]")
     assert report["state"] == "merged"
@@ -1632,14 +1634,60 @@ def test_public_receipt_cannot_contain_homegrown_or_private_fields(ready) -> Non
         reporting.public_receipt(report)
 
 
-def test_failed_downstream_job_overrides_earlier_green_receipt(tmp_path, ready) -> None:
+def test_failed_downstream_job_overrides_earlier_green_receipt(
+    tmp_path, ready, monkeypatch
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOSITORY", "owner/data")
+    monkeypatch.setenv("GITHUB_RUN_ID", "200")
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "3")
+    monkeypatch.setenv("GITHUB_OUTPUT", str(tmp_path / "outputs"))
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "summary"))
+    monkeypatch.setenv("FAILED", "true")
+    monkeypatch.setenv("STAGE", "distribution-transfer")
+    monkeypatch.setenv("RELEASE_ALERT_OWNER", "release-owner")
     event, _manifest = ready
     report = automation.receipt(event, "prepare")
     report["state"] = "deploying"
-    directory = tmp_path / "release-stage-1-20-prepare"
+    directory = tmp_path / f"release-stage-{report['sequence']}-20-prepare"
     directory.mkdir()
     (directory / "release-receipt.json").write_bytes(contract.json_bytes(report))
-    result = reporting.collect(tmp_path, failed=True, stage="publication")
+    issues = []
+
+    def api(repo, endpoint, method="GET", data=None):
+        assert repo == "owner/data"
+        if endpoint == "actions/runs/200":
+            return {
+                "id": 200, "run_attempt": 3, "path": ".github/workflows/release.yml",
+                "head_sha": "c" * 40, "event": "workflow_run",
+            }
+        if endpoint == "actions/runs/200/artifacts?per_page=100&page=1":
+            return {"artifacts": [{
+                "id": 201, "name": "release-stage-3-20-prepare", "expired": False,
+            }]}
+        if endpoint == "actions/runs/200/attempts/3/jobs?per_page=100&page=1":
+            return {"jobs": [
+                {"name": "prepare", "status": "completed", "conclusion": "success"},
+                {"name": "build", "status": "completed", "conclusion": "failure"},
+            ]}
+        if endpoint == "releases?per_page=100&page=1":
+            return []
+        if endpoint.startswith("issues?"):
+            return issues
+        if endpoint == "issues" and method == "POST":
+            issues.append({"number": 41, **data})
+            return issues[0]
+        assert endpoint == "issues/41" and method == "PATCH"
+        issues[0].update(data)
+        return issues[0]
+
+    monkeypatch.setattr(automation, "api", api)
+    monkeypatch.setattr(reporting, "api", api)
+    monkeypatch.setattr(sys, "argv", [
+        "release_chain.reporting", "collect", "--directory", str(tmp_path),
+        "--receipt", str(tmp_path / "release-receipt.json"),
+    ])
+    reporting.main()
+    result = contract.object_json((tmp_path / "release-receipt.json").read_bytes())
     assert result["state"] == "failed"
     assert result["event_id"] == event["event_id"]
     assert result["deployed"] is None
@@ -1784,7 +1832,7 @@ def test_completed_receipt_replay_does_not_dispatch_or_publish(
     monkeypatch.setattr(publishing, "verified_package", lambda *args: saved["deployed"])
     monkeypatch.setattr(publishing, "api", lambda *args: pytest.fail("replayed publication"))
     report = automation.receipt(event, "reconcile")
-    publishing.recover_applied("owner/data", baseline, report)
+    publishing.recover_applied("owner/data", baseline, report, installed_source="b" * 40)
     assert report["state"] == "verified"
     assert report["deployed"] == saved["deployed"]
 
@@ -1958,10 +2006,24 @@ def test_recovery_saved_receipt_replays_after_real_verification(saved_recovery_t
     state = saved_recovery_transport
     apply(state["root"], state["source_files"])
     report = receipts.receipt(state["event"], "reconcile")
-    publishing.recover_applied("owner/data", state["root"], report)
+    publishing.recover_applied(
+        "owner/data", state["root"], report, installed_source="b" * 40,
+    )
     assert_saved_recovery_verification_order(state)
     assert state["local_results"][1] == state["local_results"][0]
     assert report == state["saved"]
+
+
+def test_recovery_saved_receipt_requires_observed_installed_revision(saved_recovery_transport):
+    state = saved_recovery_transport
+    apply(state["root"], state["source_files"])
+    report = receipts.receipt(state["event"], "reconcile")
+    before = copy.deepcopy(report)
+    # Existing API shape reaches the actual old replay branch too.
+    with pytest.raises(ValueError, match=r"^stored publication installed source missing$"):
+        publishing.recover_applied("owner/data", state["root"], report)
+    assert_saved_recovery_verification_order(state)
+    assert report == before
 
 
 def test_recovery_saved_receipt_keeps_installed_image_mismatch_refusal(saved_recovery_transport):
@@ -2004,6 +2066,409 @@ def test_recovery_verifies_package_before_requiring_local_lock(saved_recovery_tr
     assert len(state["package_calls"]) == 1
     assert state["local_reads"] == state["git"] == state["processes"] == []
     assert report == before
+
+
+@pytest.fixture(params=[(987, 1), (1987, 5)], ids=["replay-first", "replay-later"])
+def replay_cli_job(saved_recovery_transport, monkeypatch, request):
+    state = saved_recovery_transport
+    apply(state["root"], state["source_files"])
+    run_id, attempt = request.param
+    # Independent adapter envelope and installed revision, unrelated to the stored run 300.
+    run = {
+        "id": run_id, "run_attempt": attempt, "head_sha": "e" * 40,
+        "path": ".github/workflows/pineforge-release.yml", "event": "workflow_run",
+    }
+    installed_source = "b" * 40
+    stage_name = f"release-stage-{attempt}-10-adapter"
+    original_api = automation.api
+    calls = []
+    state["installed_bytes"] = state["source_files"][contract.LOCK]
+    jobs = [{"name": "reconcile", "status": "completed", "conclusion": "success"}]
+
+    def api(repo, endpoint, method="GET", data=None):
+        calls.append((endpoint, method))
+        assert repo == "owner/data" and method == "GET" and data is None
+        if endpoint == f"actions/runs/{run_id}":
+            return copy.deepcopy(run)
+        if endpoint == f"actions/runs/{run_id}/artifacts?per_page=100&page=1":
+            return {"artifacts": [{"id": 98710, "name": stage_name, "expired": False}]}
+        if endpoint == f"actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100&page=1":
+            return {"jobs": copy.deepcopy(jobs)}
+        if endpoint == "pulls?state=open&base=main&per_page=100&page=1":
+            return []
+        return original_api(repo, endpoint, method, data)
+
+    def installed_bytes(route, *, accept):
+        assert route == (
+            f"repos/owner/data/contents/{contract.LOCK}?ref={installed_source}"
+        ) and accept == "application/vnd.github.raw+json"
+        return state["installed_bytes"]
+
+    def installed_snapshot(revision, destination):
+        assert revision == installed_source
+        apply(destination, state["source_files"])
+
+    monkeypatch.setattr(automation, "api", api)
+    monkeypatch.setattr(reporting, "api", api)
+    monkeypatch.setattr(reporting, "gh_bytes", installed_bytes)
+    monkeypatch.setattr(automation, "git", lambda *args: installed_source)
+    monkeypatch.setattr(automation, "snapshot", installed_snapshot)
+    monkeypatch.setattr(automation, "newest_ready", lambda: (
+        state["event"], state["source_files"][contract.MANIFEST],
+    ))
+    for key, value in {
+        "GITHUB_REPOSITORY": "owner/data", "GITHUB_RUN_ID": str(run_id),
+        "GITHUB_RUN_ATTEMPT": str(attempt), "GITHUB_SHA": run["head_sha"],
+        "RELEASE_BOT_LOGIN": "release[bot]", "FAILED": "false", "STAGE": "reconcile",
+        "RELEASE_ALERT_OWNER": "release-owner",
+        "GITHUB_OUTPUT": str(state["root"] / "report-outputs"),
+        "GITHUB_STEP_SUMMARY": str(state["root"] / "report-summary"),
+    }.items():
+        monkeypatch.setenv(key, value)
+    event_path = state["root"] / "event.json"
+    event_path.write_bytes(b"{}")
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event_path))
+    produced = state["root"] / "producer"
+    monkeypatch.setattr(sys, "argv", [
+        "release_adapter.py", "reconcile", "--receipt", str(produced / "release-receipt.json"),
+    ])
+    release_adapter.main()
+    destination = state["root"] / "downloaded-stages" / stage_name
+    destination.mkdir(parents=True)
+    for filename in ("release-receipt.json", "producer-outcome.json"):
+        path = produced / filename
+        if path.exists():
+            (destination / filename).write_bytes(path.read_bytes())
+    state.update(
+        cli_run=run, cli_jobs=jobs, cli_calls=calls, cli_stage=destination, cli_produced=produced,
+    )
+    return state
+
+
+def replay_collect_cli(state, monkeypatch):
+    monkeypatch.setattr(sys, "argv", [
+        "release_chain.reporting", "collect", "--directory", str(state["cli_stage"].parent),
+        "--receipt", str(state["root"] / "report-release-receipt.json"),
+    ])
+    reporting.main()
+
+
+def test_cli_stored_replay_preserves_original_identity_after_real_verification(
+    replay_cli_job, monkeypatch
+):
+    state = replay_cli_job
+    original = receipts.canonical(state["saved"])
+    assert (state["cli_stage"] / "release-receipt.json").read_bytes() == original
+    replay_collect_cli(state, monkeypatch)
+    assert (state["cli_stage"] / "release-receipt.json").read_bytes() == original
+    assert receipts.canonical(state["saved"]) == original
+    assert (state["root"] / "report-outputs").read_text() == "has_event=false\n"
+    assert not (state["root"] / "report-release-receipt.json").exists()
+    assert state["reads"].count("https://pypi.org/pypi/pineforge-data/0.3.1/json") == 4
+    assert state["processes"] == []
+    assert all(method == "GET" for _, method in state["cli_calls"])
+    assert "**verified**" in (state["root"] / "report-summary").read_text()
+
+
+@pytest.mark.parametrize(
+    "status", ["queued", "in_progress", None], ids=["queued", "running", "null"]
+)
+def test_cli_stored_replay_uses_needs_completion_when_job_api_lags(
+    replay_cli_job, monkeypatch, status
+):
+    state = replay_cli_job
+    run = state["cli_run"]
+    run.update(
+        event="workflow_dispatch", repository={"full_name": "owner/data"},
+        head_repository={"full_name": "owner/data"},
+    )
+    job = state["cli_jobs"][0]
+    job.update(
+        status=status, conclusion=None, run_id=run["id"],
+        run_attempt=run["run_attempt"], head_sha=run["head_sha"],
+    )
+    state["cli_jobs"].append({
+        "name": "authz", "status": "completed", "conclusion": "success",
+        "run_id": run["id"], "run_attempt": run["run_attempt"], "head_sha": run["head_sha"],
+    })
+    state["cli_jobs"].append({
+        "name": "report / report", "status": "in_progress", "conclusion": None,
+        "run_id": run["id"], "run_attempt": run["run_attempt"], "head_sha": run["head_sha"],
+    })
+    path = state["root"] / "lag-workflow-event.json"
+    path.write_bytes(contract.json_bytes({
+        "repository": {"full_name": "owner/data"}, "ref": "refs/heads/main",
+        "inputs": {"publication_run": ""},
+    }))
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(path))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("RELEASE_NEEDS", contract.json_bytes({
+        "authz": {"result": "success", "outputs": {}},
+        "reconcile": {"result": "success", "outputs": {}},
+    }).decode())
+    original = (state["cli_stage"] / "release-receipt.json").read_bytes()
+    replay_collect_cli(state, monkeypatch)
+    assert (state["cli_stage"] / "release-receipt.json").read_bytes() == original
+    assert original == receipts.canonical(state["saved"])
+    assert (state["root"] / "report-outputs").read_text() == "has_event=false\n"
+    assert not (state["root"] / "report-release-receipt.json").exists()
+    assert state["reads"].count("https://pypi.org/pypi/pineforge-data/0.3.1/json") == 4
+    assert all(method == "GET" for _, method in state["cli_calls"])
+    assert state["processes"] == []
+
+
+@pytest.mark.parametrize("fault", [
+    "missing-witness", "witness-json", "witness-run", "witness-attempt", "witness-head",
+    "witness-schema", "witness-reason", "witness-digest", "witness-extra", "input-extra",
+    "snapshot-attempt", "stored-pin", "stored-state", "installed-lock", "installed-version",
+    "served-bytes", "adapter-attempt", "producer-skipped",
+])
+def test_cli_stored_replay_requires_independent_proof(replay_cli_job, monkeypatch, fault):
+    state = replay_cli_job
+    stage = state["cli_stage"]
+    assert (stage / "producer-outcome.json").is_file()
+    assert (stage / "release-receipt.json").is_file()
+    if fault == "missing-witness":
+        # Keep the withheld bytes outside the downloaded stage.
+        path = stage / "producer-outcome.json"
+        path.rename(state["root"] / "withheld-producer-outcome.json")
+    elif fault.startswith("witness-") or fault == "input-extra":
+        path = stage / "producer-outcome.json"
+        value = contract.object_json(path.read_bytes())
+        if fault in {"witness-run", "witness-attempt"}:
+            value["run_id" if fault == "witness-run" else "run_attempt"] += 1
+        elif fault == "witness-head":
+            value["head_sha"] = "9" * 40
+        elif fault == "witness-schema":
+            value["schema"] = "pineforge/consumer-receipt/v1"
+        elif fault == "witness-reason":
+            value["reason"] = "ordinary-main"
+        elif fault == "witness-digest":
+            value["receipt_sha256"] = "0" * 64
+        elif fault == "input-extra":
+            value["inputs"]["ignored"] = True
+        else:
+            value["ignored"] = True
+        path.write_bytes(b"{" if fault == "witness-json" else contract.json_bytes(value))
+    elif fault == "snapshot-attempt":
+        path = stage / "release-receipt.json"
+        value = contract.object_json(path.read_bytes())
+        value["sequence"] += 1
+        path.write_bytes(contract.json_bytes(value))
+    elif fault == "stored-pin":
+        state["saved"]["previous"]["facts_sha256"] = "0" * 64
+    elif fault == "stored-state":
+        state["saved"]["state"] = "failed"
+    elif fault in {"installed-lock", "installed-version"}:
+        value = contract.object_json(state["installed_bytes"])
+        if fault == "installed-lock":
+            value["event"]["event_id"] = "sha256:" + "0" * 64
+        else:
+            value["package_version"] = "8.9.10"
+        state["installed_bytes"] = contract.json_bytes(value)
+    elif fault == "served-bytes":
+        state["downloads"]["pineforge_data-0.3.1-py3-none-any.whl"] += b"changed"
+    elif fault == "adapter-attempt":
+        state["cli_run"]["run_attempt"] += 1
+    else:
+        state["cli_jobs"][0]["conclusion"] = "skipped"
+    cause = {
+        "missing-witness": "release-snapshot-attempt-mismatch:",
+        "witness-json": "release-snapshot-invalid:",
+        "witness-run": "release-producer-outcome-invalid: envelope or producer job differs",
+        "witness-attempt": "release-producer-outcome-invalid: envelope or producer job differs",
+        "witness-head": "release-producer-outcome-invalid: envelope or producer job differs",
+        "witness-schema": "release-producer-outcome-invalid: envelope or producer job differs",
+        "witness-reason": "release-producer-outcome-invalid: missing replay proof",
+        "witness-digest": "release-producer-outcome-invalid: missing replay proof",
+        "witness-extra": "release-producer-outcome-invalid: envelope or producer job differs",
+        "input-extra": "release-replay-invalid: installed source/version missing",
+        "snapshot-attempt": "release-producer-outcome-invalid: missing replay proof",
+        "stored-pin": "release-replay-invalid: immutable stored receipt differs",
+        "stored-state": "release-replay-invalid: immutable stored receipt differs",
+        "installed-lock": "release-replay-invalid: installed target differs",
+        "installed-version": "release-replay-invalid: installed target differs",
+        "served-bytes": "PyPI bytes differ",
+        "adapter-attempt": "release-producer-run-mismatch:",
+        "producer-skipped": "release-producer-job-mismatch: producer did not execute",
+    }[fault]
+    with pytest.raises(ValueError, match="^" + cause):
+        replay_collect_cli(state, monkeypatch)
+    assert not (state["root"] / "report-release-receipt.json").exists()
+    assert not (state["root"] / "report-outputs").exists()
+    assert not (state["root"] / "report-summary").exists()
+    assert state["processes"] == []
+    assert all(method == "GET" for _, method in state["cli_calls"])
+
+
+def test_cli_recovery_handoff_uses_real_gates_and_emits_no_new_receipt(
+    recovery_main_transport, ready, monkeypatch
+):
+    state = recovery_main_transport
+    event, manifest = ready
+    root, source = state["root"], state["python"]["head_sha"]
+    apply(root, contract.update_files(root, event, manifest))
+    files = {name: (root / name).read_bytes() for name in contract.UPDATE_FILES}
+    pr = state["pr"]
+    pr.update(merged=True)
+    pr["head"] = {"sha": "a" * 40, "repo": {"full_name": "owner/data"}}
+    pr["base"] = {"ref": "main", "sha": "b" * 40}
+    pr["body"] = automation.body({
+        "kind": "release", "version": "0.3.1", "event_id": event["event_id"],
+        "generated_head": "a" * 40, "base": "b" * 40,
+    })
+    candidate, candidate_run, candidate_jobs = green_gate()
+    candidate["distributions"] = {
+        "pineforge_data-0.3.1-py3-none-any.whl": contract.sha256(b"candidate wheel"),
+        "pineforge_data-0.3.1.tar.gz": contract.sha256(b"candidate sdist"),
+    }
+    candidate_run["pull_requests"] = [{"number": 7}]
+    for job in candidate_jobs:
+        job["completed_at"] = "2026-11-07T11:59:00Z"
+    publisher = {
+        "id": 400, "run_attempt": 4, "path": ".github/workflows/release.yml",
+        "head_sha": source, "event": "workflow_run", "status": "completed",
+        "conclusion": "success",
+    }
+    adapter = {
+        "id": 987, "run_attempt": 3, "path": ".github/workflows/pineforge-release.yml",
+        "head_sha": source, "event": "workflow_run",
+    }
+    stage = "release-stage-3-10-adapter"
+    publisher_stage = {"id": 40050, "name": "release-stage-4-50-verify", "expired": False}
+    saved_stage = contract.object_json((FIXTURES / "sample-release-receipt.json").read_bytes())
+    saved_stage.update(
+        attempt=400, sequence=4, state="deploying",
+        pr={"number": 7, "base": "main", "base_sha": "b" * 40,
+            "head": "a" * 40, "merge": source},
+    )
+    saved_stage["deployed"]["source"] = source
+    observed_api, proof_bytes = automation.api, evidence.gh_bytes
+    writes = []
+    downloaded = []
+
+    def api(repo, endpoint, method="GET", data=None):
+        assert repo == "owner/data"
+        if method != "GET":
+            assert endpoint == "actions/workflows/pineforge-release.yml/dispatches"
+            assert method == "POST" and data == {
+                "ref": "v0.3.1", "inputs": {"publication_run": "400"},
+            }
+            writes.append((endpoint, copy.deepcopy(data)))
+            return None
+        if endpoint == "pulls?state=open&base=main&per_page=100&page=1":
+            return []
+        if endpoint == "pulls/7":
+            return copy.deepcopy(pr)
+        if endpoint == "actions/workflows/release.yml/runs?per_page=100":
+            return {"workflow_runs": [copy.deepcopy(publisher)]}
+        if endpoint.startswith("actions/workflows/ci.yml/runs?"):
+            return {"workflow_runs": [copy.deepcopy(candidate_run)]}
+        if endpoint == "actions/runs/70/attempts/2/jobs?per_page=100&page=1":
+            return {"jobs": copy.deepcopy(candidate_jobs)}
+        if endpoint == "actions/runs/400":
+            return copy.deepcopy(publisher)
+        if endpoint == "actions/runs/987":
+            return copy.deepcopy(adapter)
+        if endpoint == "actions/runs/400/artifacts?per_page=100&page=1":
+            return {"artifacts": [copy.deepcopy(publisher_stage)]}
+        if endpoint == "actions/runs/987/artifacts?per_page=100&page=1":
+            return {"artifacts": copy.deepcopy(downloaded)}
+        if endpoint == "actions/runs/400/attempts/4/jobs?per_page=100&page=1":
+            return {"jobs": [
+                {"name": name, "status": "completed", "conclusion": "success"}
+                for name in receipts.DEPLOY_JOBS
+            ]}
+        if endpoint == "actions/runs/987/attempts/3/jobs?per_page=100&page=1":
+            return {"jobs": [{
+                "name": "reconcile", "status": "completed", "conclusion": "success",
+            }]}
+        return observed_api(repo, endpoint, method, data)
+
+    def archive(name, value):
+        raw = io.BytesIO()
+        with zipfile.ZipFile(raw, "w") as zipped:
+            zipped.writestr(name, contract.json_bytes(value))
+        return raw.getvalue()
+
+    def gh_bytes(route, **kwargs):
+        if route == "repos/owner/data/actions/artifacts/40050/zip":
+            return archive("release-receipt.json", saved_stage)
+        path = route.split("?", 1)[0]
+        if path == "repos/owner/data/actions/runs/70":
+            return contract.json_bytes(candidate_run)
+        if path == "repos/owner/data/actions/runs/70/attempts/2/jobs":
+            return contract.json_bytes({"jobs": candidate_jobs})
+        if path == "repos/owner/data/actions/runs/70/artifacts":
+            return contract.json_bytes({"artifacts": [{
+                "id": 7000, "name": "release-evidence-2", "expired": False,
+            }]})
+        if path == "repos/owner/data/actions/artifacts/7000/zip":
+            return archive("evidence.json", candidate)
+        if path == f"repos/{contract.HUB}/releases":
+            return contract.json_bytes([{
+                "tag_name": "v" + event["release_version"], "draft": False,
+                "prerelease": False, "assets": [{"name": "release-manifest.json"}],
+            }])
+        if path == f"repos/{contract.HUB}/releases/tags/v{event['release_version']}":
+            return contract.json_bytes({
+                "draft": False, "prerelease": False,
+                "assets": [{"id": 81, "name": "release-manifest.json"}],
+            })
+        if path == f"repos/{contract.HUB}/releases/assets/81":
+            return manifest
+        return proof_bytes(route, **kwargs)
+
+    def git(*args):
+        assert args in {("fetch", "origin", "main"), ("rev-parse", "origin/main")}
+        return source if args[0] == "rev-parse" else ""
+
+    def snapshot(revision, destination):
+        assert revision == source
+        apply(destination, files)
+
+    monkeypatch.setattr(automation, "api", api)
+    monkeypatch.setattr(publishing, "api", api)
+    monkeypatch.setattr(reporting, "api", api)
+    monkeypatch.setattr(contract, "gh_bytes", gh_bytes)
+    monkeypatch.setattr(evidence, "gh_bytes", gh_bytes)
+    monkeypatch.setattr(reporting, "gh_bytes", gh_bytes)
+    monkeypatch.setattr(automation, "git", git)
+    monkeypatch.setattr(automation, "snapshot", snapshot)
+    for key, value in {
+        "GITHUB_REPOSITORY": "owner/data", "GITHUB_RUN_ID": "987",
+        "GITHUB_RUN_ATTEMPT": "3", "GITHUB_SHA": source, "RELEASE_BOT_LOGIN": "release[bot]",
+        "GITHUB_OUTPUT": str(root / "report-outputs"),
+        "GITHUB_STEP_SUMMARY": str(root / "report-summary"), "FAILED": "false",
+        "STAGE": "reconcile", "RELEASE_ALERT_OWNER": "release-owner",
+    }.items():
+        monkeypatch.setenv(key, value)
+    trigger = root / "trigger.json"
+    trigger.write_bytes(b"{}")
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(trigger))
+    produced = root / "producer"
+    monkeypatch.setattr(sys, "argv", [
+        "release_adapter.py", "reconcile", "--receipt", str(produced / "release-receipt.json"),
+    ])
+    release_adapter.main()
+    destination = root / "downloaded-stages" / stage
+    for name in ("release-receipt.json", "producer-outcome.json"):
+        path = produced / name
+        if path.exists():
+            destination.mkdir(parents=True, exist_ok=True)
+            (destination / name).write_bytes(path.read_bytes())
+    if destination.exists():
+        downloaded.append({"id": 98710, "name": stage, "expired": False})
+    state["cli_stage"] = destination
+    replay_collect_cli(state, monkeypatch)
+    assert len(writes) == 1
+    assert not (root / "report-release-receipt.json").exists()
+    assert not (produced / "release-receipt.json").exists()
+    assert (root / "report-outputs").read_text() == "has_event=false\n"
+    decision = contract.object_json((produced / "producer-outcome.json").read_bytes())
+    assert decision["reason"] == "publication-handoff"
+    assert decision["inputs"] == {"version": "0.3.1", "publication_run": 400}
+    assert len(state["validated"]) == 2  # Independent main and pre-merge gates executed.
 
 
 def assert_pull_request_filter_policy(workflow: dict[str, Any], name: str) -> None:
@@ -2230,7 +2695,11 @@ def test_reconciliation_repairs_a_dropped_rollback_publication(
         ),
     )
 
-    def recover(repo, source, report):
+    def recover(repo, source, report, *, installed_source=None):
+        # Keep this legacy orchestration control usable on c042 as well.
+        # The real CLI replay controls independently require the recorded revision.
+        if installed_source is not None:
+            assert installed_source == "b" * 40
         recovered.append(report["event_id"])
         report["state"] = "deploying"
 

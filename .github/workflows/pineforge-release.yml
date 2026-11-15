@@ -131,7 +131,9 @@ jobs:
         if: always()
         with:
           name: release-stage-${{ github.run_attempt }}-10-adapter
-          path: ${{ runner.temp }}/release-receipt.json
+          path: |
+            ${{ runner.temp }}/release-receipt.json
+            ${{ runner.temp }}/producer-outcome.json
           if-no-files-found: warn
 
   report:
@@ -145,6 +147,7 @@ jobs:
       issues: write
     with:
       hub: true
+      orchestration: ${{ toJSON(needs) }}
       failed: ${{ needs.reconcile.result != 'success' }}
       stage: reconcile
     secrets: inherit

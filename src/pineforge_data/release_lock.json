@@ -1,55 +1,55 @@
 {
   "event": {
-    "event_id": "sha256:87bcaf7515b9d0414cd613006e5c2b2d8ed707d6a936edced164e95088062a90",
+    "event_id": "sha256:674c10654dcbe384ac41275299d6e945b03dfb13ce39b59d281f580798f57bbd",
     "facts": {
-      "commit": "8282f2414e26120dcbf130a3840989d62a2aaa1a",
+      "commit": "b4b80bc44bb7cb1a9ae5f3635c6ec4f7c490d49a",
       "path": "facts/facts.json",
-      "release_key": "1.6.3",
-      "sha256": "fa0c68f51e680953455b53ad4815f15ad5b2e47997ab7420f69711bc1bf2df43"
+      "release_key": "1.10.0",
+      "sha256": "6b88a55a7d193ef8e6948cda32b0116e97dc2bcf3543efb7b7346a0b389102cf"
     },
-    "hub_commit": "8282f2414e26120dcbf130a3840989d62a2aaa1a",
+    "hub_commit": "b4b80bc44bb7cb1a9ae5f3635c6ec4f7c490d49a",
     "image": {
-      "amd64_digest": "sha256:e27012997b6ad60750d91508b5193d202993ebe08812c05d74c950d951870601",
-      "arm64_digest": "sha256:6fc49ccc92af7d8300b955110be2a828d30b6c14fba6f12d1515fa89199a2f38",
-      "digest": "sha256:d13d9b785438b56151544f37cb1493449749d7cd4dcd56f8a210d7a0f1caceaf",
+      "amd64_digest": "sha256:e5f96cac9fbca0e988d69a5b484c3c7b5885cd287011fc65eeb8769b01017bd9",
+      "arm64_digest": "sha256:6b01fb0c70bb3146ad014cca52579f66ea26e86ec9604422c6ab6289b9680f01",
+      "digest": "sha256:be9fb9c02ea5d117ca9af23ae82135373c650db338304d516abfc22f5154a7b5",
       "repository": "ghcr.io/pineforge-4pass/pineforge-release"
     },
     "manifest": {
       "asset": "release-manifest.json",
-      "sha256": "87bcaf7515b9d0414cd613006e5c2b2d8ed707d6a936edced164e95088062a90"
+      "sha256": "674c10654dcbe384ac41275299d6e945b03dfb13ce39b59d281f580798f57bbd"
     },
     "prerelease": false,
-    "release_version": "1.6.3",
-    "run_id": 39888718882,
+    "release_version": "1.10.0",
+    "run_id": 41858128823,
     "schema": "pineforge/release-ready/v1",
     "versions": {
       "codegen": {
-        "commit": "3ac65032bb23b59bfc9b6fe5ba91b791adc73ee2",
-        "npm_integrity": "sha512-9W0UotlusivO5PsfsBKHH6rMYQIEc2x1HejB79rfyKcsqsU7nZ0EszZKtY7LFIpEV/VIhpbXrtj0dfA0t4CIRw==",
-        "npm_version": "1.6.3",
-        "pypi_version": "1.6.3",
-        "sdist_sha256": "968ac925e021c5096391e4145b3f6c7f964fbb1e15927f5c357dde548193de95",
-        "version": "1.6.3"
+        "commit": "47f0e8a59696a8ba9d09166bbf428730f1bee723",
+        "npm_integrity": "sha512-DkCZgbnP1vawp4lwB8pyJ6MSPN/e0x4SIWWGFtrJ20TCSC499TKB5ovLLwSF0oBP4OtlfkcZq+EDlFB+oZIbSQ==",
+        "npm_version": "1.10.0",
+        "pypi_version": "1.10.0",
+        "sdist_sha256": "b2d1a1737cea70781e86f4a15782626bb7622f9c49d891ba08c4e9b8d36b7789",
+        "version": "1.10.0"
       },
       "engine": {
-        "commit": "e799ac8ea911b4a83d4ec730fbcb742019ab086a",
-        "tag": "v1.6.3",
-        "version": "1.6.3"
+        "commit": "59f98ba80e69a624f97ada11935e1bc973fd0e19",
+        "tag": "v1.10.0",
+        "version": "1.10.0"
       },
       "hpo": {
-        "commit": "3f269a868ee3f56ae9ee1b236b0cebd5a5539ff8",
-        "package_version": "1.6.3",
-        "sdist_sha256": "e9bb7db604f98fd9ea1e15c74d0044c22ab1cde7b515da0f721d2072f13e1ab5",
-        "tag": "v1.6.3",
-        "version": "1.6.3",
-        "wheel_sha256": "310b7f879de6fd3527e2e38a3a4332be9529d714ab2816260b0a56f7d12e66e3"
+        "commit": "7a7ae57542f95e15dd296660c8d33285a5617cb3",
+        "package_version": "1.10.0",
+        "sdist_sha256": "5139a4b2cd47f0e4ec14cac6f58100dbe0274322dd659a2807c1c23c2c698737",
+        "tag": "v1.10.0",
+        "version": "1.10.0",
+        "wheel_sha256": "59abc767e8f7ac55ac3304283eca95c5afc68aaa27f041457593fc4a235f6417"
       }
     }
   },
-  "package_version": "0.3.2",
+  "package_version": "0.3.3",
   "previous": {
-    "event_id": "sha256:9fe363b741a1b9046a8b1c162fa6ebcc8ff20f4620f6a2e4799c0310b50e9e5c",
-    "image": "ghcr.io/pineforge-4pass/pineforge-release:1.6.0@sha256:3f739e20d35612140b69de41cd12fcf959f381d9b56e18b5c7c8806a612ca022",
-    "package_version": "0.3.1"
+    "event_id": "sha256:87bcaf7515b9d0414cd613006e5c2b2d8ed707d6a936edced164e95088062a90",
+    "image": "ghcr.io/pineforge-4pass/pineforge-release:1.6.3@sha256:d13d9b785438b56151544f37cb1493449749d7cd4dcd56f8a210d7a0f1caceaf",
+    "package_version": "0.3.2"
   }
 }
